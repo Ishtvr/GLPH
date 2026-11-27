@@ -14,6 +14,7 @@ pub const FEATURES: &[Feature] = &[
     Feature::CpuTdcMa,
     Feature::CpuEdcMa,
     Feature::CpuTemperatureLimitC,
+    Feature::GpuTemperatureLimitC,
     Feature::CpuPboScalar,
     Feature::CpuBoostLimitMhz,
     Feature::CpuCurveOptimizerAllCore,

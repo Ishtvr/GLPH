@@ -7,13 +7,14 @@ use omen_core::{
 };
 
 /// Language keys of the collapsible groups, in display order,
-/// cleanly separated into 3 independent sections: GPU, CPU, Windows.
-pub const GROUPS: [&str; 7] = [
+/// cleanly separated into 4 independent sections: GPU, CPU, Thermals, Windows.
+pub const GROUPS: [&str; 8] = [
     "group.gpu",
     "group.limits",
     "group.pbo",
     "group.curve_optimizer",
     "group.curve_optimizer_per_core",
+    "group.thermals",
     "group.processor",
     "group.energy_display",
 ];
@@ -21,7 +22,8 @@ pub const GROUPS: [&str; 7] = [
 pub const SECTIONS: &[(usize, &str)] = &[
     (0, "section.gpu"),
     (1, "section.cpu"),
-    (5, "section.windows"),
+    (5, "section.thermals"),
+    (6, "section.windows"),
 ];
 pub struct Field {
     pub feature: F,
@@ -34,14 +36,13 @@ pub const REMOVED_GPU_OPTIONS: &[F] = &[
     F::GpuVoltageOffsetMv,
     F::GpuMemoryVoltageOffsetMv,
     F::GpuVoltageLimitMv,
-    F::GpuTemperatureLimitC,
     F::GpuCoreClockLimitMhz,
     F::GpuMemoryClockLimitMhz,
     F::GpuFrameRateLimit,
     // The HP mode is the dashboard's switch (30 October 2026).
     F::OmenPerformanceMode,
     // NVML refuses the power-limit GET/SET on the RTX 5070 Laptop (status 3,
-    // not supported); cTGP, Dynamic Boost and TPP set the GPU envelope instead.
+    // not supported); direct fixed VBIOS TGP sets the GPU envelope instead.
     F::GpuPowerLimitMw,
 ];
 /// Independent HP STAPM writes failed qualification. The CPU slow/fast
@@ -50,7 +51,6 @@ pub const REMOVED_GPU_OPTIONS: &[F] = &[
 /// requested CPU-only tuning UI. Retain decoding; retire intent on explicit Save.
 pub const REMOVED_APU_OPTIONS: &[F] = &[
     F::CpuStapmLimitMw,
-    F::CpuSkinTemperatureLimitC,
     F::CpuFastPptLimitMw,
     F::CpuStapmTimeSeconds,
     F::CpuSlowPptTimeSeconds,
@@ -102,12 +102,15 @@ pub const DEVICE_DEFAULTS: &[F] = &[
     F::GpuCoreOffsetMhz,
     F::GpuMemoryOffsetMhz,
 ];
-/// Independent watt sliders (no cross-coupling between GPU and CPU):
+/// Independent watt and °C sliders (no cross-coupling between GPU, CPU & Thermals):
 /// - `GpuDynamicBoostLimitMw` (Direct GPU Power Limit / TGP): 50 W up to
 ///   `gpu_tgp_max_w` (default 135 W, configurable up to 175 W in Settings).
 /// - `CpuPptLimitMw` (Fast Limit / PPT): 15–160 W via direct AMD SMU.
 /// - `CpuSlowPptLimitMw` (Slow Limit): 15–80 W via direct AMD SMU (hard SMU
 ///   firmware cap at 80 W verified on SMU 0x546F00).
+/// - `CpuTemperatureLimitC`: 60–100 °C via direct AMD SMU (`RSMU 0x59`).
+/// - `GpuTemperatureLimitC`: 65–87 °C via HP WMI `0x22` / NVML GPS target.
+/// - `CpuSkinTemperatureLimitC`: 35–55 °C chassis IR surface guard (`0x23`).
 pub fn slider_watts_with_gpu_max(
     feature: F,
     _dynamic_boost: bool,
@@ -125,6 +128,12 @@ pub fn slider_watts_with_gpu_max(
         F::CpuPptLimitMw => Some((15, 160)),
         F::CpuSlowPptLimitMw => Some((15, 80)),
         F::HpSharedPowerMw => Some((55, 72)),
+        F::CpuTemperatureLimitC => Some((60, 100)),
+        F::GpuTemperatureLimitC => Some((65, 87)),
+        F::CpuSkinTemperatureLimitC => Some((
+            i64::from(omen_core::fan::IR_LIMIT_MIN_C),
+            i64::from(omen_core::fan::IR_LIMIT_MAX_C),
+        )),
         _ => None,
     }
 }
@@ -168,25 +177,28 @@ pub fn fields() -> Vec<Field> {
         // Section 2: CPU (direct AMD SMU limits, Fmax boost, PBO, Curve Optimizer)
         (F::CpuPptLimitMw, 1, 80000),
         (F::CpuSlowPptLimitMw, 1, 55000),
-        (F::CpuTemperatureLimitC, 1, 100),
         (F::CpuTdcMa, 1, 108000),
         (F::CpuEdcMa, 1, 160000),
         (F::CpuBoostLimitMhz, 2, 5350),
         (F::CpuPboScalar, 2, 1),
         (F::CpuCurveOptimizerAllCore, 3, 0),
         (F::CpuCurveOptimizerPerCore, 4, 0),
-        // Section 3: Windows (processor scheduling, power plans, display & MUX)
-        (F::WindowsBoostMode, 5, 2),
-        (F::WindowsMinimumProcessorPercent, 5, 5),
-        (F::WindowsMaximumProcessorPercent, 5, 100),
-        (F::WindowsProcessorEppPercent, 5, 50),
-        (F::WindowsCoreParkingMinPercent, 5, 0),
-        (F::WindowsCoreParkingMaxPercent, 5, 100),
-        (F::CpuCcdAffinity, 5, 3),
-        (F::WindowsEnergyMode, 6, 1),
-        (F::WindowsPowerPlan, 6, 1),
-        (F::DisplayRefreshRateHz, 6, 60),
-        (F::GraphicsMode, 6, 1),
+        // Section 3: Thermals (CPU Tctl, GPU GPS target, Chassis IR surface limit)
+        (F::CpuTemperatureLimitC, 5, 100),
+        (F::GpuTemperatureLimitC, 5, 87),
+        (F::CpuSkinTemperatureLimitC, 5, 50),
+        // Section 4: Windows (processor scheduling, power plans, display & MUX)
+        (F::WindowsBoostMode, 6, 2),
+        (F::WindowsMinimumProcessorPercent, 6, 5),
+        (F::WindowsMaximumProcessorPercent, 6, 100),
+        (F::WindowsProcessorEppPercent, 6, 50),
+        (F::WindowsCoreParkingMinPercent, 6, 0),
+        (F::WindowsCoreParkingMaxPercent, 6, 100),
+        (F::CpuCcdAffinity, 6, 3),
+        (F::WindowsEnergyMode, 7, 1),
+        (F::WindowsPowerPlan, 7, 1),
+        (F::DisplayRefreshRateHz, 7, 60),
+        (F::GraphicsMode, 7, 1),
     ];
     rows.iter()
         .map(|(feature, group, seed)| Field {
@@ -484,21 +496,29 @@ mod tests {
         ] {
             assert_eq!(group(feature), Some(0), "{feature:?}");
         }
-        // CPU limits section holds Fast PPT, Slow PPT, Tctl, TDC, EDC together.
+        // CPU limits section holds Fast PPT, Slow PPT, TDC, EDC together.
         for feature in [
             F::CpuPptLimitMw,
             F::CpuSlowPptLimitMw,
-            F::CpuTemperatureLimitC,
             F::CpuTdcMa,
             F::CpuEdcMa,
         ] {
             assert_eq!(group(feature), Some(1), "{feature:?}");
+        }
+        // Thermals section holds CPU Max-Temp, GPU Max-Temp, and Chassis Max-Temp.
+        for feature in [
+            F::CpuTemperatureLimitC,
+            F::GpuTemperatureLimitC,
+            F::CpuSkinTemperatureLimitC,
+        ] {
+            assert_eq!(group(feature), Some(5), "{feature:?}");
         }
         // CPU Boost & PBO holds Fmax + PBO Scalar.
         assert_eq!(group(F::CpuBoostLimitMhz), Some(2));
         assert_eq!(group(F::CpuPboScalar), Some(2));
         assert_eq!(GROUPS[0], "group.gpu");
         assert_eq!(GROUPS[1], "group.limits");
+        assert_eq!(GROUPS[5], "group.thermals");
         assert_eq!(slider_watts(F::GpuDynamicBoostLimitMw, false), Some((50, 135)));
         assert_eq!(
             slider_watts_with_gpu_max(F::GpuDynamicBoostLimitMw, false, 160),
@@ -513,11 +533,16 @@ mod tests {
         assert_eq!(slider_watts(F::CpuPptLimitMw, false), Some((15, 160)));
         assert_eq!(slider_watts(F::CpuSlowPptLimitMw, true), Some((15, 80)));
         assert_eq!(slider_watts(F::CpuSlowPptLimitMw, false), Some((15, 80)));
+        // Thermal sliders cover CPU (60-100 °C), GPU (65-87 °C), Chassis IR (35-55 °C).
+        assert_eq!(slider_watts(F::CpuTemperatureLimitC, false), Some((60, 100)));
+        assert_eq!(slider_watts(F::GpuTemperatureLimitC, false), Some((65, 87)));
+        assert_eq!(slider_watts(F::CpuSkinTemperatureLimitC, false), Some((35, 55)));
         // The seeds start inside their sliders.
         for field in fields() {
             if let Some((lo, hi)) = slider_watts(field.feature, false) {
+                let scale = field.scale();
                 assert!(
-                    (lo * 1000..=hi * 1000).contains(&field.seed),
+                    (lo * scale..=hi * scale).contains(&field.seed),
                     "{:?}",
                     field.feature
                 );
@@ -541,7 +566,8 @@ mod tests {
             &[
                 (0, "section.gpu"),
                 (1, "section.cpu"),
-                (5, "section.windows")
+                (5, "section.thermals"),
+                (6, "section.windows")
             ]
         );
         let old = serde_json::from_str::<F>("\"intel_pl1_mw\"").unwrap();

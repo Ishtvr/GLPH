@@ -72,6 +72,14 @@ pub enum RestoreState {
     HpGraphicsMode {
         mode: u8,
     },
+    /// HP BIOS 0x21/0x22 byte 3 GPU thermal target (GPS, 65-87 °C).
+    HpGpuTemp {
+        temp_c: u8,
+    },
+    /// Chassis IR surface max-temperature limit (°C) enforced by the fan service.
+    ChassisTemp {
+        limit_c: Option<u8>,
+    },
 }
 
 pub struct Controller {
@@ -469,7 +477,9 @@ impl Controller {
                 },
             );
         }
-        if uses_hp_gpu_power(setting.feature) {
+        if uses_hp_gpu_power(setting.feature)
+            || setting.feature == Feature::GpuTemperatureLimitC
+        {
             let live = self.read(setting.feature)?;
             return Ok((live != setting.value).then_some(live));
         }
@@ -490,6 +500,13 @@ impl Controller {
                 |_, _| {},
             )
             .map(|_| ());
+        }
+        if setting.feature == Feature::GpuTemperatureLimitC {
+            let Value::Integer(c) = setting.value else {
+                return Err("GPU max temperature needs an integer in °C".into());
+            };
+            let temp_c = u8::try_from(c).map_err(|_| "GPU max temperature out of range")?;
+            return super::write_hp_gpu_temperature_limit(&self.inventory, temp_c).map(|_| ());
         }
         if uses_hp_gpu_power(setting.feature) {
             let Value::Boolean(on) = setting.value else {
@@ -799,6 +816,51 @@ impl Backend for Controller {
                 Err(reason) => Capability::unsupported(feature, reason),
             };
         }
+        if feature == Feature::GpuTemperatureLimitC {
+            return if self.inventory.manufacturer == "HP"
+                && self.inventory.board == "8E35"
+                && self.inventory.bios == "F.13"
+            {
+                Capability {
+                    feature,
+                    access: Access::ReadWrite,
+                    reason: "HP BIOS 0x22 byte 3 / NVML GPS GPU thermal target (65-87 °C) with exact readback and restore"
+                        .into(),
+                    integer_range: Some((65, 87)),
+                    requires_ac: false,
+                    startup_safe: true,
+                }
+            } else {
+                Capability::unsupported(
+                    feature,
+                    omen_core::message::msg("support.err.boost_board", &[]),
+                )
+            };
+        }
+        if feature == Feature::CpuSkinTemperatureLimitC {
+            return if self.inventory.manufacturer == "HP"
+                && self.inventory.board == "8E35"
+                && self.inventory.bios == "F.13"
+            {
+                Capability {
+                    feature,
+                    access: Access::ReadWrite,
+                    reason: "Chassis IR surface max-temperature guard (35-55 °C, sensor 0x23) enforced by the fan service"
+                        .into(),
+                    integer_range: Some((
+                        i64::from(omen_core::fan::IR_LIMIT_MIN_C),
+                        i64::from(omen_core::fan::IR_LIMIT_MAX_C),
+                    )),
+                    requires_ac: false,
+                    startup_safe: true,
+                }
+            } else {
+                Capability::unsupported(
+                    feature,
+                    omen_core::message::msg("support.err.fan_board", &[]),
+                )
+            };
+        }
         if uses_hp_gpu_power(feature) {
             // Board-qualified only; the live flags need elevation and are read at capture.
             return if self.inventory.manufacturer == "HP"
@@ -1030,6 +1092,19 @@ impl Backend for Controller {
             let image = super::cpu_tuning::capture(self.smu()?, feature)?;
             return super::cpu_tuning::value(feature, &image);
         }
+        if feature == Feature::GpuTemperatureLimitC {
+            let status = super::read_hp_gpu_status(&self.inventory)?;
+            let temp_c = status
+                .temperature_threshold_c
+                .ok_or_else(|| "HP BIOS 0x21 did not return a GPU temperature limit".to_owned())?;
+            return Ok(Value::Integer(i64::from(temp_c)));
+        }
+        if feature == Feature::CpuSkinTemperatureLimitC {
+            let limit = crate::profile_store::ProfileStore::user_data()?
+                .chassis_max_temp_c()?
+                .unwrap_or(omen_core::fan::IR_EMERGENCY_C);
+            return Ok(Value::Integer(i64::from(limit)));
+        }
         if uses_hp_gpu_power(feature) {
             let status = super::read_hp_gpu_status(&self.inventory)?;
             return Ok(Value::Boolean(gpu_flag(
@@ -1078,6 +1153,30 @@ impl Backend for Controller {
                 feature,
                 value: super::cpu_tuning::value(feature, &image)?,
                 restore: RestoreState::AmdSmu { image },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if feature == Feature::GpuTemperatureLimitC {
+            let status = super::read_hp_gpu_status(&self.inventory)?;
+            let temp_c = status
+                .temperature_threshold_c
+                .ok_or_else(|| "HP BIOS 0x21 did not return a GPU temperature limit".to_owned())?;
+            let saved = Captured {
+                feature,
+                value: Value::Integer(i64::from(temp_c)),
+                restore: RestoreState::HpGpuTemp { temp_c },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if feature == Feature::CpuSkinTemperatureLimitC {
+            let limit_c = crate::profile_store::ProfileStore::user_data()?.chassis_max_temp_c()?;
+            let effective = limit_c.unwrap_or(omen_core::fan::IR_EMERGENCY_C);
+            let saved = Captured {
+                feature,
+                value: Value::Integer(i64::from(effective)),
+                restore: RestoreState::ChassisTemp { limit_c },
             };
             self.captured.insert(feature, saved.clone());
             return Ok(saved);
@@ -1204,6 +1303,14 @@ impl Backend for Controller {
         if let RestoreState::Windows { image } = &saved.restore {
             self.verify_captured(saved)?;
             return super::windows_settings::restore(saved.feature, image);
+        }
+        if let RestoreState::HpGpuTemp { temp_c } = &saved.restore {
+            super::write_hp_gpu_temperature_limit(&self.inventory, *temp_c)?;
+            return Ok(());
+        }
+        if let RestoreState::ChassisTemp { limit_c } = &saved.restore {
+            crate::profile_store::ProfileStore::user_data()?.save_chassis_max_temp_c(*limit_c)?;
+            return Ok(());
         }
         if let RestoreState::HpGpuPower { custom_tgp, ppab } = &saved.restore {
             super::write_hp_gpu_power(&self.inventory, *custom_tgp, *ppab)?;
@@ -1394,6 +1501,29 @@ impl Backend for Controller {
             }
             return Ok(());
         }
+        if let RestoreState::HpGpuTemp { temp_c } = &saved.restore {
+            let live = super::read_hp_gpu_status(&self.inventory)?
+                .temperature_threshold_c
+                .ok_or_else(|| "HP BIOS 0x21 did not return a GPU temperature limit".to_owned())?;
+            if live != *temp_c
+                && self.windows_targets.get(&saved.feature) != Some(&Value::Integer(i64::from(live)))
+            {
+                return Err("GPU max temperature differs from original and target".into());
+            }
+            return Ok(());
+        }
+        if let RestoreState::ChassisTemp { limit_c } = &saved.restore {
+            let live = crate::profile_store::ProfileStore::user_data()?
+                .chassis_max_temp_c()?
+                .unwrap_or(omen_core::fan::IR_EMERGENCY_C);
+            let orig = limit_c.unwrap_or(omen_core::fan::IR_EMERGENCY_C);
+            if live != orig
+                && self.windows_targets.get(&saved.feature) != Some(&Value::Integer(i64::from(live)))
+            {
+                return Err("Chassis max temperature differs from original and target".into());
+            }
+            return Ok(());
+        }
         if let RestoreState::HpGpuPower { custom_tgp, ppab } = &saved.restore {
             let live = super::read_hp_gpu_status(&self.inventory)?;
             // A flag differing from its original is ours only if this
@@ -1451,6 +1581,8 @@ impl Backend for Controller {
             | RestoreState::HpMaxFan { .. }
             | RestoreState::Windows { .. }
             | RestoreState::HpGpuPower { .. }
+            | RestoreState::HpGpuTemp { .. }
+            | RestoreState::ChassisTemp { .. }
             | RestoreState::AmdSmu { .. }
             | RestoreState::HpGraphicsMode { .. } => unreachable!(),
         };
@@ -1541,7 +1673,12 @@ impl Backend for Controller {
             }
             return result.map(|_| setting.value.clone());
         }
-        if uses_hp_gpu_power(setting.feature) {
+        if uses_hp_gpu_power(setting.feature)
+            || matches!(
+                setting.feature,
+                Feature::GpuTemperatureLimitC | Feature::CpuSkinTemperatureLimitC
+            )
+        {
             let actual = self.read(setting.feature)?;
             return if actual == setting.value {
                 Ok(actual)
@@ -1743,6 +1880,17 @@ impl Backend for Controller {
                 }
                 self.windows_targets
                     .insert(feature, requested.value.clone());
+                continue;
+            }
+            if matches!(
+                saved.restore,
+                RestoreState::HpGpuTemp { .. } | RestoreState::ChassisTemp { .. }
+            ) {
+                if requested.feature != saved.feature {
+                    return Err("Persisted thermal-limit feature differs".into());
+                }
+                self.windows_targets
+                    .insert(saved.feature, requested.value.clone());
                 continue;
             }
             if let RestoreState::HpGpuPower { custom_tgp, ppab } = &saved.restore {
@@ -1972,6 +2120,26 @@ impl Backend for Controller {
                 return Err(omen_core::message::msg("cpu.err.firmware_ppt", &[&held]));
             }
             super::cpu_tuning::write(self.smu()?, setting.feature, &setting.value)?;
+            self.windows_targets
+                .insert(setting.feature, setting.value.clone());
+            return Ok(());
+        }
+        if setting.feature == Feature::GpuTemperatureLimitC {
+            let Value::Integer(c) = setting.value else {
+                return Err("GPU max temperature needs an integer in °C".into());
+            };
+            let temp_c = u8::try_from(c).map_err(|_| "GPU max temperature out of range")?;
+            super::write_hp_gpu_temperature_limit(&self.inventory, temp_c)?;
+            self.windows_targets
+                .insert(setting.feature, setting.value.clone());
+            return Ok(());
+        }
+        if setting.feature == Feature::CpuSkinTemperatureLimitC {
+            let Value::Integer(c) = setting.value else {
+                return Err("Chassis max temperature needs an integer in °C".into());
+            };
+            let limit_c = u8::try_from(c).map_err(|_| "Chassis max temperature out of range")?;
+            crate::profile_store::ProfileStore::user_data()?.save_chassis_max_temp_c(Some(limit_c))?;
             self.windows_targets
                 .insert(setting.feature, setting.value.clone());
             return Ok(());

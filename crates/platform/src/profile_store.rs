@@ -915,6 +915,40 @@ impl ProfileStore {
             None => Ok(()),
         }
     }
+    /// Chassis / IR surface max-temperature guard (`35..=55 °C`) enforced by
+    /// the background cooling service. Absent means the default `55 °C` ceiling.
+    pub fn chassis_max_temp_c(&self) -> Result<Option<u8>, String> {
+        let path = self.root.join("chassis-max-temp.json");
+        if !path.try_exists().map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        let value: serde_json::Value = read_json(&path)?;
+        if value["schema"] != 1 {
+            return Err("Unknown chassis temperature limit schema".into());
+        }
+        value["celsius"]
+            .as_u64()
+            .and_then(|c| u8::try_from(c).ok())
+            .filter(|c| (omen_core::fan::IR_LIMIT_MIN_C..=omen_core::fan::IR_LIMIT_MAX_C).contains(c))
+            .map(Some)
+            .ok_or_else(|| "Chassis max temperature is outside 35..=55 °C".into())
+    }
+    pub fn save_chassis_max_temp_c(&self, temp_c: Option<u8>) -> Result<(), String> {
+        let path = self.root.join("chassis-max-temp.json");
+        match temp_c {
+            Some(c)
+                if (omen_core::fan::IR_LIMIT_MIN_C..=omen_core::fan::IR_LIMIT_MAX_C)
+                    .contains(&c) =>
+            {
+                atomic_json(&path, &serde_json::json!({"schema": 1, "celsius": c}))
+            }
+            Some(_) => Err("Chassis max temperature must be within 35..=55 °C".into()),
+            None if path.try_exists().map_err(|e| e.to_string())? => {
+                fs::remove_file(path).map_err(|e| e.to_string())
+            }
+            None => Ok(()),
+        }
+    }
     pub fn save_fan_status<T: Serialize>(&self, value: &T) -> Result<(), String> {
         atomic_json(&self.root.join("fan-service-status.json"), value)
     }

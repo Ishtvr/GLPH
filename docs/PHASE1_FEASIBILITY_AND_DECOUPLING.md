@@ -21,9 +21,17 @@ Measured live on reference hardware (**HP OMEN 16 `8E35 / BIOS F.13`**, AMD Ryze
 ## 2. Decoupled Multi-Vendor Architecture
 
 1. **Zero GPU ↔ CPU Coupling:**
-   - The Overview page is cleanly divided into **3 independent top-level sections**: **GPU**, **CPU**, and **Windows**.
+   - The Overview page is cleanly divided into **4 independent top-level sections**: **GPU**, **CPU**, **Thermals / Temperature**, and **Windows**.
    - Direct GPU Power Limit (`50–135 W+`) no longer depends on HP Unleashed (`0x1A`), `cTGP`, `Dynamic Boost (PPAB)`, or `Shared Budget (TPP)`.
-   - Applying a clean PerformanceHub preset dispatches **zero HP WMI commands**.
+   - On HP systems using Direct Fixed GPU TGP without legacy Dynamic Boost, PerformanceHub sets `PPAB = 0` (preserving `cTGP` and the live GPU thermal target) so the GPU receives its full requested wattage even under heavy CPU load.
+   - Applying a clean PerformanceHub preset on non-HP hardware dispatches **zero HP WMI commands**.
+2. **Follow-Up Live Proofs (27 Nov 2026 — 140 W GPU + 45 W CPU & Thermal Controls):**
+   - **140 W Direct Fixed GPU + 45 W CPU Combined Burn (`AC=True`):**
+     - With `PPAB = 1` (Dynamic Boost on): under simultaneous GPU + 6-thread CPU load (`45 W → 39.2 W`), GPU enforced climbed **`125.00 → 130.13 W`**, real draw hit **`129.43 W` at `2640–2647 MHz` (`67.4 °C` GPU, `36 °C` IR chassis)** with **`0 mW` battery drain**.
+     - With `PPAB = 0` (`HP 0x22 = [1, 0, 1, 87]`): GPU enforced jumped immediately to a **flat `140.00 W`** even while CPU simultaneously drew **`64.1 W`** (`0 mW` battery drain).
+   - **GPU Max-Temperature (`GPS`, `Feature::GpuTemperatureLimitC`):** Writing `HP 0x22` byte 3 (`87 → 83 → 87 °C`) verified live on **both** HP WMI `0x21` byte 3 (`83 °C`) and NVIDIA `NVML GPS_CURR(7)` (`83 °C`). Shipped as **`65–87 °C`** slider in **Thermals / Temperature**.
+   - **Chassis Max-Temperature (`IR 0x23`, `Feature::CpuSkinTemperatureLimitC`):** Live IR surface sensor (`0x23`) read `36 °C` steady under full 130 W GPU + 45 W CPU burn. Shipped as **`35–55 °C`** slider in **Thermals / Temperature**, persisted in `chassis-max-temp.json` and enforced live by `fan_service.rs`.
+   - **External-Monitor-Safe GPU Restart (`vbios_tgp.rs`):** Raised `DISABLE_SETTLE` to `2000 ms` and `POST_ENABLE_SETTLE` to `1000 ms` to avoid `CM_PROB_FAILED_POST_START` (Code 43) on external displays during VBIOS power-limit switches.
 2. **Cross-Vendor Readiness (ASUS, MSI, Lenovo, HP, ...):**
    - **GPU (`vbios_tgp.rs`, `gpu_support.rs`, `nvpcf_ppt.rs`):** Dynamically locates any active discrete NVIDIA PCI adapter (`VEN_10DE`), parses its own Power Policy Table v4.0 structurally, validates monotonic invariants, and verifies every write via NVML readback.
    - **CPU (`smu.rs`, `cpu_tuning.rs`):** Qualifies on AMD Ryzen + signed PawnIO driver + signed `RyzenSMU.bin` hash + Raphael/Dragon Range SMU family (`0x54xxxx`) + PM-table `0x540208` contract, without locking to HP board/BIOS strings.

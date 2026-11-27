@@ -452,8 +452,8 @@ pub fn write_hp_graphics_mode(inventory: &Inventory, mode: u8) -> Result<(), Str
         .map_err(|e| query_error("graphics-mode SET", e))
 }
 
-/// Sets the Hub's cTGP and PPAB (Dynamic Boost) flags with the Hub's fixed
-/// D-state 1 and 87 °C GPS byte, then reads both flags back.
+/// Sets the Hub's cTGP and PPAB (Dynamic Boost) flags while preserving the
+/// current GPS GPU temperature target (default 87 °C), then reads both flags back.
 pub fn write_hp_gpu_power(
     inventory: &Inventory,
     custom_tgp: bool,
@@ -461,9 +461,16 @@ pub fn write_hp_gpu_power(
 ) -> Result<GpuPowerStatus, String> {
     use omen_core::hp_mode::GPU_POWER_TYPE;
     let bios = HpBios::new(inventory).map_err(|e| query_error("GPU-power", e))?;
+    let gps_temp_c = bios
+        .get(Read::GpuStatus)
+        .ok()
+        .and_then(|(c, b)| decode_gpu_status(c, &b).ok())
+        .and_then(|s| s.temperature_threshold_c)
+        .filter(|t| (65..=87).contains(t))
+        .unwrap_or(87);
     bios.set_mode_payload(
         GPU_POWER_TYPE,
-        [u8::from(custom_tgp), u8::from(ppab), 1, 87],
+        [u8::from(custom_tgp), u8::from(ppab), 1, gps_temp_c],
     )
     .map_err(|e| query_error("GPU-power SET", e))?;
     let (code, bytes) = bios
@@ -474,6 +481,47 @@ pub fn write_hp_gpu_power(
         return Err(format!(
             "GPU-power readback differs: cTGP {} / PPAB {}",
             status.custom_tgp_enabled, status.ppab_enabled
+        ));
+    }
+    Ok(status)
+}
+
+/// Sets the GPU GPS maximum temperature target (`65..=87 °C`) via HP WMI `0x22`
+/// byte 3 while preserving the live `cTGP` and `PPAB` flags, then verifies the
+/// exact readback via `0x21` byte 3 (also reflected live in NVML `GPS_CURR`).
+pub fn write_hp_gpu_temperature_limit(
+    inventory: &Inventory,
+    temp_c: u8,
+) -> Result<GpuPowerStatus, String> {
+    use omen_core::hp_mode::GPU_POWER_TYPE;
+    if !(65..=87).contains(&temp_c) {
+        return Err(format!(
+            "GPU max temperature {temp_c} °C is outside the verified 65–87 °C range"
+        ));
+    }
+    let bios = HpBios::new(inventory).map_err(|e| query_error("GPU-temp", e))?;
+    let (code, bytes) = bios
+        .get(Read::GpuStatus)
+        .map_err(|e| query_error("GPU-status", e))?;
+    let current = decode_gpu_status(code, &bytes)?;
+    bios.set_mode_payload(
+        GPU_POWER_TYPE,
+        [
+            u8::from(current.custom_tgp_enabled),
+            u8::from(current.ppab_enabled),
+            1,
+            temp_c,
+        ],
+    )
+    .map_err(|e| query_error("GPU-temp SET", e))?;
+    let (code, bytes) = bios
+        .get(Read::GpuStatus)
+        .map_err(|e| query_error("GPU-status", e))?;
+    let status = decode_gpu_status(code, &bytes)?;
+    if status.temperature_threshold_c != Some(temp_c) {
+        return Err(format!(
+            "GPU max temperature readback {:?} differs from requested {temp_c} °C",
+            status.temperature_threshold_c
         ));
     }
     Ok(status)

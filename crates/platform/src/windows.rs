@@ -44,8 +44,8 @@ pub use gpu::{GpuControlsReport, NvidiaIdentity, OffsetState, read_gpu_controls}
 pub use hp::{
     GraphicsModeReport, HpModeReport, apply_graphics_mode, apply_hp_mode, read_hp_gpu_status,
     read_hp_graphics_mode, read_hp_keyboard_state, read_hp_system_design, write_hp_cpu_pl1,
-    write_hp_gpu_power, write_hp_graphics_mode, write_hp_performance_step, write_hp_shared_budget,
-    write_hp_thermal_mode,
+    write_hp_gpu_power, write_hp_gpu_temperature_limit, write_hp_graphics_mode,
+    write_hp_performance_step, write_hp_shared_budget, write_hp_thermal_mode,
 };
 pub use lighting::DirectLighting;
 pub use nvidia::{GpuLimitProbe, Nvidia, read_nvml_power_limits};

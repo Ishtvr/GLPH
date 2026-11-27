@@ -692,13 +692,19 @@ pub fn run_until(
             // Maximum is unconditional and works without loading sensor drivers.
             // A curve may never lower cooling when its GPU reader is unavailable;
             // a powered-down dGPU is not a failed reader and produces no heat.
+            let ir_limit_c = crate::profile_store::ProfileStore::user_data()
+                .ok()
+                .and_then(|s| s.chassis_max_temp_c().ok())
+                .flatten()
+                .unwrap_or(fan::IR_EMERGENCY_C);
             let full = !max
                 && (write_was_blocked
                     || (gpu_c.is_none() && !gpu_asleep)
-                    || fan::emergency(
+                    || fan::emergency_with_ir(
                         cpu_c.map(|t| t as f32),
                         gpu_c.map(|t| t as f32),
                         ir_c,
+                        ir_limit_c,
                         protection,
                     ));
             let target = |t: Option<i32>| requested_level(mode, curve.as_ref(), full, t);

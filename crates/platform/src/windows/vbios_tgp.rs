@@ -82,10 +82,10 @@ const OFF_LIMIT_MAX: usize = 0x15;
 const OFF_INFLECTION_0: usize = 0x2D;
 const OFF_TGP_RATED: usize = 0x49;
 
-const DISABLE_SETTLE: Duration = Duration::from_millis(450);
+const DISABLE_SETTLE: Duration = Duration::from_millis(2000);
 const DEVNODE_WAIT: Duration = Duration::from_secs(12);
 const NVML_WAIT: Duration = Duration::from_secs(8);
-const POST_ENABLE_SETTLE: Duration = Duration::from_millis(500);
+const POST_ENABLE_SETTLE: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyOutcome {

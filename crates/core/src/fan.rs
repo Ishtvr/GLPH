@@ -61,6 +61,9 @@ pub const MIN_RUNNING_LEVEL: u8 = 19;
 pub const CPU_EMERGENCY_C: f32 = 92.0;
 pub const GPU_EMERGENCY_C: f32 = 85.0;
 pub const IR_EMERGENCY_C: u8 = 55;
+/// Configurable chassis (IR surface) max-temperature guard bounds in °C.
+pub const IR_LIMIT_MIN_C: u8 = 35;
+pub const IR_LIMIT_MAX_C: u8 = IR_EMERGENCY_C;
 
 /// Tracks only this controller's commands, never infers firmware ownership.
 /// A paused writer can leave its last low target latched until the firmware
@@ -139,10 +142,23 @@ impl Smoother {
 /// reading, a missing mandatory IR reading or a set BIOS protection bit.
 /// A sleeping GPU may have no temperature; an invalid supplied value is a fault.
 pub fn emergency(cpu_c: Option<f32>, gpu_c: Option<f32>, ir_c: Option<u8>, protection: u8) -> bool {
+    emergency_with_ir(cpu_c, gpu_c, ir_c, IR_EMERGENCY_C, protection)
+}
+
+/// Same emergency cooling check with a configurable chassis (IR) temperature ceiling
+/// clamped to `IR_LIMIT_MIN_C..=IR_LIMIT_MAX_C` (`35..=55 °C`).
+pub fn emergency_with_ir(
+    cpu_c: Option<f32>,
+    gpu_c: Option<f32>,
+    ir_c: Option<u8>,
+    ir_limit_c: u8,
+    protection: u8,
+) -> bool {
+    let ceiling = ir_limit_c.clamp(IR_LIMIT_MIN_C, IR_LIMIT_MAX_C);
     protection != 0
         || cpu_c.is_none_or(|t| !t.is_finite() || t >= CPU_EMERGENCY_C)
         || gpu_c.is_some_and(|t| !t.is_finite() || t >= GPU_EMERGENCY_C)
-        || ir_c.is_none_or(|t| t >= IR_EMERGENCY_C)
+        || ir_c.is_none_or(|t| t >= ceiling)
 }
 
 #[cfg(test)]

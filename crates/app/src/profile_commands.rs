@@ -749,6 +749,20 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             if nvpcf_mode.is_some() {
                 controller.set_nvpcf_ppt_unlocked(true);
             }
+            // Empirically verified (27 Nov 2026): when using Direct Fixed GPU TGP
+            // on HP without legacy Dynamic Boost, setting PPAB=0 stops the -15 W
+            // GPU subtraction under simultaneous CPU load (e.g. 140 W stays 140 W
+            // even while CPU draws 45-64 W), while preserving cTGP and GPS max-temp.
+            let legacy_boost = profile.settings.iter().any(|s| {
+                matches!(s.feature, Feature::GpuUnleashed | Feature::GpuDynamicBoost)
+            });
+            if ac
+                && requested_tgp_w.is_some()
+                && !legacy_boost
+                && controller.inventory().manufacturer == "HP"
+            {
+                let _ = omen_platform::write_hp_gpu_power(controller.inventory(), true, false);
+            }
             let cooling_request =
                 crate::profile_fan::prepare(&profile, &store, controller.inventory())?;
             let prelude_failed = match apply_hp_prelude(&profile, controller.inventory()) {
@@ -898,6 +912,9 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                         error,
                         rollback_errors: vec![],
                     })?;
+                    if gpu_tgp_restored && inventory.manufacturer == "HP" {
+                        let _ = omen_platform::write_hp_gpu_power(&inventory, true, true);
+                    }
                 }
                 Ok(())
             });

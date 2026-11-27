@@ -1901,8 +1901,8 @@ pub fn run(
                     .find_map(|(start, key)| (*start == i).then(|| t(key).into()))
                     .unwrap_or_default(),
                 title: t(k).into(),
-                // Open GPU and CPU Limits by default for immediate independent control.
-                expanded: i <= 1,
+                // Open GPU, CPU Limits, and Thermals by default for immediate independent control.
+                expanded: i <= 1 || i == 5,
                 is_per_core: *k == "group.curve_optimizer_per_core",
                 rows: group_rows[i].clone().into(),
             })

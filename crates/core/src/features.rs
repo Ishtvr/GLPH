@@ -339,14 +339,17 @@ impl Feature {
     pub fn retired(self) -> bool {
         matches!(self, Self::Retired(_))
     }
-    /// GPU settings written through the NVIDIA driver. cTGP and Dynamic Boost
-    /// are HP firmware flags (WMI `0x22`): they need no NVIDIA identity and
-    /// never wake the discrete GPU.
+    /// GPU settings written through the NVIDIA driver. cTGP, Dynamic Boost and
+    /// GPS GPU max-temperature are HP firmware controls (WMI `0x22`): they need
+    /// no NVIDIA identity and never wake a sleeping discrete GPU.
     pub fn needs_nvidia(self) -> bool {
         self.descriptor().category == Category::Gpu
             && !matches!(
                 self,
-                Self::GpuUnleashed | Self::GpuDynamicBoost | Self::GpuCustomTgp
+                Self::GpuUnleashed
+                    | Self::GpuDynamicBoost
+                    | Self::GpuCustomTgp
+                    | Self::GpuTemperatureLimitC
             )
     }
 }

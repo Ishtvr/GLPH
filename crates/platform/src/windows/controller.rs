@@ -970,15 +970,7 @@ impl Backend for Controller {
             };
         }
         if feature == Feature::GpuDynamicBoostLimitMw {
-            if self.inventory.manufacturer != "HP"
-                || self.inventory.board != "8E35"
-                || self.inventory.bios != "F.13"
-                || !self
-                    .inventory
-                    .gpus
-                    .iter()
-                    .any(|g| g.to_ascii_lowercase().contains("rtx 5070 laptop"))
-            {
+            if !super::vbios_tgp::model_supported(&self.inventory) {
                 return Capability::unsupported(
                     feature,
                     omen_core::message::msg("vbios_tgp.err.unsupported", &[]),
@@ -987,9 +979,9 @@ impl Backend for Controller {
             return Capability {
                 feature,
                 access: Access::ReadWrite,
-                reason: "Flashless VBIOS Policy[2] Dynamic Boost TGP ceiling (115-175 W, verified via NVML)".into(),
+                reason: "Flashless direct VBIOS Policy[2] GPU Power Limit (50-175 W, independent of CPU & Dynamic Boost, verified via NVML)".into(),
                 integer_range: Some((
-                    i64::from(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W) * 1_000,
+                    i64::from(omen_core::profiles::GPU_DIRECT_TGP_MIN_W) * 1_000,
                     i64::from(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W) * 1_000,
                 )),
                 requires_ac: true,

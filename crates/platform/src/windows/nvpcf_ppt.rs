@@ -59,13 +59,37 @@ const CONFIG_VERSION_2X: u32 = 0x0000_0200;
 /// HP 8E35 / F.13 SSDT `SSD4` `NVDA0820._DSM(rev=0x200, func=0)` bitmask:
 /// bits 0, 1, 2, 8, 9, 10 (`0x0707`).
 const ACPI_STOCK_SUPPORTED_FUNCS: u32 = 0x0000_0707;
+/// Sub-function #2: Dynamic Boost (cTGP / PPAB -15 W GPU subtraction under CPU load).
+const SUBFUNC_DYNAMIC_BOOST_BIT: u32 = 1 << 2;
 /// Sub-function #9: CPU TDP overwriter (`CPTD = 80000 mW -> EC0.NSPT/NFPT = 80`).
 const SUBFUNC_CPU_TDP_BIT: u32 = 1 << 9;
 /// Clears only bit 9; keeps Dynamic Boost (#2), battery (#8) and DTTL (#10) active.
 const UNLOCKED_SUPPORTED_FUNCS: u32 = ACPI_STOCK_SUPPORTED_FUNCS & !SUBFUNC_CPU_TDP_BIT;
+/// Clears bit 2 AND bit 9: disables Dynamic Boost GPU power subtraction AND CPU TDP
+/// overwrites for 100% independent Direct Fixed GPU TGP + CPU limits.
+const DIRECT_GPU_AND_CPU_FUNCS: u32 =
+    ACPI_STOCK_SUPPORTED_FUNCS & !(SUBFUNC_DYNAMIC_BOOST_BIT | SUBFUNC_CPU_TDP_BIT);
 const MAX_DRIVER_BYTES: u64 = 4 * 1024 * 1024;
 const RESTART_SETTLE: Duration = Duration::from_millis(500);
 const RESTART_WAIT: Duration = Duration::from_secs(4);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NvpcfUnlockMode {
+    /// `0x0507`: clears Sub-function #9 (CPU TDP overwriter); keeps Dynamic Boost (#2).
+    CpuOnly,
+    /// `0x0503`: clears Sub-function #2 (Dynamic Boost -15 W GPU drop) AND #9 (CPU TDP overwriter).
+    DirectGpuAndCpu,
+}
+
+impl NvpcfUnlockMode {
+    pub fn supported_funcs(self) -> u32 {
+        match self {
+            Self::CpuOnly => UNLOCKED_SUPPORTED_FUNCS,
+            Self::DirectGpuAndCpu => DIRECT_GPU_AND_CPU_FUNCS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlockOutcome {
@@ -86,41 +110,71 @@ pub struct NvpcfPptStatus {
     pub qualification_error: Option<String>,
 }
 
-/// Whether `profile` needs the NVPCF Sub-function #9 bypass on this power source:
-/// Dynamic Boost (`Unleashed` on AC or `Performance` on battery) combined with
-/// an explicit Fast PPT limit or a Slow PPT limit outside HP `0x29`'s 45..=80 W window.
-pub fn preset_needs_unlock(profile: &PerformanceProfile, ac: bool) -> bool {
-    if !matches!(
-        HpMode::of_preset(profile, ac),
-        Some(HpMode::Unleashed | HpMode::Performance)
-    ) {
-        return false;
-    }
-    profile
+/// Determines which NVPCF bypass mode (if any) `profile` needs so GPU and CPU
+/// power limits stay 100% independent:
+/// - Empirically verified on 27 Nov 2026: clearing bit 2 (`0x0503`) causes
+///   `nvlddmkm.sys` to apply a `-15 W` fallback penalty (`135 -> 120 W`),
+///   whereas clearing ONLY bit 9 (`0x0507`, `CpuOnly`) preserves full
+///   `135.00 W` GPU enforced TGP while completely stopping `nvpcf.sys` from
+///   overwriting CPU Fast/Slow PPT limits!
+pub fn required_mode(profile: &PerformanceProfile, ac: bool) -> Option<NvpcfUnlockMode> {
+    let legacy_dynamic_boost = [Feature::GpuDynamicBoost, Feature::GpuUnleashed]
+        .iter()
+        .find_map(|f| profile.settings.iter().find(|s| s.feature == *f))
+        .is_some_and(|s| s.value == Value::Boolean(true));
+    let has_direct_gpu_tgp = profile
+        .settings
+        .iter()
+        .any(|s| s.feature == Feature::GpuDynamicBoostLimitMw);
+    let has_cpu_power = profile
         .effective()
         .settings
         .iter()
-        .any(|s| match s.feature {
-            Feature::CpuPptLimitMw => true,
-            Feature::CpuSlowPptLimitMw => match s.value {
-                Value::Integer(mw) => mw % 1000 != 0 || !(45_000..=80_000).contains(&mw),
+        .any(|s| matches!(s.feature, Feature::CpuPptLimitMw | Feature::CpuSlowPptLimitMw));
+    if ac && has_direct_gpu_tgp && !legacy_dynamic_boost {
+        return Some(NvpcfUnlockMode::CpuOnly);
+    }
+    if has_cpu_power {
+        if legacy_dynamic_boost {
+            let needs_bypass = profile.effective().settings.iter().any(|s| match s.feature {
+                Feature::CpuPptLimitMw => true,
+                Feature::CpuSlowPptLimitMw => match s.value {
+                    Value::Integer(mw) => mw % 1000 != 0 || !(45_000..=80_000).contains(&mw),
+                    _ => false,
+                },
                 _ => false,
-            },
-            _ => false,
-        })
+            });
+            return needs_bypass.then_some(NvpcfUnlockMode::CpuOnly);
+        }
+        return Some(NvpcfUnlockMode::CpuOnly);
+    }
+    None
+}
+
+/// Whether `profile` needs an NVPCF bypass on this power source.
+pub fn preset_needs_unlock(profile: &PerformanceProfile, ac: bool) -> bool {
+    let _ = HpMode::of_preset(profile, ac);
+    required_mode(profile, ac).is_some()
 }
 
 fn model_supported(inventory: &Inventory) -> bool {
-    inventory.manufacturer == "HP"
-        && inventory.board == "8E35"
-        && inventory.bios == "F.13"
-        && inventory.cpus.len() == 1
-        && inventory.cpus[0].contains("AMD Ryzen 9 8940HX")
+    inventory.gpus.iter().any(|gpu| {
+        let lower = gpu.to_ascii_lowercase();
+        lower.contains("nvidia")
+            || lower.contains("geforce")
+            || lower.contains("rtx")
+            || lower.contains("gtx")
+    })
+}
+
+fn is_unlocked_for_mode(state: NvpcfPptOriginal, mode: NvpcfUnlockMode) -> bool {
+    state.config_version == Some(CONFIG_VERSION_2X)
+        && state.supported_funcs == Some(mode.supported_funcs())
 }
 
 fn is_unlocked_values(state: NvpcfPptOriginal) -> bool {
-    state.config_version == Some(CONFIG_VERSION_2X)
-        && state.supported_funcs == Some(UNLOCKED_SUPPORTED_FUNCS)
+    is_unlocked_for_mode(state, NvpcfUnlockMode::CpuOnly)
+        || is_unlocked_for_mode(state, NvpcfUnlockMode::DirectGpuAndCpu)
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -453,18 +507,19 @@ pub fn is_currently_unlocked(inventory: &Inventory) -> bool {
             .is_ok_and(is_unlocked_values)
 }
 
-/// Ensures `nvpcf.sys` has Sub-function #9 disabled (`pcfKeyConfigVersion=0x200`,
-/// `pcfKeySupportedFuncs=0x0507`) so Fast PPT and Slow PPT persist with Dynamic
-/// Boost enabled. Captures the original registry state durably before any write
-/// and rolls back cleanly if restarting `ACPI\NVDA0820\NPCF` fails.
-pub fn ensure_unlocked(
+/// Ensures `nvpcf.sys` is configured for `mode` (`0x0507` for CPU-only unlock
+/// or `0x0503` for independent Direct Fixed GPU TGP + CPU unlock). Captures
+/// the original registry state durably before any write and rolls back cleanly
+/// if restarting `ACPI\NVDA0820\NPCF` fails.
+pub fn ensure_mode(
     inventory: &Inventory,
     store: &ProfileStore,
+    mode: NvpcfUnlockMode,
 ) -> Result<UnlockOutcome, String> {
     qualify(inventory)?;
     let key = RegKey::open(KEY_QUERY_VALUE | KEY_SET_VALUE)?;
     let current = key.read_state()?;
-    if is_unlocked_values(current) {
+    if is_unlocked_for_mode(current, mode) {
         return Ok(UnlockOutcome::AlreadyActive);
     }
     let created_backup = store.nvpcf_ppt_original().is_none();
@@ -473,7 +528,7 @@ pub fn ensure_unlocked(
     }
     let target = NvpcfPptOriginal {
         config_version: Some(CONFIG_VERSION_2X),
-        supported_funcs: Some(UNLOCKED_SUPPORTED_FUNCS),
+        supported_funcs: Some(mode.supported_funcs()),
     };
     if let Err(error) = key.apply_state(target).and_then(|()| {
         drop(key);
@@ -494,6 +549,40 @@ pub fn ensure_unlocked(
         return Err(error);
     }
     Ok(UnlockOutcome::EnabledNow)
+}
+
+/// Applies the NVPCF bypass mode required by `profile`, or restores stock NVPCF
+/// when the profile no longer needs one. On systems without an `ACPI\NVDA0820\NPCF`
+/// device (e.g. non-NVPCF laptops/desktops), returns `Ok(None)` cleanly.
+pub fn apply_for_profile(
+    inventory: &Inventory,
+    store: &ProfileStore,
+    profile: &PerformanceProfile,
+    ac: bool,
+) -> Result<Option<NvpcfUnlockMode>, String> {
+    match required_mode(profile, ac) {
+        Some(mode) => {
+            if !model_supported(inventory) || locate_nvpcf_devnode().is_err() {
+                return Ok(None);
+            }
+            ensure_mode(inventory, store, mode)?;
+            Ok(Some(mode))
+        }
+        None => {
+            if store.nvpcf_ppt_original().is_some() {
+                let _ = restore_if_saved(inventory, store)?;
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Backwards-compatible helper: ensures Sub-function #9 (`0x0507`) is disabled.
+pub fn ensure_unlocked(
+    inventory: &Inventory,
+    store: &ProfileStore,
+) -> Result<UnlockOutcome, String> {
+    ensure_mode(inventory, store, NvpcfUnlockMode::CpuOnly)
 }
 
 /// Restores the saved original `nvpcf` registry values and restarts
@@ -543,20 +632,30 @@ mod tests {
     }
 
     #[test]
-    fn unlocked_mask_clears_only_subfunction_nine() {
+    fn unlocked_mask_clears_subfunction_nine_and_direct_gpu_clears_two_and_nine() {
         assert_eq!(ACPI_STOCK_SUPPORTED_FUNCS, 0x0707);
         assert_eq!(UNLOCKED_SUPPORTED_FUNCS, 0x0507);
+        assert_eq!(DIRECT_GPU_AND_CPU_FUNCS, 0x0503);
         assert_eq!(
             UNLOCKED_SUPPORTED_FUNCS ^ ACPI_STOCK_SUPPORTED_FUNCS,
             1 << 9
         );
-        assert_ne!(UNLOCKED_SUPPORTED_FUNCS & (1 << 2), 0); // Dynamic Boost
-        assert_ne!(UNLOCKED_SUPPORTED_FUNCS & (1 << 8), 0); // Battery
-        assert_ne!(UNLOCKED_SUPPORTED_FUNCS & (1 << 10), 0); // DTTL
-        assert_eq!(UNLOCKED_SUPPORTED_FUNCS & (1 << 9), 0); // CPU TDP overwriter disabled
+        assert_eq!(
+            DIRECT_GPU_AND_CPU_FUNCS ^ ACPI_STOCK_SUPPORTED_FUNCS,
+            (1 << 2) | (1 << 9)
+        );
+        assert_ne!(UNLOCKED_SUPPORTED_FUNCS & (1 << 2), 0); // Dynamic Boost kept in CpuOnly
+        assert_eq!(DIRECT_GPU_AND_CPU_FUNCS & (1 << 2), 0); // Dynamic Boost disabled in DirectGpuAndCpu
+        assert_ne!(DIRECT_GPU_AND_CPU_FUNCS & (1 << 8), 0); // Battery kept
+        assert_ne!(DIRECT_GPU_AND_CPU_FUNCS & (1 << 10), 0); // DTTL kept
+        assert_eq!(DIRECT_GPU_AND_CPU_FUNCS & (1 << 9), 0); // CPU TDP overwriter disabled
         assert!(is_unlocked_values(NvpcfPptOriginal {
             config_version: Some(0x200),
             supported_funcs: Some(0x0507),
+        }));
+        assert!(is_unlocked_values(NvpcfPptOriginal {
+            config_version: Some(0x200),
+            supported_funcs: Some(0x0503),
         }));
         assert!(!is_unlocked_values(NvpcfPptOriginal {
             config_version: None,
@@ -565,19 +664,38 @@ mod tests {
     }
 
     #[test]
-    fn preset_needs_unlock_only_for_dynamic_boost_with_fast_or_extended_slow_ppt() {
-        let boosted_fast = preset(vec![
+    fn required_mode_selects_direct_gpu_and_cpu_or_cpu_only_independently() {
+        let direct_135_with_cpu = preset(vec![
             Setting {
-                feature: Feature::GpuUnleashed,
-                value: Value::Boolean(true),
+                feature: Feature::GpuDynamicBoostLimitMw,
+                value: Value::Integer(135_000),
             },
             Setting {
                 feature: Feature::CpuPptLimitMw,
-                value: Value::Integer(100_000),
+                value: Value::Integer(110_000),
+            },
+            Setting {
+                feature: Feature::CpuSlowPptLimitMw,
+                value: Value::Integer(45_000),
             },
         ]);
-        assert!(preset_needs_unlock(&boosted_fast, true));
-        assert!(preset_needs_unlock(&boosted_fast, false));
+        assert_eq!(
+            required_mode(&direct_135_with_cpu, true),
+            Some(NvpcfUnlockMode::CpuOnly)
+        );
+        assert_eq!(
+            required_mode(&direct_135_with_cpu, false),
+            Some(NvpcfUnlockMode::CpuOnly)
+        );
+
+        let cpu_only = preset(vec![Setting {
+            feature: Feature::CpuPptLimitMw,
+            value: Value::Integer(95_000),
+        }]);
+        assert_eq!(
+            required_mode(&cpu_only, true),
+            Some(NvpcfUnlockMode::CpuOnly)
+        );
 
         let boosted_slow_in_window = preset(vec![
             Setting {
@@ -589,7 +707,7 @@ mod tests {
                 value: Value::Integer(65_000),
             },
         ]);
-        assert!(!preset_needs_unlock(&boosted_slow_in_window, true));
+        assert_eq!(required_mode(&boosted_slow_in_window, true), None);
 
         let boosted_slow_below_45 = preset(vec![
             Setting {
@@ -598,22 +716,13 @@ mod tests {
             },
             Setting {
                 feature: Feature::CpuSlowPptLimitMw,
-                value: Value::Integer(30_000),
+                value: Value::Integer(35_000),
             },
         ]);
-        assert!(preset_needs_unlock(&boosted_slow_below_45, true));
-
-        let balanced_fast = preset(vec![
-            Setting {
-                feature: Feature::GpuUnleashed,
-                value: Value::Boolean(false),
-            },
-            Setting {
-                feature: Feature::CpuPptLimitMw,
-                value: Value::Integer(30_000),
-            },
-        ]);
-        assert!(!preset_needs_unlock(&balanced_fast, true));
+        assert_eq!(
+            required_mode(&boosted_slow_below_45, true),
+            Some(NvpcfUnlockMode::CpuOnly)
+        );
     }
 
     #[test]

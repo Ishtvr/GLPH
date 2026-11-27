@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const PROFILE_SCHEMA: u32 = 1;
-/// Qualified flashless GPU Dynamic Boost TGP ceiling bounds (HP 8E35 / RTX 5070 Laptop).
+/// Lower bound for direct flashless GPU Power Limit (TGP) control in whole watts.
+pub const GPU_DIRECT_TGP_MIN_W: u32 = 50;
+/// Stock VBIOS TGP ceiling / minimum configurable ceiling in Settings (115 W on RTX 5070 Laptop).
 pub const GPU_DYNAMIC_BOOST_LIMIT_MIN_W: u32 = 115;
-/// Verified default upper bound for the Dynamic Boost TGP slider (tested on 8E35 / RTX 5070 Laptop).
+/// Verified default upper bound for the GPU Power Limit slider (tested on 8E35 / RTX 5070 Laptop).
 pub const GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W: u32 = 135;
 /// Absolute hard upper ceiling selectable in Settings (above 135 W is untested / user risk).
 pub const GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W: u32 = 175;
@@ -359,8 +361,8 @@ impl PerformanceProfile {
         self.gpu_dynamic_boost_limit_w_max(GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W)
     }
 
-    /// Validated GPU Dynamic Boost / Max TGP limit in whole watts against an
-    /// explicit upper ceiling (clamped to `115..=175 W`).
+    /// Validated direct GPU Power Limit (TGP) in whole watts against an
+    /// explicit upper ceiling (`50..=ceiling`, where `ceiling` is clamped to `115..=175 W`).
     pub fn gpu_dynamic_boost_limit_w_max(&self, max_w: u32) -> Result<Option<u32>, String> {
         let ceiling = max_w.clamp(
             GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
@@ -376,14 +378,14 @@ impl PerformanceProfile {
         match setting.value {
             Value::Integer(mw)
                 if mw % 1000 == 0
-                    && (i64::from(GPU_DYNAMIC_BOOST_LIMIT_MIN_W)..=i64::from(ceiling))
+                    && (i64::from(GPU_DIRECT_TGP_MIN_W)..=i64::from(ceiling))
                         .contains(&(mw / 1000)) =>
             {
                 Ok(Some((mw / 1000) as u32))
             }
             _ => Err(crate::message::msg(
                 "vbios_tgp.err.range",
-                &[&GPU_DYNAMIC_BOOST_LIMIT_MIN_W, &ceiling],
+                &[&GPU_DIRECT_TGP_MIN_W, &ceiling],
             )),
         }
     }
@@ -443,15 +445,12 @@ impl PerformanceProfile {
                 }),
             }
         }
-        let dynamic_boost = [Feature::GpuDynamicBoost, Feature::GpuUnleashed]
-            .iter()
-            .find_map(|f| find(*f))
-            .is_some_and(|s| s.value == Value::Boolean(true));
-        if !dynamic_boost
-            && let Some(Setting {
-                value: Value::Integer(fast_mw),
-                ..
-            }) = find(Feature::CpuPptLimitMw)
+        // Keep CPU Slow <= Fast physical invariant regardless of GPU settings:
+        // GPU flags never alter, disable, or hide CPU Fast/Slow limits.
+        if let Some(Setting {
+            value: Value::Integer(fast_mw),
+            ..
+        }) = find(Feature::CpuPptLimitMw)
             && (15_000..=160_000).contains(fast_mw)
         {
             if let Some(slow) = profile

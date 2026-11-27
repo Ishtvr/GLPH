@@ -37,7 +37,7 @@ pub struct NvpcfPptOriginal {
     pub config_version: Option<u32>,
     pub supported_funcs: Option<u32>,
 }
-/// Durable state of an active flashless GPU Dynamic Boost TGP VBIOS override.
+/// Durable state of an active flashless GPU Power Limit (TGP) VBIOS override.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VbiosTgpState {
@@ -45,6 +45,20 @@ pub struct VbiosTgpState {
     pub stock_sha256: String,
     pub applied_sha256: String,
     pub target_watts: u32,
+    /// True when applied with flat direct-fixed Policy[2] (`limitRated = limitMax = target_w`),
+    /// independent of HP Unleashed / Dynamic Boost.
+    #[serde(default)]
+    pub direct_fixed: bool,
+    /// Expected NVML default/min/max limits (mW) when this override is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_default_mw: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_min_mw: Option<u32>,
+    /// Verified stock NVML default/max limits (mW) captured from the stock ROM for exact restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stock_default_mw: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stock_max_mw: Option<u32>,
 }
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 

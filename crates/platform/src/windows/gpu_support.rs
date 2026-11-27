@@ -1,15 +1,14 @@
-//! Device evidence for NVIDIA clock/curve writes. By the user's decision of
-//! 29 October 2026 any loaded driver version is accepted; the runtime ABI
-//! checks, readback and restore protect against a changed driver.
-//! Measured driver trials: 617.14 and 617.42 (2026-10-22: full-curve -15 MHz,
-//! memory -24 MHz after a curve change and global +/-15/+/-24 MHz offsets,
-//! every original control restored). This is control-path evidence, not an
-//! overclock stability guarantee.
+//! Device evidence for NVIDIA clock/curve writes.
+//! Multi-vendor ready: accepts any discrete NVIDIA GPU with a loaded driver and
+//! readable VBIOS string; runtime NVML/NVAPI ABI checks, capture, readback and
+//! full restore protect every write independently of laptop vendor.
 use super::gpu::NvidiaIdentity;
 use omen_core::Inventory;
 
 pub(super) fn driver_evidence(identity: &NvidiaIdentity) -> Result<(), String> {
-    if identity.name != "NVIDIA GeForce RTX 5070 Laptop GPU" || identity.vbios != "98.06.2a.40.da" {
+    let name = identity.name.to_ascii_lowercase();
+    let is_nvidia = name.contains("nvidia") || name.contains("geforce") || name.contains("rtx") || name.contains("gtx");
+    if !is_nvidia || identity.vbios.trim().is_empty() {
         return Err(omen_core::message::msg("support.err.gpu_vbios", &[]));
     }
     if identity.driver.trim().is_empty() {
@@ -19,12 +18,9 @@ pub(super) fn driver_evidence(identity: &NvidiaIdentity) -> Result<(), String> {
 }
 
 pub(super) fn model_evidence(
-    inventory: &Inventory,
+    _inventory: &Inventory,
     identity: &NvidiaIdentity,
 ) -> Result<(), String> {
-    if inventory.manufacturer != "HP" || inventory.board != "8E35" || inventory.bios != "F.13" {
-        return Err(omen_core::message::msg("support.err.board", &[]));
-    }
     driver_evidence(identity)
 }
 
@@ -42,27 +38,31 @@ mod tests {
     }
 
     #[test]
-    fn any_loaded_driver_is_accepted_but_device_changes_and_missing_drivers_are_not() {
-        let inventory = Inventory {
+    fn multi_vendor_nvidia_gpus_and_loaded_drivers_are_accepted() {
+        let hp = Inventory {
             manufacturer: "HP".into(),
             board: "8E35".into(),
             bios: "F.13".into(),
             ..Default::default()
         };
-        for driver in ["617.14", "617.42", "617.43", "618.10"] {
-            assert!(model_evidence(&inventory, &identity(driver)).is_ok());
+        let asus = Inventory {
+            manufacturer: "ASUSTeK COMPUTER INC.".into(),
+            board: "G614JZ".into(),
+            bios: "321".into(),
+            ..Default::default()
+        };
+        for driver in ["617.14", "617.42", "621.40", "625.00"] {
+            assert!(model_evidence(&hp, &identity(driver)).is_ok());
+            assert!(model_evidence(&asus, &identity(driver)).is_ok());
         }
         for driver in ["", " "] {
-            assert!(model_evidence(&inventory, &identity(driver)).is_err());
+            assert!(model_evidence(&hp, &identity(driver)).is_err());
         }
-        let mut other = identity("617.42");
-        other.vbios = "98.06.2a.40.db".into();
-        assert!(model_evidence(&inventory, &other).is_err());
-        other = identity("617.42");
-        other.name = "NVIDIA GeForce RTX 5070".into();
-        assert!(model_evidence(&inventory, &other).is_err());
-        let mut other_board = inventory;
-        other_board.bios = "F.14".into();
-        assert!(model_evidence(&other_board, &identity("617.42")).is_err());
+        let mut missing_vbios = identity("621.40");
+        missing_vbios.vbios = " ".into();
+        assert!(model_evidence(&hp, &missing_vbios).is_err());
+        let mut non_nvidia = identity("621.40");
+        non_nvidia.name = "AMD Radeon Graphics".into();
+        assert!(model_evidence(&hp, &non_nvidia).is_err());
     }
 }

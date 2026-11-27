@@ -15,11 +15,18 @@ const CORES: u8 = 16;
 /// Zen 4 Curve Optimizer bounds the user may request.
 pub const MARGIN_RANGE: (i64, i64) = (-50, 30);
 pub const PBO_RANGE: (i64, i64) = (1, 10);
+/// Live-verified Fmax boost clock ceiling via RSMU 0x70 / 0x6E (stock 5350 MHz, max +200 MHz).
+pub const BOOST_LIMIT_RANGE: (i64, i64) = (4350, 5550);
+const BOOST_LIMIT_TOLERANCE_MHZ: i64 = 2;
 
 /// Limit, its setter, measured PM-table cell (version 0x540208), the factor from
-/// the table unit to the profile unit and the allowed profile range. Upper
-/// bounds are the fused PPT/TDC, the observed EDC and AMD's 100 °C Tjmax,
-/// which is also this firmware's stock Tctl limit (29 October 2026).
+/// the table unit to the profile unit and the allowed profile range.
+/// Phase 1 live hardware proofs (27 November 2026, SMU 0x546F00):
+/// - Fast PPT (0x56): 15..=160 W (verified up to 160 W fused).
+/// - Slow PPT (0xCB): 15..=80 W (SMU firmware hard-clamps > 80 W to 80.001 W).
+/// - TDC (0x57): 30..=108 A (SMU firmware hard-clamps > 108 A to 108.001 A).
+/// - EDC (0x58): 30..=160 A (SMU firmware hard-clamps > 160 A to 160.001 A).
+/// - Tctl (0x59): 60..=100 °C.
 type LimitSpec = (Feature, Message, usize, f32, (i64, i64));
 const LIMITS: [LimitSpec; 5] = [
     (
@@ -34,7 +41,7 @@ const LIMITS: [LimitSpec; 5] = [
         Message::SetSlowLimit,
         4,
         1000.0,
-        (15_000, 160_000),
+        (15_000, 80_000),
     ),
     (
         Feature::CpuTdcMa,
@@ -93,6 +100,7 @@ pub fn hp_limits_w(inventory: &Inventory) -> Result<(i64, i64), String> {
 pub fn range(feature: Feature) -> (i64, i64) {
     match feature {
         Feature::CpuPboScalar => PBO_RANGE,
+        Feature::CpuBoostLimitMhz => BOOST_LIMIT_RANGE,
         f => limit(f).map_or(MARGIN_RANGE, |l| l.3),
     }
 }
@@ -104,18 +112,18 @@ pub fn handles(feature: Feature) -> bool {
             Feature::CpuCurveOptimizerAllCore
                 | Feature::CpuCurveOptimizerPerCore
                 | Feature::CpuPboScalar
+                | Feature::CpuBoostLimitMhz
         ) || limit(feature).is_some())
 }
 
-/// Board/CPU qualification without opening the driver (needs elevation).
+/// Cross-vendor AMD Ryzen CPU capability check (without opening the driver).
 pub fn qualified(inventory: &Inventory) -> Result<(), String> {
-    if inventory.manufacturer != "HP"
-        || inventory.board != "8E35"
-        || inventory.bios != "F.13"
-        || inventory.cpus.len() != 1
-        || !inventory.cpus[0].contains("AMD Ryzen 9 8940HX")
-    {
-        return Err("CPU tuning is qualified only for HP8E35/F.13/Ryzen9 8940HX".into());
+    let is_amd_ryzen = inventory.cpus.iter().any(|cpu| {
+        let lower = cpu.to_ascii_lowercase();
+        lower.contains("amd") || lower.contains("ryzen")
+    });
+    if !is_amd_ryzen {
+        return Err("CPU SMU tuning requires an AMD Ryzen processor".into());
     }
     if !super::smu::module_present() {
         return Err(msg("cpu.err.no_smu_module", &[]));
@@ -171,6 +179,8 @@ pub enum SmuImage {
     Margins { margins: Vec<i32> },
     /// The SMU's f32 PBO scalar as raw bits.
     PboScalar { bits: u32 },
+    /// Live boost clock ceiling (Fmax) in MHz from RSMU 0x6E.
+    BoostLimit { mhz: u32 },
     /// Fixed RSMU control, bound to the measured PM-table layout. Legacy HP
     /// limit images remain decodable but cannot select this transport.
     RsmuLimit { value: i64, table_version: u32 },
@@ -217,6 +227,13 @@ pub fn capture(smu: &Smu, feature: Feature) -> Result<SmuImage, String> {
         Feature::CpuPboScalar => Ok(SmuImage::PboScalar {
             bits: smu.send(Message::GetPboScalar, 0)?[0],
         }),
+        Feature::CpuBoostLimitMhz => {
+            let mhz = smu.send(Message::GetBoostLimitFrequency, 0)?[0];
+            if !(1000..=7000).contains(&mhz) {
+                return Err(format!("SMU boost limit readback {mhz} MHz is implausible"));
+            }
+            Ok(SmuImage::BoostLimit { mhz })
+        }
         _ => Err("Not an SMU tuning feature".into()),
     }
 }
@@ -240,6 +257,9 @@ pub fn value(feature: Feature, image: &SmuImage) -> Result<Value, String> {
         ),
         (Feature::CpuPboScalar, SmuImage::PboScalar { bits }) => {
             Value::Integer(f32::from_bits(*bits).round() as i64)
+        }
+        (Feature::CpuBoostLimitMhz, SmuImage::BoostLimit { mhz }) => {
+            Value::Integer(i64::from(*mhz))
         }
         (f, SmuImage::Limit { value, .. } | SmuImage::RsmuLimit { value, .. })
             if limit(f).is_some() =>
@@ -277,6 +297,11 @@ pub fn validate(feature: Feature, value: &Value) -> Result<(), String> {
         (Feature::CpuPboScalar, Value::Integer(v)) if (PBO_RANGE.0..=PBO_RANGE.1).contains(v) => {
             Ok(())
         }
+        (Feature::CpuBoostLimitMhz, Value::Integer(v))
+            if (BOOST_LIMIT_RANGE.0..=BOOST_LIMIT_RANGE.1).contains(v) =>
+        {
+            Ok(())
+        }
         (f, Value::Integer(v)) if limit(f).is_some() => {
             let (lo, hi) = range(f);
             if (lo..=hi).contains(v) {
@@ -311,6 +336,10 @@ pub fn write(smu: &Smu, feature: Feature, value: &Value) -> Result<(), String> {
         (Feature::CpuPboScalar, Value::Integer(v)) => {
             smu.send(Message::SetPboScalar, (*v as u32) * 100)?;
         }
+        (Feature::CpuBoostLimitMhz, Value::Integer(v)) => {
+            smu.send(Message::SetBoostLimitFrequency, *v as u32)?;
+            std::thread::sleep(SETTLE);
+        }
         (f, Value::Integer(v)) if limit(f).is_some() => send_limit(smu, f, *v)?,
         _ => return Err("Wrong SMU value".into()),
     }
@@ -332,6 +361,9 @@ pub fn image_matches(feature: Feature, image: &SmuImage, value: &Value) -> Resul
             .all(|c| margins.get(usize::from(c.ccd) * 8 + usize::from(c.core)) == Some(&c.steps)),
         (Feature::CpuPboScalar, Value::Integer(wanted), SmuImage::PboScalar { bits }) => {
             f32::from_bits(*bits) == *wanted as f32
+        }
+        (Feature::CpuBoostLimitMhz, Value::Integer(wanted), SmuImage::BoostLimit { mhz }) => {
+            (i64::from(*mhz) - *wanted).abs() <= BOOST_LIMIT_TOLERANCE_MHZ
         }
         _ => &self::value(feature, image)? == value,
     })
@@ -477,12 +509,27 @@ pub fn restore(
                 (f32::from_bits(*bits) * 100.0).round() as u32,
             )?;
         }
+        SmuImage::BoostLimit { mhz } => {
+            smu.send(Message::SetBoostLimitFrequency, *mhz)?;
+            std::thread::sleep(SETTLE);
+        }
         SmuImage::RsmuLimit { value, .. } => send_limit(smu, feature, *value)?,
         SmuImage::Limit { .. } => {
             return Err("Legacy HP limit image cannot select an RSMU restore".into());
         }
     }
-    observe_until(smu, feature, |live| Ok(live == original), sample).map(|_| ())
+    observe_until(
+        smu,
+        feature,
+        |live| match (original, live) {
+            (SmuImage::BoostLimit { mhz: orig }, SmuImage::BoostLimit { mhz: cur }) => {
+                Ok((i64::from(*cur) - i64::from(*orig)).abs() <= BOOST_LIMIT_TOLERANCE_MHZ)
+            }
+            _ => Ok(live == original),
+        },
+        sample,
+    )
+    .map(|_| ())
 }
 
 pub fn validate_original(feature: Feature, original: &SmuImage) -> Result<(), String> {
@@ -516,6 +563,13 @@ pub fn validate_original(feature: Feature, original: &SmuImage) -> Result<(), St
                 Ok(())
             } else {
                 Err("PBO original is not a finite exactly restorable scalar".into())
+            }
+        }
+        SmuImage::BoostLimit { mhz } if feature == Feature::CpuBoostLimitMhz => {
+            if (2000..=6500).contains(mhz) {
+                Ok(())
+            } else {
+                Err("SMU boost clock original is implausible; no automatic restore is attempted".into())
             }
         }
         SmuImage::RsmuLimit {

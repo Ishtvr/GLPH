@@ -35,9 +35,9 @@ pub(crate) fn profile_directory() -> Result<PathBuf, String> {
         if !root.is_absolute() {
             return Err("Windows profile directory is not absolute".into());
         }
-        // Outside AppData: Codex/MSIX children and Task Scheduler must see the
-        // same durable files. This is per-user data, not an elevated command path.
-        Ok(root.join(".omen-hub-pp"))
+        // Outside AppData: isolated per-user PerformanceHub data directory
+        // (keeps journals, presets, and VBIOS backups separate from OmenHub++).
+        Ok(root.join(".performance-hub"))
     })();
     // SAFETY: Every token path, including errors, closes its query-only handle.
     unsafe {

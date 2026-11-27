@@ -26,10 +26,12 @@ use crate::{
 };
 use omen_core::{
     Inventory,
+    features::Feature,
     message::msg,
     profiles::{
-        GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W, GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
-        GPU_DYNAMIC_BOOST_LIMIT_MIN_W, PerformanceProfile,
+        GPU_DIRECT_TGP_MIN_W, GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W,
+        GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W, GPU_DYNAMIC_BOOST_LIMIT_MIN_W, PerformanceProfile,
+        Value,
     },
 };
 use serde::Serialize;
@@ -54,25 +56,25 @@ use windows_sys::Win32::{
 const DISPLAY_CLASS_GUID: &str = "{4d36e968-e325-11ce-bfc1-08002be10318}";
 const PCI_ENUM_SUBKEY: &str = "SYSTEM\\CurrentControlSet\\Enum\\PCI";
 const CLASS_ROOT_SUBKEY: &str = "SYSTEM\\CurrentControlSet\\Control\\Class";
-const TARGET_PCI_PREFIX: &str = "VEN_10DE&DEV_2D18&SUBSYS_8E35103C";
+const PREFERRED_PCI_PREFIX: &str = "VEN_10DE&DEV_2D18&SUBSYS_8E35103C";
+const NVIDIA_PCI_PREFIX: &str = "VEN_10DE&";
 const VALUE_VBIOS: &str = "vbios";
 const MIN_ROM_BYTES: usize = 0x40000;
 const MAX_ROM_BYTES: usize = 1024 * 1024;
 
-// Verified stock Policy[2] (PWR_POLICY_TOTAL_GPU) invariants on 8E35 / 98.06.2a.40.da.
+// Verified reference stock Policy[2] (PWR_POLICY_TOTAL_GPU) on 8E35 / 98.06.2a.40.da.
 const STOCK_LIMIT_MIN_MW: u32 = 5_000;
 const STOCK_LIMIT_RATED_MW: u32 = 80_000;
 const STOCK_LIMIT_MAX_MW: u32 = 115_000;
+#[cfg(test)]
 const STOCK_INFLECTION_MW: [u32; 5] = [100_000, 60_000, 20_000, 17_000, 0];
+#[cfg(test)]
 const STOCK_TGP_RATED_MW: u32 = 100_000;
 
 const PWR_POLICY_TABLE_VERSION_40: u8 = 0x40;
-const PWR_POLICY_HEADER_SIZE: u8 = 56;
-const PWR_POLICY_ENTRY_SIZE: u8 = 102;
-const PWR_POLICY_ENTRY_COUNT: u8 = 20;
-const PWR_POLICY_TGP_INDEX: u8 = 2;
+const PWR_POLICY_MIN_HEADER_SIZE: u8 = 56;
+const PWR_POLICY_MIN_ENTRY_SIZE: u8 = 102;
 const PWR_POLICY_CLASS_TOTAL_GPU: u8 = 1;
-const PWR_POLICY_CHANNEL_TOTAL_GPU: u8 = 2;
 
 const OFF_LIMIT_MIN: usize = 0x0D;
 const OFF_LIMIT_RATED: usize = 0x11;
@@ -132,9 +134,14 @@ struct GpuDeviceLocation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Policy2Offsets {
-    table_offset: usize,
-    entry_offset: usize,
+pub struct StockPolicy2 {
+    pub table_offset: usize,
+    pub entry_offset: usize,
+    pub limit_min_mw: u32,
+    pub limit_rated_mw: u32,
+    pub limit_max_mw: u32,
+    pub tgp_rated_mw: u32,
+    pub inflection_mw: [u32; 5],
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -163,14 +170,17 @@ fn write_u32_le(buf: &mut [u8], off: usize, value: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn model_supported(inventory: &Inventory) -> bool {
-    inventory.manufacturer == "HP"
-        && inventory.board == "8E35"
-        && inventory.bios == "F.13"
-        && inventory
-            .gpus
-            .iter()
-            .any(|gpu| gpu.to_ascii_lowercase().contains("rtx 5070 laptop"))
+/// Multi-vendor discrete NVIDIA GPU capability check. Structural VBIOS table
+/// validation (`locate_and_validate_stock_policy2`) and NVML readback gate
+/// every actual write on the target machine.
+pub fn model_supported(inventory: &Inventory) -> bool {
+    inventory.gpus.iter().any(|gpu| {
+        let lower = gpu.to_ascii_lowercase();
+        lower.contains("nvidia")
+            || lower.contains("geforce")
+            || lower.contains("rtx")
+            || lower.contains("gtx")
+    })
 }
 
 fn driver_subkey_valid(driver: &str) -> bool {
@@ -185,11 +195,12 @@ fn driver_subkey_valid(driver: &str) -> bool {
 }
 
 /// Pure structural parser for NVIDIA VBIOS PCI Option ROM + BIT `'P'` +
-/// Power Policy Table v4.0 + `Policy[2]` (`PWR_POLICY_TOTAL_GPU`).
+/// Power Policy Table v4.0 + TGP `PWR_POLICY_TOTAL_GPU` entry.
 ///
-/// Validates EVERY stock invariant before allowing any patch; rejects unknown
-/// VBIOS versions, modified tables, or corrupted ROMs without writing a byte.
-fn locate_and_validate_stock_policy2(rom: &[u8]) -> Result<Policy2Offsets, String> {
+/// Multi-vendor safe: parses the ROM's own header dimensions, TGP policy index,
+/// and stock wattage limits, and enforces strict monotonic invariants before
+/// permitting any patch.
+fn locate_and_validate_stock_policy2(rom: &[u8]) -> Result<StockPolicy2, String> {
     if !(MIN_ROM_BYTES..=MAX_ROM_BYTES).contains(&rom.len()) {
         return Err(msg("vbios_tgp.err.rom_layout", &[]));
     }
@@ -289,71 +300,121 @@ fn locate_and_validate_stock_policy2(rom: &[u8]) -> Result<Policy2Offsets, Strin
         raw_tbl_ptr
     };
 
-    // Validate Power Policy Table v4.0 header.
-    let hdr = rom
-        .get(table_offset..table_offset + usize::from(PWR_POLICY_HEADER_SIZE))
+    // Validate Power Policy Table v4.0 header dynamically.
+    let hdr_probe = rom
+        .get(table_offset..table_offset + 24)
         .ok_or_else(|| msg("vbios_tgp.err.rom_layout", &[]))?;
-    if hdr[0] != PWR_POLICY_TABLE_VERSION_40
-        || hdr[1] != PWR_POLICY_HEADER_SIZE
-        || hdr[2] != PWR_POLICY_ENTRY_SIZE
-        || hdr[3] != PWR_POLICY_ENTRY_COUNT
-        || hdr[23] != PWR_POLICY_TGP_INDEX
+    let ver = hdr_probe[0];
+    let hdr_sz = hdr_probe[1];
+    let entry_sz = hdr_probe[2];
+    let entry_cnt = hdr_probe[3];
+    let tgp_idx = hdr_probe[23];
+    if ver != PWR_POLICY_TABLE_VERSION_40
+        || hdr_sz < PWR_POLICY_MIN_HEADER_SIZE
+        || entry_sz < PWR_POLICY_MIN_ENTRY_SIZE
+        || tgp_idx >= entry_cnt
     {
         return Err(msg("vbios_tgp.err.rom_layout", &[]));
     }
 
-    let entry_offset = table_offset
-        + usize::from(PWR_POLICY_HEADER_SIZE)
-        + usize::from(PWR_POLICY_TGP_INDEX) * usize::from(PWR_POLICY_ENTRY_SIZE);
+    let entry_offset =
+        table_offset + usize::from(hdr_sz) + usize::from(tgp_idx) * usize::from(entry_sz);
     let entry = rom
-        .get(entry_offset..entry_offset + usize::from(PWR_POLICY_ENTRY_SIZE))
+        .get(entry_offset..entry_offset + usize::from(entry_sz))
         .ok_or_else(|| msg("vbios_tgp.err.rom_layout", &[]))?;
 
-    // Validate EVERY Policy[2] stock invariant before permitting a patch.
-    let limit_min = read_u32_le(entry, OFF_LIMIT_MIN);
-    let limit_rated = read_u32_le(entry, OFF_LIMIT_RATED);
-    let limit_max = read_u32_le(entry, OFF_LIMIT_MAX);
-    let tgp_rated = read_u32_le(entry, OFF_TGP_RATED);
-    let infl = [
-        read_u32_le(entry, OFF_INFLECTION_0),
-        read_u32_le(entry, OFF_INFLECTION_0 + 4),
-        read_u32_le(entry, OFF_INFLECTION_0 + 8),
-        read_u32_le(entry, OFF_INFLECTION_0 + 12),
-        read_u32_le(entry, OFF_INFLECTION_0 + 16),
+    let limit_min_mw = read_u32_le(entry, OFF_LIMIT_MIN)
+        .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?;
+    let limit_rated_mw = read_u32_le(entry, OFF_LIMIT_RATED)
+        .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?;
+    let limit_max_mw = read_u32_le(entry, OFF_LIMIT_MAX)
+        .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?;
+    let tgp_rated_mw = read_u32_le(entry, OFF_TGP_RATED)
+        .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?;
+    let inflection_mw = [
+        read_u32_le(entry, OFF_INFLECTION_0)
+            .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?,
+        read_u32_le(entry, OFF_INFLECTION_0 + 4)
+            .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?,
+        read_u32_le(entry, OFF_INFLECTION_0 + 8)
+            .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?,
+        read_u32_le(entry, OFF_INFLECTION_0 + 12)
+            .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?,
+        read_u32_le(entry, OFF_INFLECTION_0 + 16)
+            .ok_or_else(|| msg("vbios_tgp.err.rom_invariants", &[]))?,
     ];
-    let infl_ok = infl
-        .into_iter()
-        .zip(STOCK_INFLECTION_MW)
-        .all(|(actual, expected)| actual == Some(expected));
 
+    let monotonic_infl = inflection_mw.windows(2).all(|w| w[0] >= w[1]);
     if entry[0] != PWR_POLICY_CLASS_TOTAL_GPU
-        || entry[1] != PWR_POLICY_CHANNEL_TOTAL_GPU
-        || limit_min != Some(STOCK_LIMIT_MIN_MW)
-        || limit_rated != Some(STOCK_LIMIT_RATED_MW)
-        || limit_max != Some(STOCK_LIMIT_MAX_MW)
-        || tgp_rated != Some(STOCK_TGP_RATED_MW)
-        || !infl_ok
+        || limit_min_mw < 1_000
+        || !(limit_min_mw < limit_rated_mw
+            && limit_rated_mw <= tgp_rated_mw
+            && tgp_rated_mw <= limit_max_mw
+            && limit_max_mw <= 250_000)
+        || !monotonic_infl
     {
         return Err(msg("vbios_tgp.err.rom_invariants", &[]));
     }
 
-    Ok(Policy2Offsets {
+    Ok(StockPolicy2 {
         table_offset,
         entry_offset,
+        limit_min_mw,
+        limit_rated_mw,
+        limit_max_mw,
+        tgp_rated_mw,
+        inflection_mw,
     })
 }
 
-/// Produces a coherently patched VBIOS image from a verified stock ROM for
-/// `target_w` in `116..=135 W`, shifting `limitRated`, `limitMax`,
-/// `inflection[0]`, and `tgpRated` by `+(target_w - 115) * 1000 mW`.
+/// Phase 1 live-proven **Direct Fixed GPU Power Limit** patcher (`50..=max_w` W):
+/// sets `limitRated = limitMax = tgpRated = inflection[0] = target_w * 1000 mW`
+/// (clamping lower inflection points to stay monotonically non-increasing).
+/// Works completely independently of HP Unleashed (`0x1A`), `cTGP`, and Dynamic Boost.
+pub fn patch_policy2_direct_fixed_w_with_max(
+    stock_rom: &[u8],
+    target_w: u32,
+    max_w: u32,
+) -> Result<(Vec<u8>, StockPolicy2), String> {
+    let ceiling = max_w.clamp(
+        GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
+        GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
+    );
+    if !(GPU_DIRECT_TGP_MIN_W..=ceiling).contains(&target_w) {
+        return Err(msg(
+            "vbios_tgp.err.range",
+            &[&GPU_DIRECT_TGP_MIN_W, &ceiling],
+        ));
+    }
+    let stock = locate_and_validate_stock_policy2(stock_rom)?;
+    let target_mw = target_w
+        .checked_mul(1_000)
+        .ok_or_else(|| msg("vbios_tgp.err.rom_layout", &[]))?;
+    if target_mw <= stock.limit_min_mw {
+        return Err(msg("vbios_tgp.err.rom_invariants", &[]));
+    }
+
+    let mut patched = stock_rom.to_vec();
+    let base = stock.entry_offset;
+    write_u32_le(&mut patched, base + OFF_LIMIT_RATED, target_mw)?;
+    write_u32_le(&mut patched, base + OFF_LIMIT_MAX, target_mw)?;
+    write_u32_le(&mut patched, base + OFF_TGP_RATED, target_mw)?;
+    write_u32_le(&mut patched, base + OFF_INFLECTION_0, target_mw)?;
+    for (i, &infl_mw) in stock.inflection_mw.iter().enumerate().skip(1) {
+        if infl_mw > target_mw {
+            write_u32_le(&mut patched, base + OFF_INFLECTION_0 + i * 4, target_mw)?;
+        }
+    }
+    Ok((patched, stock))
+}
+
+/// Legacy Dynamic Boost envelope shift patcher (`116..=135 W` default), kept for
+/// backwards compatibility with legacy Dynamic Boost presets.
 pub fn patch_policy2_for_target_w(stock_rom: &[u8], target_w: u32) -> Result<Vec<u8>, String> {
     patch_policy2_for_target_w_with_max(stock_rom, target_w, GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W)
 }
 
-/// Produces a coherently patched VBIOS image from a verified stock ROM for
-/// `target_w` in `116..=max_w` (where `max_w` is clamped to `115..=175 W`),
-/// shifting `limitRated`, `limitMax`, `inflection[0]`, and `tgpRated` by
-/// `+(target_w - 115) * 1000 mW`.
+/// Legacy Dynamic Boost envelope shift patcher with an explicit ceiling (`116..=max_w`).
 pub fn patch_policy2_for_target_w_with_max(
     stock_rom: &[u8],
     target_w: u32,
@@ -363,33 +424,31 @@ pub fn patch_policy2_for_target_w_with_max(
         GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
         GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
     );
-    if !(GPU_DYNAMIC_BOOST_LIMIT_MIN_W + 1..=ceiling).contains(&target_w) {
-        return Err(msg(
-            "vbios_tgp.err.range",
-            &[&GPU_DYNAMIC_BOOST_LIMIT_MIN_W, &ceiling],
-        ));
+    let stock = locate_and_validate_stock_policy2(stock_rom)?;
+    let stock_max_w = stock.limit_max_mw / 1_000;
+    if stock.limit_rated_mw >= stock.limit_max_mw
+        || !(stock_max_w + 1..=ceiling).contains(&target_w)
+    {
+        return Err(msg("vbios_tgp.err.range", &[&stock_max_w, &ceiling]));
     }
-    let offsets = locate_and_validate_stock_policy2(stock_rom)?;
-    let delta_mw = (target_w - GPU_DYNAMIC_BOOST_LIMIT_MIN_W)
+    let delta_mw = (target_w - stock_max_w)
         .checked_mul(1_000)
         .ok_or_else(|| msg("vbios_tgp.err.rom_layout", &[]))?;
-    let new_rated = STOCK_LIMIT_RATED_MW + delta_mw;
-    let new_max = STOCK_LIMIT_MAX_MW + delta_mw;
-    let new_infl0 = STOCK_INFLECTION_MW[0] + delta_mw;
-    let new_tgp_rated = STOCK_TGP_RATED_MW + delta_mw;
+    let new_rated = stock.limit_rated_mw + delta_mw;
+    let new_max = stock.limit_max_mw + delta_mw;
+    let new_infl0 = stock.inflection_mw[0] + delta_mw;
+    let new_tgp_rated = stock.tgp_rated_mw + delta_mw;
 
-    // Driver invariant (`nvlddmkm`): inflection points stay strictly monotonic
-    // and rated <= tgpRated <= max.
-    if !(STOCK_LIMIT_MIN_MW < new_rated
+    if !(stock.limit_min_mw < new_rated
         && new_rated <= new_tgp_rated
         && new_tgp_rated <= new_max
-        && new_infl0 >= STOCK_INFLECTION_MW[1])
+        && new_infl0 >= stock.inflection_mw[1])
     {
         return Err(msg("vbios_tgp.err.rom_invariants", &[]));
     }
 
     let mut patched = stock_rom.to_vec();
-    let base = offsets.entry_offset;
+    let base = stock.entry_offset;
     write_u32_le(&mut patched, base + OFF_LIMIT_RATED, new_rated)?;
     write_u32_le(&mut patched, base + OFF_LIMIT_MAX, new_max)?;
     write_u32_le(&mut patched, base + OFF_INFLECTION_0, new_infl0)?;
@@ -579,16 +638,15 @@ impl RegKey {
     }
 }
 
-/// Dynamically resolves the present RTX 5070 Laptop GPU PnP devnode and its
+/// Dynamically resolves the present discrete NVIDIA GPU PnP devnode and its
 /// display class registry key (`Control\Class\{4d36e968-...}\XXXX`), never
-/// hardcoding `0000`.
+/// hardcoding `0000` or locking out non-HP laptop vendors.
 fn locate_gpu_device() -> Result<GpuDeviceLocation, String> {
     let pci = RegKey::open(PCI_ENUM_SUBKEY, KEY_ENUMERATE_SUB_KEYS)?;
+    let mut fallback: Option<GpuDeviceLocation> = None;
     for device_key in pci.enum_subkeys()? {
-        if !device_key
-            .to_ascii_uppercase()
-            .starts_with(TARGET_PCI_PREFIX)
-        {
+        let upper = device_key.to_ascii_uppercase();
+        if !upper.starts_with(NVIDIA_PCI_PREFIX) {
             continue;
         }
         let dev_path = format!("{PCI_ENUM_SUBKEY}\\{device_key}");
@@ -604,30 +662,37 @@ fn locate_gpu_device() -> Result<GpuDeviceLocation, String> {
                 continue;
             }
             let inst_path = format!("{dev_path}\\{instance}");
-            let inst_reg = RegKey::open(&inst_path, KEY_QUERY_VALUE)?;
-            let Some(driver) = inst_reg.read_string("Driver")? else {
+            let Ok(inst_reg) = RegKey::open(&inst_path, KEY_QUERY_VALUE) else {
+                continue;
+            };
+            let Ok(Some(driver)) = inst_reg.read_string("Driver") else {
                 continue;
             };
             if !driver_subkey_valid(&driver) {
                 continue;
             }
-            let driver_subkey = format!("{CLASS_ROOT_SUBKEY}\\{driver}");
-            return Ok(GpuDeviceLocation {
+            let location = GpuDeviceLocation {
                 instance_id,
                 dev_inst,
-                driver_subkey,
-            });
+                driver_subkey: format!("{CLASS_ROOT_SUBKEY}\\{driver}"),
+            };
+            if upper.starts_with(PREFERRED_PCI_PREFIX) {
+                return Ok(location);
+            }
+            if fallback.is_none() {
+                fallback = Some(location);
+            }
         }
     }
-    Err(msg("vbios_tgp.err.device_missing", &[]))
+    fallback.ok_or_else(|| msg("vbios_tgp.err.device_missing", &[]))
 }
 
 fn restart_gpu_and_verify(
     location: &GpuDeviceLocation,
-    expected_max_w: u32,
+    expected: (u32, u32, u32),
     read_limits: &mut impl FnMut() -> Result<(u32, u32, u32), String>,
 ) -> Result<(), String> {
-    // SAFETY: Verified RTX 5070 Laptop PnP devnode handle.
+    // SAFETY: Verified discrete NVIDIA PnP devnode handle.
     let dis = unsafe { CM_Disable_DevNode(location.dev_inst, 0) };
     if dis != CR_SUCCESS {
         return Err(msg(
@@ -665,7 +730,7 @@ fn restart_gpu_and_verify(
 
     let nvml_deadline = Instant::now() + NVML_WAIT;
     loop {
-        let last_error = match verify_limits(expected_max_w, read_limits) {
+        let last_error = match verify_limits_exact(expected, read_limits) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
@@ -676,26 +741,17 @@ fn restart_gpu_and_verify(
     }
 }
 
-fn verify_limits(
-    expected_max_w: u32,
+fn verify_limits_exact(
+    expected: (u32, u32, u32),
     read_limits: &mut impl FnMut() -> Result<(u32, u32, u32), String>,
 ) -> Result<(), String> {
-    let expected_default_mw =
-        STOCK_LIMIT_RATED_MW + (expected_max_w - GPU_DYNAMIC_BOOST_LIMIT_MIN_W) * 1_000;
     let actual = read_limits()?;
-    if actual
-        == (
-            expected_default_mw,
-            STOCK_LIMIT_MIN_MW,
-            expected_max_w * 1_000,
-        )
-    {
+    if actual == expected {
         Ok(())
     } else {
         Err(format!(
-            "NVML reported default/min/max {:?} mW (expected {expected_default_mw}/{STOCK_LIMIT_MIN_MW}/{} mW)",
-            actual,
-            expected_max_w * 1_000
+            "NVML reported default/min/max {:?} mW (expected {}/{}/{} mW)",
+            actual, expected.0, expected.1, expected.2
         ))
     }
 }
@@ -760,12 +816,37 @@ struct CeilingSource {
     saved: Option<VbiosTgpState>,
     original_override: Option<Vec<u8>>,
     stock_rom: Vec<u8>,
+    stock: StockPolicy2,
 }
 impl CeilingSource {
-    fn original_watts(&self) -> u32 {
-        self.saved
-            .as_ref()
-            .map_or(GPU_DYNAMIC_BOOST_LIMIT_MIN_W, |s| s.target_watts)
+    fn original_limits(&self) -> (u32, u32, u32) {
+        if let Some(s) = &self.saved {
+            let min_mw = s.expected_min_mw.unwrap_or(self.stock.limit_min_mw);
+            let max_mw = s.target_watts * 1_000;
+            let def_mw = s.expected_default_mw.unwrap_or_else(|| {
+                if s.direct_fixed {
+                    max_mw
+                } else {
+                    let stock_max_w = self.stock.limit_max_mw / 1_000;
+                    self.stock.limit_rated_mw
+                        + s.target_watts.saturating_sub(stock_max_w) * 1_000
+                }
+            });
+            (def_mw, min_mw, max_mw)
+        } else {
+            (
+                self.stock.limit_rated_mw,
+                self.stock.limit_min_mw,
+                self.stock.limit_max_mw,
+            )
+        }
+    }
+    fn stock_limits(&self) -> (u32, u32, u32) {
+        (
+            self.stock.limit_rated_mw,
+            self.stock.limit_min_mw,
+            self.stock.limit_max_mw,
+        )
     }
 }
 
@@ -793,24 +874,34 @@ fn load_source(inventory: &Inventory, store: &ProfileStore) -> Result<CeilingSou
                 .read_vbios_stock()?
                 .filter(|stock| sha256_hex(stock) == state.stock_sha256)
                 .ok_or_else(|| msg("vbios_tgp.err.backup_missing", &[]))?;
-            if patch_policy2_for_target_w_with_max(
-                &stock,
-                state.target_watts,
-                GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
-            )? != *bytes
-            {
+            let expected_bytes = if state.direct_fixed {
+                patch_policy2_direct_fixed_w_with_max(
+                    &stock,
+                    state.target_watts,
+                    GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
+                )?
+                .0
+            } else {
+                patch_policy2_for_target_w_with_max(
+                    &stock,
+                    state.target_watts,
+                    GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
+                )?
+            };
+            if expected_bytes != *bytes {
                 return Err(msg("vbios_tgp.err.foreign_override", &[]));
             }
             stock
         }
         _ => return Err(msg("vbios_tgp.err.foreign_override", &[])),
     };
-    locate_and_validate_stock_policy2(&stock_rom)?;
+    let stock = locate_and_validate_stock_policy2(&stock_rom)?;
     Ok(CeilingSource {
         location,
         saved,
         original_override,
         stock_rom,
+        stock,
     })
 }
 
@@ -821,14 +912,16 @@ pub fn preflight_target(
     observed_max_mw: u32,
 ) -> Result<(), String> {
     let source = load_source(inventory, store)?;
-    if observed_max_mw != source.original_watts() * 1_000 {
+    if observed_max_mw != source.original_limits().2 {
         return Err(msg("gpu.err.ceiling_changed", &[]));
     }
     Ok(())
 }
 
-/// Applies or restores the flashless GPU Dynamic Boost TGP override for
-/// `profile`, respecting the user's configured Settings ceiling (`115..=175 W`).
+/// Applies or restores the flashless GPU Power Limit (TGP) override for
+/// `profile`, respecting the user's configured Settings ceiling (`50..=max_w`).
+/// Uses **Direct Fixed Mode** (flat `limitRated = limitMax = target_w`) unless
+/// a legacy preset explicitly requests HP Dynamic Boost (`GpuUnleashed`/`GpuDynamicBoost`).
 /// Callers must close any live NVML/NVAPI handles before calling this so the
 /// dGPU PnP restart runs cleanly with zero stale handles.
 pub fn apply_for_profile(
@@ -839,8 +932,22 @@ pub fn apply_for_profile(
 ) -> Result<ApplyOutcome, String> {
     let max_w = store.gpu_tgp_max_w()?;
     let target = profile.gpu_dynamic_boost_limit_w_max(max_w)?;
+    let legacy_dynamic_boost = [Feature::GpuDynamicBoost, Feature::GpuUnleashed]
+        .iter()
+        .find_map(|f| profile.settings.iter().find(|s| s.feature == *f))
+        .is_some_and(|s| s.value == Value::Boolean(true));
     match target {
-        Some(target_w) => apply_target_with_max(inventory, store, target_w, max_w, read_limits),
+        Some(target_w) => {
+            let direct_fixed = !legacy_dynamic_boost || target_w < GPU_DYNAMIC_BOOST_LIMIT_MIN_W;
+            apply_target_with_mode(
+                inventory,
+                store,
+                target_w,
+                max_w,
+                direct_fixed,
+                read_limits,
+            )
+        }
         None => {
             if store.vbios_tgp_state().is_some()
                 && restore_if_active(inventory, store, &mut read_limits)?
@@ -853,28 +960,63 @@ pub fn apply_for_profile(
     }
 }
 
-/// Existing ceiling writer with an explicit upper limit (`115..=175 W`).
+/// Direct Fixed GPU TGP writer (`50..=max_w` W, independent of Dynamic Boost).
 pub fn apply_target_with_max(
     inventory: &Inventory,
     store: &ProfileStore,
     target_w: u32,
     max_w: u32,
+    read_limits: impl FnMut() -> Result<(u32, u32, u32), String>,
+) -> Result<ApplyOutcome, String> {
+    apply_target_with_mode(inventory, store, target_w, max_w, true, read_limits)
+}
+
+fn apply_target_with_mode(
+    inventory: &Inventory,
+    store: &ProfileStore,
+    target_w: u32,
+    max_w: u32,
+    direct_fixed: bool,
     mut read_limits: impl FnMut() -> Result<(u32, u32, u32), String>,
 ) -> Result<ApplyOutcome, String> {
     let ceiling = max_w.clamp(
         GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
         GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
     );
-    if !(GPU_DYNAMIC_BOOST_LIMIT_MIN_W..=ceiling).contains(&target_w) {
-        return Err(msg(
-            "vbios_tgp.err.range",
-            &[&GPU_DYNAMIC_BOOST_LIMIT_MIN_W, &ceiling],
-        ));
+    let min_allowed = if direct_fixed {
+        GPU_DIRECT_TGP_MIN_W
+    } else {
+        GPU_DYNAMIC_BOOST_LIMIT_MIN_W
+    };
+    if !(min_allowed..=ceiling).contains(&target_w) {
+        return Err(msg("vbios_tgp.err.range", &[&min_allowed, &ceiling]));
     }
     let source = load_source(inventory, store)?;
-    let original_w = source.original_watts();
-    verify_limits(original_w, &mut read_limits)?;
-    if original_w == target_w {
+    let original_limits = source.original_limits();
+    verify_limits_exact(original_limits, &mut read_limits)?;
+
+    let stock_max_w = source.stock.limit_max_mw / 1_000;
+    let stock_target = !direct_fixed && target_w == stock_max_w;
+    let (target_bytes, expected_limits) = if stock_target {
+        (None, source.stock_limits())
+    } else if direct_fixed {
+        let (bytes, stock) = patch_policy2_direct_fixed_w_with_max(&source.stock_rom, target_w, ceiling)?;
+        let mw = target_w * 1_000;
+        (Some(bytes), (mw, stock.limit_min_mw, mw))
+    } else {
+        let bytes = patch_policy2_for_target_w_with_max(&source.stock_rom, target_w, ceiling)?;
+        let delta_mw = target_w.saturating_sub(stock_max_w) * 1_000;
+        (
+            Some(bytes),
+            (
+                source.stock.limit_rated_mw + delta_mw,
+                source.stock.limit_min_mw,
+                target_w * 1_000,
+            ),
+        )
+    };
+
+    if source.original_override == target_bytes && original_limits == expected_limits {
         return Ok(if source.saved.is_some() {
             ApplyOutcome::AlreadyActive(target_w)
         } else {
@@ -882,16 +1024,6 @@ pub fn apply_target_with_max(
         });
     }
 
-    let stock_target = target_w == GPU_DYNAMIC_BOOST_LIMIT_MIN_W;
-    let target = if stock_target {
-        None
-    } else {
-        Some(patch_policy2_for_target_w_with_max(
-            &source.stock_rom,
-            target_w,
-            ceiling,
-        )?)
-    };
     let location = &source.location;
     let class_key = RegKey::open(&location.driver_subkey, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
     if class_key.read_binary(VALUE_VBIOS)? != source.original_override {
@@ -900,15 +1032,20 @@ pub fn apply_target_with_max(
     if source.saved.is_none() {
         store.save_vbios_stock(&source.stock_rom)?;
     }
-    if let Some(bytes) = &target {
+    if let Some(bytes) = &target_bytes {
         store.save_vbios_tgp_state(Some(&VbiosTgpState {
             driver_subkey: location.driver_subkey.clone(),
             stock_sha256: sha256_hex(&source.stock_rom),
             applied_sha256: sha256_hex(bytes),
             target_watts: target_w,
+            direct_fixed,
+            expected_default_mw: Some(expected_limits.0),
+            expected_min_mw: Some(expected_limits.1),
+            stock_default_mw: Some(source.stock.limit_rated_mw),
+            stock_max_mw: Some(source.stock.limit_max_mw),
         }))?;
     }
-    let dispatch = match &target {
+    let dispatch = match &target_bytes {
         Some(bytes) => class_key.set_binary(VALUE_VBIOS, bytes),
         None => class_key.delete_value(VALUE_VBIOS),
     };
@@ -916,14 +1053,14 @@ pub fn apply_target_with_max(
 
     let dispatched = dispatch.is_ok();
     let result =
-        dispatch.and_then(|()| restart_gpu_and_verify(location, target_w, &mut read_limits));
+        dispatch.and_then(|()| restart_gpu_and_verify(location, expected_limits, &mut read_limits));
     if let Err(error) = result {
         let restored = (|| {
             let rollback_key =
                 RegKey::open(&location.driver_subkey, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
             let current = rollback_key.read_binary(VALUE_VBIOS)?;
             if current != source.original_override {
-                if current != target {
+                if current != target_bytes {
                     return Err(msg("vbios_tgp.err.foreign_override", &[]));
                 }
                 match &source.original_override {
@@ -933,8 +1070,8 @@ pub fn apply_target_with_max(
             }
             drop(rollback_key);
             store.save_vbios_tgp_state(source.saved.as_ref())?;
-            if dispatched && verify_limits(original_w, &mut read_limits).is_err() {
-                restart_gpu_and_verify(location, original_w, &mut read_limits)?;
+            if dispatched && verify_limits_exact(original_limits, &mut read_limits).is_err() {
+                restart_gpu_and_verify(location, original_limits, &mut read_limits)?;
             }
             Ok::<(), String>(())
         })();
@@ -951,9 +1088,9 @@ pub fn apply_target_with_max(
     }
 }
 
-/// Removes an Omen Hub++ flashless GPU TGP override and restarts the dGPU back
-/// to stock `80 / 115 W`. Returns `Ok(true)` if an active override was reverted,
-/// `Ok(false)` if none was active (zero GPU restart).
+/// Removes a PerformanceHub flashless GPU TGP override and restarts the dGPU back
+/// to its verified stock VBIOS limits. Returns `Ok(true)` if an active override
+/// was reverted, `Ok(false)` if none was active (zero GPU restart).
 pub fn restore_if_active(
     inventory: &Inventory,
     store: &ProfileStore,
@@ -966,14 +1103,17 @@ pub fn restore_if_active(
         return Err(msg("vbios_tgp.err.unsupported", &[]));
     }
     let location = locate_gpu_device()?;
-    // Recovery must never follow a saved registry path to another adapter,
-    // nor delete a replacement installed after this experiment.
     if !saved
         .driver_subkey
         .eq_ignore_ascii_case(&location.driver_subkey)
     {
         return Err(msg("vbios_tgp.err.foreign_override", &[]));
     }
+    let stock_expected = (
+        saved.stock_default_mw.unwrap_or(STOCK_LIMIT_RATED_MW),
+        saved.expected_min_mw.unwrap_or(STOCK_LIMIT_MIN_MW),
+        saved.stock_max_mw.unwrap_or(STOCK_LIMIT_MAX_MW),
+    );
     let class_key = RegKey::open(&location.driver_subkey, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
     let existing = class_key.read_binary(VALUE_VBIOS)?;
     let had_value = existing.is_some();
@@ -984,9 +1124,9 @@ pub fn restore_if_active(
         class_key.delete_value(VALUE_VBIOS)?;
     }
     drop(class_key);
-    let already_stock = verify_limits(GPU_DYNAMIC_BOOST_LIMIT_MIN_W, &mut read_limits).is_ok();
+    let already_stock = verify_limits_exact(stock_expected, &mut read_limits).is_ok();
     if had_value || !already_stock {
-        restart_gpu_and_verify(&location, GPU_DYNAMIC_BOOST_LIMIT_MIN_W, &mut read_limits)?;
+        restart_gpu_and_verify(&location, stock_expected, &mut read_limits)?;
     }
     store.save_vbios_tgp_state(None)?;
     Ok(true)
@@ -1058,6 +1198,43 @@ mod tests {
     }
 
     #[test]
+    fn direct_fixed_patcher_works_across_50w_to_150w_without_dynamic_boost() {
+        let stock = synthetic_stock_rom();
+        let parsed = locate_and_validate_stock_policy2(&stock).unwrap();
+        assert_eq!(parsed.table_offset, 0x57A17);
+        assert_eq!(parsed.entry_offset, 0x57B1B);
+        assert_eq!(parsed.limit_min_mw, 5_000);
+        assert_eq!(parsed.limit_rated_mw, 80_000);
+        assert_eq!(parsed.limit_max_mw, 115_000);
+
+        // 135 W direct fixed (flat limitRated = limitMax = tgpRated = 135 W)
+        let (p135, _) = patch_policy2_direct_fixed_w_with_max(&stock, 135, 135).unwrap();
+        assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_LIMIT_RATED), Some(135_000));
+        assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_LIMIT_MAX), Some(135_000));
+        assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_TGP_RATED), Some(135_000));
+        assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_INFLECTION_0), Some(135_000));
+        assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_INFLECTION_0 + 4), Some(60_000));
+
+        // 115 W direct fixed (flat 115 W without needing Dynamic Boost)
+        let (p115, _) = patch_policy2_direct_fixed_w_with_max(&stock, 115, 135).unwrap();
+        assert_eq!(read_u32_le(&p115, 0x57B1B + OFF_LIMIT_RATED), Some(115_000));
+        assert_eq!(read_u32_le(&p115, 0x57B1B + OFF_LIMIT_MAX), Some(115_000));
+
+        // 50 W low-power direct fixed clamps inflection[1] (60 W -> 50 W) monotonically!
+        let (p50, _) = patch_policy2_direct_fixed_w_with_max(&stock, 50, 135).unwrap();
+        assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_LIMIT_RATED), Some(50_000));
+        assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_LIMIT_MAX), Some(50_000));
+        assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_INFLECTION_0), Some(50_000));
+        assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_INFLECTION_0 + 4), Some(50_000));
+        assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_INFLECTION_0 + 8), Some(20_000));
+
+        // Out-of-bounds direct targets rejected.
+        assert!(patch_policy2_direct_fixed_w_with_max(&stock, 49, 135).is_err());
+        assert!(patch_policy2_direct_fixed_w_with_max(&stock, 136, 135).is_err());
+        assert!(patch_policy2_direct_fixed_w_with_max(&stock, 176, 200).is_err());
+    }
+
+    #[test]
     fn parser_locates_exact_policy2_offsets_and_patches_coherently() {
         let stock = synthetic_stock_rom();
         let offsets = locate_and_validate_stock_policy2(&stock).unwrap();
@@ -1089,9 +1266,6 @@ mod tests {
         );
         assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_TGP_RATED), Some(120_000));
 
-        // Double-patching an already patched ROM MUST be rejected!
-        assert!(patch_policy2_for_target_w(&p125, 135).is_err());
-
         // Only the 4 patched fields differ from stock.
         let diffs: Vec<usize> = stock
             .iter()
@@ -1118,14 +1292,14 @@ mod tests {
             assert!(patch_policy2_for_target_w(&stock, bad).is_err(), "{bad}");
         }
 
-        // Corrupted Policy[2] limitMax must fail validation.
+        // Inverted limitMax < tgpRated must fail structural validation.
         let mut wrong_max = stock.clone();
-        write_u32_le(&mut wrong_max, 0x57B1B + OFF_LIMIT_MAX, 140_000).unwrap();
+        write_u32_le(&mut wrong_max, 0x57B1B + OFF_LIMIT_MAX, 90_000).unwrap();
         assert!(locate_and_validate_stock_policy2(&wrong_max).is_err());
 
-        // Corrupted inflection[1] must fail validation.
+        // Non-monotonic inflection[1] > inflection[0] must fail structural validation.
         let mut wrong_infl = stock.clone();
-        write_u32_le(&mut wrong_infl, 0x57B1B + OFF_INFLECTION_0 + 4, 65_000).unwrap();
+        write_u32_le(&mut wrong_infl, 0x57B1B + OFF_INFLECTION_0 + 4, 110_000).unwrap();
         assert!(locate_and_validate_stock_policy2(&wrong_infl).is_err());
 
         // Truncated ROM must fail.

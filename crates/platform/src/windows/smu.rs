@@ -45,6 +45,8 @@ pub enum Message {
     IsOverclockable,
     /// Read-only boost frequency limit (Fmax) in MHz.
     GetBoostLimitFrequency,
+    /// All-core boost frequency ceiling (Fmax) in MHz (`RSMU 0x70`).
+    SetBoostLimitFrequency,
 }
 impl Message {
     fn id(self) -> u64 {
@@ -64,6 +66,7 @@ impl Message {
             Self::GetFusedTdc => 0xDB,
             Self::IsOverclockable => 0x6F,
             Self::GetBoostLimitFrequency => 0x6E,
+            Self::SetBoostLimitFrequency => 0x70,
         }
     }
 }
@@ -124,13 +127,12 @@ impl Smu {
         if MODULE.is_empty() {
             return Err(omen_core::message::msg("cpu.err.no_smu_module", &[]));
         }
-        if inventory.manufacturer != "HP"
-            || inventory.board != "8E35"
-            || inventory.bios != "F.13"
-            || inventory.cpus.len() != 1
-            || !inventory.cpus[0].contains("AMD Ryzen 9 8940HX")
-        {
-            return Err("CPU tuning is qualified only for HP8E35/F.13/Ryzen9 8940HX".into());
+        let is_amd_ryzen = inventory.cpus.iter().any(|cpu| {
+            let lower = cpu.to_ascii_lowercase();
+            lower.contains("amd") || lower.contains("ryzen")
+        });
+        if !is_amd_ryzen {
+            return Err("CPU SMU tuning requires an AMD Ryzen processor".into());
         }
         driver_identity()?;
         // SAFETY: Fixed device path; the handle is owned and closed on drop.
@@ -176,8 +178,12 @@ impl Smu {
         if name[0] == 0 {
             return Err("SMU module did not recognise this CPU".into());
         }
-        if smu.smu_version()? != 0x546f00 {
-            return Err("SMU firmware differs from the measured 0x546F00 contract".into());
+        let smu_ver = smu.smu_version()?;
+        // Raphael / Dragon Range (Zen 4 HX) SMU family prefix 0x54xxxx.
+        if (smu_ver >> 16) != 0x54 {
+            return Err(format!(
+                "SMU firmware {smu_ver:#x} is outside the qualified Raphael/Dragon Range 0x54xxxx contract"
+            ));
         }
         Ok(smu)
     }

@@ -6,10 +6,10 @@ use omen_core::{
     profiles::{Choice as C, Value},
 };
 
-/// Language keys of the collapsible groups, in display order.
-pub const GROUPS: [&str; 8] = [
+/// Language keys of the collapsible groups, in display order,
+/// cleanly separated into 3 independent sections: GPU, CPU, Windows.
+pub const GROUPS: [&str; 7] = [
     "group.gpu",
-    "group.dynamic_boost",
     "group.limits",
     "group.pbo",
     "group.curve_optimizer",
@@ -17,11 +17,11 @@ pub const GROUPS: [&str; 8] = [
     "group.processor",
     "group.energy_display",
 ];
-/// First group of each section and the section's language key.
+/// First group of each top-level section on the Overview page.
 pub const SECTIONS: &[(usize, &str)] = &[
     (0, "section.gpu"),
-    (2, "section.cpu"),
-    (6, "section.windows"),
+    (1, "section.cpu"),
+    (5, "section.windows"),
 ];
 pub struct Field {
     pub feature: F,
@@ -102,15 +102,15 @@ pub const DEVICE_DEFAULTS: &[F] = &[
     F::GpuCoreOffsetMhz,
     F::GpuMemoryOffsetMhz,
 ];
-/// Slider bounds in whole watts for Dynamic Boost and CPU power limits.
-/// - `GpuDynamicBoostLimitMw`: 115 W stock up to `gpu_tgp_max_w` (default 135 W,
-///   configurable up to 175 W in Settings).
-/// - `HpSharedPowerMw`: 55–72 W matching HP OMEN Hub's Unleashed panel.
-/// - `CpuSlowPptLimitMw`: 15–80 W with Dynamic Boost (NVPCF Sub-function #9
-///   unlock lifts the 45 W firmware floor); 15–160 W without Dynamic Boost.
+/// Independent watt sliders (no cross-coupling between GPU and CPU):
+/// - `GpuDynamicBoostLimitMw` (Direct GPU Power Limit / TGP): 50 W up to
+///   `gpu_tgp_max_w` (default 135 W, configurable up to 175 W in Settings).
+/// - `CpuPptLimitMw` (Fast Limit / PPT): 15–160 W via direct AMD SMU.
+/// - `CpuSlowPptLimitMw` (Slow Limit): 15–80 W via direct AMD SMU (hard SMU
+///   firmware cap at 80 W verified on SMU 0x546F00).
 pub fn slider_watts_with_gpu_max(
     feature: F,
-    dynamic_boost: bool,
+    _dynamic_boost: bool,
     gpu_tgp_max_w: u32,
 ) -> Option<(i64, i64)> {
     let gpu_max = i64::from(gpu_tgp_max_w.clamp(
@@ -119,12 +119,12 @@ pub fn slider_watts_with_gpu_max(
     ));
     match feature {
         F::GpuDynamicBoostLimitMw => Some((
-            i64::from(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W),
+            i64::from(omen_core::profiles::GPU_DIRECT_TGP_MIN_W),
             gpu_max,
         )),
+        F::CpuPptLimitMw => Some((15, 160)),
+        F::CpuSlowPptLimitMw => Some((15, 80)),
         F::HpSharedPowerMw => Some((55, 72)),
-        F::CpuSlowPptLimitMw if dynamic_boost => Some((15, 80)),
-        F::CpuSlowPptLimitMw => Some((15, 160)),
         _ => None,
     }
 }
@@ -160,38 +160,33 @@ pub fn display_value(
 }
 pub fn fields() -> Vec<Field> {
     let rows = [
+        // Section 1: GPU (direct fixed TGP + clocks + V/F curve — 0 CPU coupling)
+        (F::GpuDynamicBoostLimitMw, 0, 115000),
         (F::GpuCoreOffsetMhz, 0, 0),
         (F::GpuMemoryOffsetMhz, 0, 0),
         (F::GpuVfCurve, 0, 0),
-        // Dynamic Boost group, as in the Hub's Unleashed panel: the mode
-        // switch, cTGP, the shared CPU+GPU budget (TPP) and the CPU watt
-        // slider (firmware PL1 = Slow PPT, written through HP 0x29).
-        (F::GpuUnleashed, 1, 0),
-        // cTGP is on unless the user turns it off (user decision, 30 October 2026).
-        (F::GpuCustomTgp, 1, 1),
-        // Flashless GPU Dynamic Boost TGP ceiling (115 W stock; up to Settings ceiling).
-        (F::GpuDynamicBoostLimitMw, 1, 115000),
-        // The Hub's Unleashed default budget (TppMaxValue of this model).
-        (F::HpSharedPowerMw, 1, 72000),
+        // Section 2: CPU (direct AMD SMU limits, Fmax boost, PBO, Curve Optimizer)
+        (F::CpuPptLimitMw, 1, 80000),
         (F::CpuSlowPptLimitMw, 1, 55000),
-        (F::CpuTemperatureLimitC, 2, 100),
-        (F::CpuPptLimitMw, 2, 80000),
-        (F::CpuTdcMa, 2, 108000),
-        (F::CpuEdcMa, 2, 160000),
-        (F::CpuPboScalar, 3, 1),
-        (F::CpuCurveOptimizerAllCore, 4, 0),
-        (F::CpuCurveOptimizerPerCore, 5, 0),
-        (F::WindowsBoostMode, 6, 2),
-        (F::WindowsMinimumProcessorPercent, 6, 5),
-        (F::WindowsMaximumProcessorPercent, 6, 100),
-        (F::WindowsProcessorEppPercent, 6, 50),
-        (F::WindowsCoreParkingMinPercent, 6, 0),
-        (F::WindowsCoreParkingMaxPercent, 6, 100),
-        (F::CpuCcdAffinity, 6, 3),
-        (F::WindowsEnergyMode, 7, 1),
-        (F::WindowsPowerPlan, 7, 1),
-        (F::DisplayRefreshRateHz, 7, 60),
-        (F::GraphicsMode, 7, 1),
+        (F::CpuTemperatureLimitC, 1, 100),
+        (F::CpuTdcMa, 1, 108000),
+        (F::CpuEdcMa, 1, 160000),
+        (F::CpuBoostLimitMhz, 2, 5350),
+        (F::CpuPboScalar, 2, 1),
+        (F::CpuCurveOptimizerAllCore, 3, 0),
+        (F::CpuCurveOptimizerPerCore, 4, 0),
+        // Section 3: Windows (processor scheduling, power plans, display & MUX)
+        (F::WindowsBoostMode, 5, 2),
+        (F::WindowsMinimumProcessorPercent, 5, 5),
+        (F::WindowsMaximumProcessorPercent, 5, 100),
+        (F::WindowsProcessorEppPercent, 5, 50),
+        (F::WindowsCoreParkingMinPercent, 5, 0),
+        (F::WindowsCoreParkingMaxPercent, 5, 100),
+        (F::CpuCcdAffinity, 5, 3),
+        (F::WindowsEnergyMode, 6, 1),
+        (F::WindowsPowerPlan, 6, 1),
+        (F::DisplayRefreshRateHz, 6, 60),
+        (F::GraphicsMode, 6, 1),
     ];
     rows.iter()
         .map(|(feature, group, seed)| Field {
@@ -473,41 +468,54 @@ mod tests {
         );
     }
     #[test]
-    fn dynamic_boost_group_holds_the_hub_style_watt_sliders() {
+    fn decoupled_sections_separate_gpu_cpu_and_windows_with_independent_sliders() {
         let group = |feature| {
             fields()
                 .iter()
                 .find(|f| f.feature == feature)
                 .map(|f| f.group)
         };
+        // GPU section holds direct GPU TGP + clocks + curve only (no CPU sliders!)
         for feature in [
-            F::GpuUnleashed,
-            F::GpuCustomTgp,
             F::GpuDynamicBoostLimitMw,
-            F::HpSharedPowerMw,
+            F::GpuCoreOffsetMhz,
+            F::GpuMemoryOffsetMhz,
+            F::GpuVfCurve,
+        ] {
+            assert_eq!(group(feature), Some(0), "{feature:?}");
+        }
+        // CPU limits section holds Fast PPT, Slow PPT, Tctl, TDC, EDC together.
+        for feature in [
+            F::CpuPptLimitMw,
             F::CpuSlowPptLimitMw,
+            F::CpuTemperatureLimitC,
+            F::CpuTdcMa,
+            F::CpuEdcMa,
         ] {
             assert_eq!(group(feature), Some(1), "{feature:?}");
         }
-        assert_eq!(GROUPS[1], "group.dynamic_boost");
-        assert_eq!(slider_watts(F::GpuDynamicBoostLimitMw, true), Some((115, 135)));
+        // CPU Boost & PBO holds Fmax + PBO Scalar.
+        assert_eq!(group(F::CpuBoostLimitMhz), Some(2));
+        assert_eq!(group(F::CpuPboScalar), Some(2));
+        assert_eq!(GROUPS[0], "group.gpu");
+        assert_eq!(GROUPS[1], "group.limits");
+        assert_eq!(slider_watts(F::GpuDynamicBoostLimitMw, false), Some((50, 135)));
         assert_eq!(
-            slider_watts_with_gpu_max(F::GpuDynamicBoostLimitMw, true, 160),
-            Some((115, 160))
+            slider_watts_with_gpu_max(F::GpuDynamicBoostLimitMw, false, 160),
+            Some((50, 160))
         );
         assert_eq!(
-            slider_watts_with_gpu_max(F::GpuDynamicBoostLimitMw, true, 999),
-            Some((115, 175))
+            slider_watts_with_gpu_max(F::GpuDynamicBoostLimitMw, false, 999),
+            Some((50, 175))
         );
-        // OMEN Hub 1101.2611.2.0 panel bounds for 8E35 (Khalilah_DRG_N22X4X6),
-        // with NVPCF Sub-function #9 bypass lifting the 45 W Slow floor.
-        assert_eq!(slider_watts(F::HpSharedPowerMw, true), Some((55, 72)));
+        // Fast PPT (15-160 W) and Slow PPT (15-80 W SMU cap) are independent of GPU flags.
+        assert_eq!(slider_watts(F::CpuPptLimitMw, true), Some((15, 160)));
+        assert_eq!(slider_watts(F::CpuPptLimitMw, false), Some((15, 160)));
         assert_eq!(slider_watts(F::CpuSlowPptLimitMw, true), Some((15, 80)));
-        assert_eq!(slider_watts(F::CpuSlowPptLimitMw, false), Some((15, 160)));
-        assert_eq!(slider_watts(F::CpuPptLimitMw, true), None);
+        assert_eq!(slider_watts(F::CpuSlowPptLimitMw, false), Some((15, 80)));
         // The seeds start inside their sliders.
         for field in fields() {
-            if let Some((lo, hi)) = slider_watts(field.feature, true) {
+            if let Some((lo, hi)) = slider_watts(field.feature, false) {
                 assert!(
                     (lo * 1000..=hi * 1000).contains(&field.seed),
                     "{:?}",
@@ -532,8 +540,8 @@ mod tests {
             SECTIONS,
             &[
                 (0, "section.gpu"),
-                (2, "section.cpu"),
-                (6, "section.windows")
+                (1, "section.cpu"),
+                (5, "section.windows")
             ]
         );
         let old = serde_json::from_str::<F>("\"intel_pl1_mw\"").unwrap();
@@ -576,25 +584,18 @@ mod tests {
         assert!(
             fields
                 .iter()
-                .find(|f| f.feature == F::HpSharedPowerMw)
+                .find(|f| f.feature == F::CpuBoostLimitMhz)
                 .unwrap()
                 .control_slot()
                 >= 64
         );
         // Unsupported on this GPU, hidden from the editor.
         assert!(fields.iter().all(|f| f.feature != F::GpuPowerLimitMw));
-        // On/off fields are plain ticks: cTGP defaults on, all others off.
-        for field in fields
-            .iter()
-            .filter(|f| f.feature.descriptor().value_kind == ValueKind::Boolean)
-        {
-            assert_eq!(
-                field.initial(),
-                Value::Boolean(field.feature == F::GpuCustomTgp),
-                "{:?}",
-                field.feature
-            );
-        }
+        // Coupled legacy HP Dynamic Boost / TPP rows are no longer shown on Overview.
+        assert!(fields.iter().all(|f| !matches!(
+            f.feature,
+            F::GpuUnleashed | F::GpuCustomTgp | F::HpSharedPowerMw
+        )));
         assert!(!F::GpuCustomTgp.needs_nvidia() && F::GpuVfCurve.needs_nvidia());
         // Sane factory seeds: 100 °C Tctl, Balanced Windows defaults, Hybrid MUX, 16 zeroed cores.
         let initial = |feature| {

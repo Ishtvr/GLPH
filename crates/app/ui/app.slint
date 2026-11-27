@@ -37,7 +37,7 @@ export struct FieldData {
     slider-min: float,
     slider-max: float,
 }
-export struct GroupData { title: string, expanded: bool, rows: [FieldData] }
+export struct GroupData { section-title: string, title: string, expanded: bool, is-per-core: bool, rows: [FieldData] }
 export struct CurveNode { x: float, y: float, reference-y: float, selected: bool }
 export struct CoreRow { label: string, value: string }
 export struct AxisTick { position: float, label: string }
@@ -363,6 +363,29 @@ component PresetGroup inherits Rectangle {
     height: layout.preferred-height;
     layout := VerticalLayout {
         spacing: 0px;
+        if root.group.section-title != "": VerticalLayout {
+            padding-top: root.index == 0 ? 4px : 14px;
+            padding-bottom: 6px;
+            spacing: 8px;
+            if root.index > 0: Hairline { }
+            HorizontalLayout {
+                spacing: 8px;
+                padding-left: 4px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 3px;
+                        height: 15px;
+                        border-radius: 1.5px;
+                        background: Theme.accent;
+                    }
+                }
+                SectionTitle {
+                    text: root.group.section-title;
+                }
+            }
+        }
         SectionHeader {
             text: root.group.title;
             expanded: root.group.expanded;
@@ -376,9 +399,9 @@ component PresetGroup inherits Rectangle {
                 padding-bottom: 4px;
                 for row[row-index] in root.group.rows: FieldRow {
                     item <=> row;
-                    last: row-index == root.group.rows.length - 1 && root.index != 5;
+                    last: row-index == root.group.rows.length - 1 && !root.group.is-per-core;
                 }
-                if root.index == 5: GridLayout {
+                if root.group.is-per-core: GridLayout {
                     spacing: 8px;
                     for item[index] in Workbench.cores: HorizontalLayout {
                         row: floor(index / 4);

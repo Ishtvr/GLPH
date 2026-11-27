@@ -91,9 +91,11 @@ pub enum Feature {
     /// HP shared CPU+GPU budget (TPP, `0x29` byte 3) in mW of whole watts.
     /// Write-only on this firmware: no readback exists.
     HpSharedPowerMw,
-    /// Whole-watt GPU Dynamic Boost / Max TGP target stored in mW.
+    /// Whole-watt GPU Power Limit (Direct TGP) target stored in mW.
     /// Applied via reversible flashless VBIOS Policy[2] override and verified via NVML.
     GpuDynamicBoostLimitMw,
+    /// CPU maximum boost frequency ceiling (Fmax) in MHz (`RSMU 0x70 / 0x6E`).
+    CpuBoostLimitMhz,
     /// Serialized legacy input only; never a current feature.
     #[serde(untagged)]
     Retired(RetiredFeature),
@@ -237,6 +239,7 @@ impl Feature {
             Self::KeyboardEffect => (Category::Omen, ValueKind::Choice, Unit::None),
             Self::HpSharedPowerMw => (Category::Omen, ValueKind::Integer, Unit::Milliwatt),
             Self::GpuDynamicBoostLimitMw => (Category::Gpu, ValueKind::Integer, Unit::Milliwatt),
+            Self::CpuBoostLimitMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
         };
         Descriptor {
             feature: self,
@@ -330,6 +333,7 @@ impl Feature {
             Self::KeyboardEffect,
             Self::HpSharedPowerMw,
             Self::GpuDynamicBoostLimitMw,
+            Self::CpuBoostLimitMhz,
         ]
     }
     pub fn retired(self) -> bool {

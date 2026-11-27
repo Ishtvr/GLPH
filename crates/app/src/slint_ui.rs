@@ -585,14 +585,9 @@ impl Host {
             .iter()
             .filter(|f| f.group == field.group)
             .count();
-        // Hub-style watt sliders; the CPU slider follows the Dynamic Boost row.
-        let dynamic_boost = catalog
-            .iter()
-            .zip(fields.iter())
-            .any(|(f, d)| f.feature == Feature::GpuUnleashed && d.included);
         let slider = preset_fields::slider_watts_with_gpu_max(
             field.feature,
-            dynamic_boost,
+            false,
             self.gpu_tgp_max_w.get(),
         );
         let kind = match field.feature.descriptor().value_kind {
@@ -981,14 +976,14 @@ impl Host {
                         value,
                         Value::Integer(mw)
                             if mw % 1000 == 0
-                                && (i64::from(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W)
+                                && (i64::from(omen_core::profiles::GPU_DIRECT_TGP_MIN_W)
                                     ..=i64::from(ceiling))
                                     .contains(&(mw / 1000))
                     );
                     if !valid {
                         return Err(omen_core::message::msg(
                             "vbios_tgp.err.range",
-                            &[&omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W, &ceiling],
+                            &[&omen_core::profiles::GPU_DIRECT_TGP_MIN_W, &ceiling],
                         ));
                     }
                 }
@@ -1901,9 +1896,14 @@ pub fn run(
             .iter()
             .enumerate()
             .map(|(i, k)| GroupData {
+                section_title: preset_fields::SECTIONS
+                    .iter()
+                    .find_map(|(start, key)| (*start == i).then(|| t(key).into()))
+                    .unwrap_or_default(),
                 title: t(k).into(),
-                // GPU, Dynamic Boost and the CPU limits open, as before the regrouping.
-                expanded: i <= 2,
+                // Open GPU and CPU Limits by default for immediate independent control.
+                expanded: i <= 1,
+                is_per_core: *k == "group.curve_optimizer_per_core",
                 rows: group_rows[i].clone().into(),
             })
             .collect::<Vec<_>>(),
@@ -2488,16 +2488,7 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
             row.included = value;
         }
         h.dirty();
-        // Dynamic Boost changes the CPU watt slider's range and mode defaults.
-        if preset_fields::fields()
-            .get(index as usize)
-            .is_some_and(|f| f.feature == Feature::GpuUnleashed)
-        {
-            h.sync_unticked_mode_defaults();
-            h.update_fields();
-        } else {
-            h.update_field(index as usize);
-        }
+        h.update_field(index as usize);
     });
     callback!(on_slider_field, |h, index, watts| {
         if let Some(row) = h.fields.borrow_mut().get_mut(index as usize) {

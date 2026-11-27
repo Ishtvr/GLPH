@@ -165,34 +165,26 @@ fn gpu_qualification(store: &mut ProfileStore, command: &str) -> Result<(), Stri
     final_check
 }
 
-/// Before a preset's transaction: the HP mode its Dynamic Boost field selects
-/// (the Hub's full mode sequence, incl. its TPP and PL1), then the preset's
-/// own TPP. The transaction then writes the preset's flags, curve, offsets,
-/// CPU limits and Windows values, so they win; CPU values the preset leaves
-/// out follow the mode. Neither step has a readback-based restore. The
-/// caller holds the control lease.
+/// Runs optional HP vendor prelude ONLY when the device is HP AND the preset
+/// explicitly includes legacy HP mode flags (`GpuUnleashed`, `GpuDynamicBoost`,
+/// or `HpSharedPowerMw`). Decoupled PerformanceHub presets (direct GPU TGP +
+/// direct SMU CPU limits + Windows settings) execute ZERO HP WMI calls.
 fn apply_hp_prelude(
     profile: &omen_core::profiles::PerformanceProfile,
     inventory: &omen_core::Inventory,
 ) -> Result<Vec<String>, String> {
     use omen_core::hp_mode::HpMode;
-    // Validate even the unconfirmed shared-budget request before any mode SET.
-    // An invalid value still refuses the preset; a firmware step that does not
-    // confirm is named and the remaining values are applied (user rule).
     let shared_budget = HpMode::shared_budget_of_profile(profile)?;
+    if inventory.manufacturer != "HP" {
+        return Ok(vec![]);
+    }
     let ac = omen_platform::power_status().ac_connected == Some(true);
     let mut failed = vec![];
     if let Some(mode) = HpMode::of_preset(profile, ac) {
         if let Err(error) = omen_platform::apply_hp_mode(inventory, mode) {
             failed.push(error);
         }
-        // Let the firmware settle its mode tables before Windows and SMU
-        // values follow (300–500 ms, battery-switch order).
         std::thread::sleep(std::time::Duration::from_millis(400));
-        // The firmware keeps the mode's PL1; make it the preset's Slow PPT
-        // (or cap to Fast PPT when Fast < mode default). In Unleashed, values
-        // outside HP 0x29's 45..=80 W window are applied directly via SMU
-        // after NVPCF Sub-function #9 is unlocked.
         if let Some(watts) = HpMode::effective_pl1_for_preset(profile, mode)
             && !(mode == HpMode::Unleashed && !(45..=80).contains(&watts))
             && let Err(error) = omen_platform::write_hp_cpu_pl1(inventory, watts)
@@ -748,8 +740,13 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 omen_platform::vbios_tgp::ApplyOutcome::Unchanged
             };
             let ac = omen_platform::power_status().ac_connected == Some(true);
-            if omen_platform::nvpcf_ppt::preset_needs_unlock(&profile, ac) {
-                omen_platform::nvpcf_ppt::ensure_unlocked(controller.inventory(), &store)?;
+            let nvpcf_mode = omen_platform::nvpcf_ppt::apply_for_profile(
+                controller.inventory(),
+                &store,
+                &profile,
+                ac,
+            )?;
+            if nvpcf_mode.is_some() {
                 controller.set_nvpcf_ppt_unlocked(true);
             }
             let cooling_request =
@@ -982,9 +979,15 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 let direct = omen_core::fan_profile::direct_part(&profile)?;
                 let mut controller = prepare_apply(&direct, &mut store, true, false)?;
                 device_checked = true;
-                if omen_platform::nvpcf_ppt::preset_needs_unlock(&profile, ac == Some(true))
-                    && omen_platform::nvpcf_ppt::ensure_unlocked(controller.inventory(), &store)
-                        .is_ok()
+                if omen_platform::nvpcf_ppt::apply_for_profile(
+                    controller.inventory(),
+                    &store,
+                    &profile,
+                    ac == Some(true),
+                )
+                .ok()
+                .flatten()
+                .is_some()
                 {
                     controller.set_nvpcf_ppt_unlocked(true);
                 }

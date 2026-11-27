@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 164 100">
+  <!-- Schematic of a centrifugal blower. Device illustration, not a service drawing. -->
+  <defs><path id="blade" d="M59 34q9-10 23-10M62 36q11-9 23-7"/></defs>
+  <g fill="none" stroke="#729589" stroke-width="1">
+    <path fill="#27443A" d="M16 38Q23 10 54 9q29-1 43 19l43 0v43l-40 1q-16 22-43 19Q16 88 13 51Z"/>
+    <path d="M21 44q1-25 26-30 29-6 45 14l8 9h36v27H99"/><circle cx="58" cy="50" r="33"/>
+    <g stroke="#AEC5A7"><use href="#blade" transform="rotate(0 58 50)"/><use href="#blade" transform="rotate(24 58 50)"/><use href="#blade" transform="rotate(48 58 50)"/><use href="#blade" transform="rotate(72 58 50)"/><use href="#blade" transform="rotate(96 58 50)"/><use href="#blade" transform="rotate(120 58 50)"/><use href="#blade" transform="rotate(144 58 50)"/><use href="#blade" transform="rotate(168 58 50)"/><use href="#blade" transform="rotate(192 58 50)"/><use href="#blade" transform="rotate(216 58 50)"/><use href="#blade" transform="rotate(240 58 50)"/><use href="#blade" transform="rotate(264 58 50)"/><use href="#blade" transform="rotate(288 58 50)"/><use href="#blade" transform="rotate(312 58 50)"/><use href="#blade" transform="rotate(336 58 50)"/></g>
+    <circle cx="58" cy="50" r="15"/><circle cx="58" cy="50" r="11"/><circle cx="58" cy="50" r="3"/>
+    <g stroke="#819F8F"><path d="M104 37v27"/><path d="M108 37v27"/><path d="M112 37v27"/><path d="M116 37v27"/><path d="M120 37v27"/><path d="M124 37v27"/><path d="M128 37v27"/><path d="M132 37v27"/></g>
+    <circle cx="22" cy="53" r="2"/><circle cx="92" cy="31" r="2"/><circle cx="88" cy="76" r="2"/>
+  </g>
+</svg>

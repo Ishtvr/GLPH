@@ -1,0 +1,238 @@
+global Paint {
+    out property <color> paper: #f6f4ee;
+    out property <color> surface: #fffcf6;
+    out property <color> ink: #192220;
+    out property <color> muted: #53615d;
+    out property <color> line: #d1d3ca;
+    out property <color> cobalt: #263fb7;
+    out property <color> cool: #276650;
+    out property <color> warm: #925011;
+    out property <color> hot: #a22c32;
+}
+
+component Kicker inherits Text {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.25px;
+    color: Paint.muted;
+}
+
+component Control inherits FocusScope {
+    in property <string> label;
+    in property <bool> selected;
+    out property <bool> hovered: pointer.has-hover;
+    callback activate();
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.activate(); }
+    key-pressed(event) => {
+        if (event.text == Key.Return || event.text == " ") {
+            root.activate();
+            return accept;
+        }
+        return reject;
+    }
+    @children
+    if root.has-focus : Rectangle {
+        border-width: 2px;
+        border-color: #db8d16;
+        border-radius: 5px;
+    }
+    pointer := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.focus(); root.activate(); }
+    }
+}
+
+component ModeKey inherits Control {
+    accessible-role: radio-button;
+    accessible-checked: root.selected;
+    Rectangle {
+        border-radius: 4px;
+        background: root.selected ? Paint.surface : root.hovered ? #4659b8 : #1e3292;
+        Text {
+            text: root.label;
+            font-size: 13px;
+            font-weight: root.selected ? 700 : 500;
+            color: root.selected ? Paint.cobalt : #ffffff;
+        }
+    }
+}
+
+component Temperature inherits Rectangle {
+    in property <string> label;
+    in property <int> value;
+    in property <color> trace;
+    Kicker { x: 0; y: 0; text: root.label; }
+    HorizontalLayout {
+        x: 0; y: 20px; height: 40px;
+        width: self.preferred-width;
+        spacing: 4px;
+        Text { text: "\{root.value}"; font-family: "Consolas"; font-size: 37px; font-weight: 700; color: Paint.ink; }
+        Text { text: "°C"; font-size: 15px; color: Paint.muted; }
+    }
+    // Twenty divisions represent a display range of 0–100 °C.
+    for i in 20 : Rectangle {
+        x: root.width * i / 20; y: 70px;
+        width: root.width / 20 - 2px; height: 5px;
+        background: (i + 1) * 5 <= root.value ? root.trace : Paint.line;
+    }
+}
+
+component Readout inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    Text { x: 0; text: root.label; font-size: 14px; color: Paint.muted; }
+    Text {
+        x: root.width - self.width;
+        text: root.value;
+        font-family: "Consolas"; font-weight: 700; font-size: 15px; color: Paint.ink;
+    }
+}
+
+export component RelayFlyout inherits Window {
+    title: "PerformanceHub · Relay";
+    width: 416px; height: 506px;
+    no-frame: true;
+    forward-focus: shell;
+    background: Paint.paper;
+    default-font-family: "Segoe UI";
+    in-out property <bool> cooling-detail: false;
+    in-out property <int> mode-index: 1;
+    in-out property <int> fan-index: 1;
+    private property <[string]> mode-names: ["Leise", "Ausgeglichen", "Leistung", "Unleashed"];
+    private property <[string]> fan-names: ["BIOS", "Kennlinie", "Maximum"];
+    private property <int> cpu-temp: 64;
+    private property <int> gpu-temp: 58;
+
+    shell := FocusScope {
+        focus-on-tab-navigation: false;
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                if (root.cooling-detail) {
+                    root.cooling-detail = false;
+                    detail-button.focus();
+                } else {
+                    root.close();
+                }
+                return accept;
+            }
+            return reject;
+        }
+        // The bars form a compact signal mark even at tray-flyout scale.
+        Rectangle {
+            x: 20px; y: 19px; width: 32px; height: 32px;
+            background: Paint.ink; border-radius: 8px;
+            for i in 3 : Rectangle {
+                x: 7px + i * 7px; y: 16px - i * 4px;
+                width: 4px; height: 8px + i * 4px;
+                background: Paint.surface;
+            }
+        }
+        Text { x: 61px; y: 16px; text: "PerformanceHub"; font-weight: 700; font-size: 18px; color: Paint.ink; }
+        Text { x: 62px; y: 39px; text: "HP OMEN  /  8E35"; font-family: "Consolas"; font-size: 11px; color: Paint.muted; }
+        HorizontalLayout {
+            x: root.width - self.width - 20px; y: 23px; height: 22px;
+            width: self.preferred-width; spacing: 6px;
+            Rectangle {
+                width: 7px;
+                Rectangle { width: 7px; height: 7px; border-radius: 4px; background: Paint.cool; }
+            }
+            Text { text: "Netzbetrieb"; color: Paint.muted; font-weight: 600; font-size: 12px; }
+        }
+
+        Rectangle {
+            x: 16px; y: 70px; width: root.width - 32px; height: 166px;
+            border-radius: 10px; background: Paint.cobalt;
+            Kicker { x: 18px; y: 16px; text: root.cooling-detail ? "LÜFTERSTEUERUNG" : "LEISTUNGSMODUS"; color: #e1e6ff; }
+            Text {
+                x: 16px; y: 42px;
+                text: root.cooling-detail ? root.fan-names[root.fan-index] : root.mode-names[root.mode-index];
+                color: #fff; font-weight: 650; font-size: 34px; letter-spacing: -1px;
+            }
+            // Each ascending column stands for one selectable operating mode.
+            if !root.cooling-detail : Rectangle {
+                x: parent.width - 77px; y: 24px; width: 58px; height: 60px;
+                for i in 4 : Rectangle {
+                    x: i * 15px; y: 39px - i * 11px; width: 11px; height: 17px + i * 11px;
+                    border-radius: 2px; background: i <= root.mode-index ? #dbedff : #5368ca;
+                }
+            }
+            if root.cooling-detail : Text {
+                x: 18px; y: 90px; color: #edf1ff; font-size: 13px;
+                text: root.fan-index == 0 ? "Eigene Regelung pausiert"
+                    : root.fan-index == 1 ? "Gespeicherte Lüfterkurve" : "Maximalstufe für beide Lüfter";
+            }
+            if !root.cooling-detail : Text {
+                x: 18px; y: 90px; color: #edf1ff; font-size: 13px; text: "Zuletzt gewählter HP-Modus";
+            }
+            if !root.cooling-detail : HorizontalLayout {
+                x: 12px; y: 122px; width: parent.width - 24px; height: 32px; spacing: 3px;
+                for name[i] in root.mode-names : ModeKey {
+                    horizontal-stretch: 1;
+                    label: name; selected: i == root.mode-index;
+                    activate => { root.mode-index = i; }
+                }
+            }
+            if root.cooling-detail : HorizontalLayout {
+                x: 12px; y: 122px; width: parent.width - 24px; height: 32px; spacing: 3px;
+                for name[i] in root.fan-names : ModeKey {
+                    horizontal-stretch: 1;
+                    label: name; selected: i == root.fan-index;
+                    activate => { root.fan-index = i; }
+                }
+            }
+        }
+
+        Text {
+            x: 20px; y: 253px; text: root.cooling-detail ? "Drehzahlen" : "Temperaturen";
+            font-weight: 650; font-size: 19px; color: Paint.ink;
+        }
+        Rectangle {
+            x: 16px; y: 286px; width: root.width - 32px; height: 112px;
+            border-radius: 8px; background: Paint.surface;
+            border-width: 1px; border-color: Paint.line;
+            if !root.cooling-detail : HorizontalLayout {
+                padding: 16px; spacing: 16px;
+                Temperature { label: "CPU · TCTL"; value: root.cpu-temp; trace: self.value >= 90 ? Paint.hot : self.value >= 80 ? Paint.warm : Paint.ink; }
+                Rectangle { width: 1px; background: Paint.line; }
+                Temperature { label: "GPU"; value: root.gpu-temp; trace: self.value >= 90 ? Paint.hot : self.value >= 80 ? Paint.warm : Paint.ink; }
+            }
+            if root.cooling-detail : VerticalLayout {
+                padding-left: 16px; padding-right: 16px;
+                Readout { label: "CPU-Lüfter"; value: "2 400 U/min"; }
+                Rectangle { height: 1px; background: Paint.line; }
+                Readout { label: "GPU-Lüfter"; value: "2 200 U/min"; }
+            }
+        }
+        detail-button := Control {
+            x: 16px; y: 410px; width: root.width - 32px; height: 52px;
+            label: root.cooling-detail ? "Zurück zur Übersicht" : "Kühlung öffnen";
+            activate => { root.cooling-detail = !root.cooling-detail; }
+            Rectangle {
+                background: detail-button.hovered ? #e5e9dd : #eaece3;
+                border-radius: 7px;
+                Text { x: 15px; text: root.cooling-detail ? "Zur Übersicht" : "Kühlung"; font-size: 16px; font-weight: 650; color: Paint.ink; }
+                Text {
+                    width: parent.width - 113px; x: 70px; horizontal-alignment: right;
+                    text: root.cooling-detail ? "" : root.fan-names[root.fan-index]; font-size: 14px; color: Paint.muted;
+                }
+                Text {
+                    x: parent.width - 29px; text: root.cooling-detail ? "‹" : "›";
+                    font-size: 26px; color: Paint.ink;
+                }
+            }
+        }
+        Text { x: 20px; y: 477px; text: "Demodaten"; font-size: 12px; color: Paint.muted; }
+        dismiss := Control {
+            x: root.width - self.width - 16px; y: 466px; width: 88px; height: 36px;
+            label: "Flyout schließen";
+            activate => { root.close(); }
+            Rectangle {
+                background: dismiss.hovered ? #eaece3 : Paint.paper;
+                border-radius: 5px;
+                Text { text: "Schließen  ×"; font-size: 12px; font-weight: 600; color: Paint.muted; }
+            }
+        }
+    }
+}

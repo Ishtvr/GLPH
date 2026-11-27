@@ -1,0 +1,377 @@
+// Standalone cooling workbench. Every displayed value lives in this window.
+global Ink {
+    out property <color> canvas: #EFF1EB;
+    out property <color> paper: #FBFCF8;
+    out property <color> rail: #203B31;
+    out property <color> rail-muted: #B6C8BA;
+    out property <color> highlight: #DCEA95;
+    out property <color> text: #20342B;
+    out property <color> subtle: #53665B;
+    out property <color> rule: #D0D8CC;
+    out property <color> green: #366846;
+    out property <color> tint: #E0EAD9;
+    out property <color> warn: #81560D;
+    out property <color> critical: #9C3F38;
+}
+
+enum SensorState { normal, elevated, critical }
+
+component Label inherits Text {
+    color: Ink.text;
+    font-size: 14px;
+    vertical-alignment: center;
+}
+
+component Caption inherits Label {
+    font-size: 12px;
+    color: Ink.subtle;
+}
+
+component Number inherits Label {
+    font-family: "Consolas";
+}
+
+component Panel inherits Rectangle {
+    background: Ink.paper;
+    border-width: 1px;
+    border-color: Ink.rule;
+    border-radius: 8px;
+}
+
+component ClickTarget inherits FocusScope {
+    in property <string> name;
+    callback invoked;
+    out property <bool> hovered: hit.has-hover;
+    out property <bool> focused: self.has-focus;
+    accessible-role: button;
+    accessible-label: root.name;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.invoked(); } }
+    key-pressed(event) => {
+        if event.text == Key.Return || event.text == " " {
+            root.invoked();
+            return accept;
+        }
+        reject
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.focus(); root.invoked(); }
+    }
+    if self.has-focus : Rectangle {
+        border-width: 2px; border-color: #6F8C3B; border-radius: 4px;
+    }
+}
+
+component Action inherits Rectangle {
+    in property <string> label;
+    in property <string> description: root.label;
+    in property <bool> primary;
+    in property <bool> available: true;
+    callback clicked;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: root.primary ? Ink.green : Ink.rule;
+    background: root.primary ? (hit.hovered ? #294F37 : Ink.green) :
+        (hit.hovered ? Ink.tint : Ink.paper);
+    opacity: root.available ? 1 : 0.53;
+    Label {
+        text: root.label; color: root.primary ? white : Ink.text;
+        font-size: 13px; font-weight: 600;
+    }
+    hit := ClickTarget {
+        name: root.description; enabled: root.available;
+        invoked => { root.clicked(); }
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> selected;
+    callback clicked;
+    border-radius: 5px;
+    background: root.selected ? Ink.highlight : hit.hovered ? #345347 : transparent;
+    HorizontalLayout {
+        padding-left: 12px; padding-right: 8px; spacing: 10px;
+        Image {
+            width: 18px; source: root.icon; image-fit: contain;
+            colorize: root.selected ? Ink.rail : Ink.rail-muted;
+        }
+        Label {
+            text: root.label; color: root.selected ? Ink.rail : #E7EEE5;
+            horizontal-stretch: 1; font-weight: root.selected ? 650 : 450;
+        }
+    }
+    hit := ClickTarget { name: root.label; invoked => { root.clicked(); } }
+}
+
+component Sensor inherits Panel {
+    in property <string> channel;
+    in property <string> temperature;
+    in property <string> speed;
+    in property <SensorState> state;
+    private property <color> value-color: root.state == SensorState.critical ? Ink.critical
+        : root.state == SensorState.elevated ? Ink.warn : Ink.text;
+    HorizontalLayout {
+        padding-left: 18px; padding-right: 18px; spacing: 12px;
+        VerticalLayout {
+            alignment: center; spacing: 4px;
+            Caption {
+                text: root.channel + (root.state == SensorState.critical ? " · Kritisch"
+                    : root.state == SensorState.elevated ? " · Erhöht" : "");
+                font-weight: 600;
+            }
+            Number { text: root.temperature + " °C"; font-size: 27px; color: root.value-color; }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        VerticalLayout {
+            alignment: center; spacing: 4px;
+            Caption { text: "Lüfterdrehzahl"; horizontal-alignment: right; }
+            Number { text: root.speed + " U/min"; font-size: 15px; horizontal-alignment: right; }
+        }
+    }
+}
+
+component Rail inherits Rectangle {
+    in property <bool> quick;
+    callback navigate(bool);
+    width: 196px; background: Ink.rail;
+    VerticalLayout {
+        padding-left: 14px; padding-right: 14px; padding-top: 22px; padding-bottom: 22px;
+        HorizontalLayout {
+            padding-left: 5px; height: 30px; spacing: 8px;
+            Image { width: 26px; source: @image-url("assets/mark.svg"); }
+            Label { text: "PerformanceHub"; color: #F5F9ED; font-size: 15px; font-weight: 700; horizontal-stretch: 1; }
+        }
+        Rectangle { height: 32px; }
+        Rectangle { height: 1px; background: #456052; }
+        Rectangle { height: 23px; }
+        HorizontalLayout {
+            padding-left: 8px;
+            Caption { text: "KÜHLUNG"; color: Ink.rail-muted; letter-spacing: 1.5px; font-weight: 600; }
+        }
+        Rectangle { height: 10px; }
+        NavItem {
+            height: 38px; label: "Schnellwahl"; icon: @image-url("assets/switches.svg");
+            selected: root.quick; clicked => { root.navigate(true); }
+        }
+        Rectangle { height: 4px; }
+        NavItem {
+            height: 38px; label: "Kurveneditor"; icon: @image-url("assets/curve.svg");
+            selected: !root.quick; clicked => { root.navigate(false); }
+        }
+        Rectangle { vertical-stretch: 1; }
+        Image { height: 95px; source: @image-url("assets/blower.svg"); image-fit: contain; }
+        Rectangle { height: 15px; }
+        Rectangle { height: 1px; background: #456052; }
+        Rectangle { height: 14px; }
+        Label { text: "HP OMEN"; color: #F5F9ED; font-weight: 600; }
+        Number { text: "8E35  /  BIOS F.13"; color: Ink.rail-muted; font-size: 12px; }
+    }
+}
+
+component Plot inherits Rectangle {
+    in property <[int]> temperatures;
+    in property <[int]> duties;
+    in property <[int]> baseline;
+    in property <bool> changed;
+    in property <int> current;
+    callback select(int);
+    pure function scaled-x(i: int) -> float { (root.temperatures[i] - 30) * 100 / 70 }
+    pure function point(i: int, values: [int]) -> string { "\{root.scaled-x(i)} \{100 - values[i]}" }
+    pure function line(values: [int]) -> string {
+        "M " + root.point(0, values) + " L " + root.point(1, values) + " L " + root.point(2, values)
+        + " L " + root.point(3, values) + " L " + root.point(4, values) + " L " + root.point(5, values)
+    }
+    Caption { x: 0; y: 0; text: "Lüfterleistung (%)"; }
+    graph := Rectangle {
+        x: 36px; y: 34px; width: parent.width - 52px; height: parent.height - 86px;
+        for i in 5 : Rectangle {
+            x: 0; y: i * graph.height / 4; width: graph.width; height: 1px;
+            background: Ink.rule;
+            Number { x: -36px; y: -8px; width: 28px; height: 16px; text: "\{100 - i * 25}"; font-size: 11px; color: Ink.subtle; horizontal-alignment: right; }
+        }
+        for i in 8 : Rectangle {
+            x: i * graph.width / 7; y: 0; width: 1px; height: graph.height;
+            background: #E0E5DA;
+            Number { x: -15px; y: graph.height + 8px; width: 30px; height: 15px; text: "\{30 + i * 10}"; font-size: 11px; color: Ink.subtle; horizontal-alignment: center; }
+        }
+        Path {
+            viewbox-width: 100; viewbox-height: 100; fit: fill;
+            commands: root.line(root.duties) + " L 100 100 L 0 100 Z";
+            fill: #78A26E32;
+        }
+        if root.changed : Path {
+            viewbox-width: 100; viewbox-height: 100; fit: fill;
+            commands: root.line(root.baseline); stroke: #839386; stroke-width: 1.5px;
+        }
+        Rectangle {
+            x: root.scaled-x(root.current) * parent.width / 100;
+            y: 0; width: 1px; height: 100%; background: #82A37D;
+        }
+        Path {
+            viewbox-width: 100; viewbox-height: 100; fit: fill;
+            commands: root.line(root.duties); stroke: Ink.green; stroke-width: 2.5px;
+        }
+        Rectangle {
+            width: 99px; height: 24px; border-radius: 4px; background: Ink.rail;
+            x: clamp(root.scaled-x(root.current) * graph.width / 100 - self.width / 2, 0px, graph.width - self.width);
+            y: root.duties[root.current] > 80 ?
+                (100 - root.duties[root.current]) * graph.height / 100 + 14px :
+                (100 - root.duties[root.current]) * graph.height / 100 - 38px;
+            Number {
+                text: "\{root.temperatures[root.current]} °C · \{root.duties[root.current]} %";
+                font-size: 12px; color: #F5F9ED;
+            }
+        }
+        for duty[i] in root.duties : Rectangle {
+            x: root.scaled-x(i) * graph.width / 100 - self.width / 2;
+            y: (100 - duty) * graph.height / 100 - self.height / 2;
+            width: 26px; height: 26px;
+            Rectangle {
+                width: i == root.current ? 16px : 9px;
+                height: self.width; border-radius: self.width / 2;
+                border-width: i == root.current ? 3px : 2px; border-color: Ink.green;
+                background: i == root.current ? Ink.highlight : Ink.paper;
+            }
+            ClickTarget {
+                name: "Punkt \{i + 1}, \{root.temperatures[i]} Grad, \{duty} Prozent";
+                invoked => { root.select(i); }
+            }
+        }
+    }
+    Caption { x: 36px; y: root.height - 18px; width: root.width - 52px; text: "Temperatur (°C)"; horizontal-alignment: right; }
+}
+
+export component Werkbank inherits Window {
+    width: root.quick ? 620px : 1060px; height: root.quick ? 580px : 664px;
+    title: "PerformanceHub · Werkbank";
+    default-font-family: "Segoe UI"; background: Ink.canvas;
+    in-out property <bool> quick: false;
+    in-out property <int> selected: 3;
+    private property <[int]> temperatures: [30, 45, 55, 70, 85, 100];
+    private property <[int]> duties: [18, 24, 35, 58, 84, 100];
+    private property <[int]> stored: [18, 24, 35, 48, 84, 100];
+    private property <bool> dirty: root.duties[0] != root.stored[0] || root.duties[1] != root.stored[1]
+        || root.duties[2] != root.stored[2] || root.duties[3] != root.stored[3]
+        || root.duties[4] != root.stored[4] || root.duties[5] != root.stored[5];
+    private property <int> minimum: root.selected == 0 ? 0 : root.duties[root.selected - 1];
+    private property <int> maximum: root.selected == 5 ? 100 : root.duties[root.selected + 1];
+    private property <int> mode: 1;
+    private property <[string]> modes: ["Automatik", "Kennlinie", "Maximum"];
+    function nudge(amount: int) {
+        root.duties[root.selected] = clamp(root.duties[root.selected] + amount, root.minimum, root.maximum);
+    }
+    // Copy all six scalar values so later edits cannot mutate the saved model.
+    pure function copy-points(points: [int]) -> [int] {
+        [points[0], points[1], points[2], points[3], points[4], points[5]]
+    }
+    HorizontalLayout {
+        if !root.quick : Rail { quick: root.quick; navigate(show-quick) => { root.quick = show-quick; } }
+        VerticalLayout {
+            padding: root.quick ? 20px : 26px; spacing: root.quick ? 12px : 16px;
+            HorizontalLayout {
+                height: 19px; spacing: 8px;
+                Caption { text: "Werkbank"; font-weight: 650; }
+                Caption { text: "/"; color: #869688; }
+                Caption { text: "Kühlung"; }
+                Rectangle { horizontal-stretch: 1; }
+                Rectangle { width: 7px; Rectangle { width: 7px; height: 7px; border-radius: 4px; background: Ink.green; } }
+                Caption { text: "Demodaten"; }
+            }
+            Rectangle { height: 1px; background: Ink.rule; }
+            HorizontalLayout {
+                height: root.quick ? 62px : 72px; spacing: 14px;
+                VerticalLayout {
+                    alignment: center; spacing: 2px;
+                    Label { text: root.quick ? "Kühlmodus" : "Lüfterkurve"; font-size: 37px; font-weight: 650; letter-spacing: -1px; }
+                    Caption { text: root.quick ? "Kühlung für beide Lüfter auswählen." : "Gemeinsame Kennlinie für CPU- und GPU-Lüfter."; font-size: 14px; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                VerticalLayout {
+                    alignment: center; spacing: 3px;
+                    Caption { text: "Lüfterpreset"; horizontal-alignment: right; }
+                    Label { text: "Alltag"; font-size: 18px; font-weight: 650; horizontal-alignment: right; }
+                }
+            }
+            if !root.quick : Panel {
+                vertical-stretch: 1;
+                HorizontalLayout {
+                    padding: 1px;
+                    VerticalLayout {
+                        padding: 20px; spacing: 10px; horizontal-stretch: 1;
+                        HorizontalLayout {
+                            height: 24px; spacing: 7px;
+                            Label { text: "Kennlinie"; font-size: 18px; font-weight: 650; }
+                            Rectangle { horizontal-stretch: 1; }
+                            if root.dirty : Rectangle { width: 18px; Rectangle { height: 1px; background: #839386; } }
+                            if root.dirty : Caption { text: "Gespeichert"; }
+                            Rectangle { width: 18px; Rectangle { height: 3px; background: Ink.green; } }
+                            Caption { text: root.dirty ? "Entwurf" : "Gespeichert"; }
+                        }
+                        Plot {
+                            vertical-stretch: 1;
+                            temperatures: root.temperatures; duties: root.duties; current: root.selected;
+                            baseline: root.stored; changed: root.dirty;
+                            select(i) => { root.selected = i; }
+                        }
+                    }
+                    Rectangle { width: 1px; background: Ink.rule; }
+                    VerticalLayout {
+                        width: 199px; padding: 16px; spacing: 8px;
+                        HorizontalLayout {
+                            height: 27px;
+                            Label { text: "Kurvenpunkt"; font-size: 15px; font-weight: 650; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Number { text: "\{root.selected + 1}/6"; font-size: 12px; color: Ink.subtle; }
+                        }
+                        Rectangle { height: 1px; background: Ink.rule; }
+                        Caption { text: "Temperatur"; }
+                        Number { text: "\{root.temperatures[root.selected]} °C"; font-size: 24px; }
+                        Caption { text: "Lüfterleistung"; }
+                        Number { text: "\{root.duties[root.selected]} %"; font-size: 32px; color: Ink.green; }
+                        HorizontalLayout {
+                            height: 32px; spacing: 6px;
+                            Action { label: "−1 %"; description: "Lüfterleistung um einen Prozentpunkt senken"; available: root.duties[root.selected] > root.minimum; clicked => { root.nudge(-1); } }
+                            Action { label: "+1 %"; description: "Lüfterleistung um einen Prozentpunkt erhöhen"; available: root.duties[root.selected] < root.maximum; clicked => { root.nudge(1); } }
+                        }
+                        Rectangle { vertical-stretch: 1; }
+                        Action { height: 33px; label: "Preset merken"; primary: true; available: root.dirty; clicked => { root.stored = root.copy-points(root.duties); } }
+                        Action { height: 29px; label: "Zurücksetzen"; available: root.dirty; clicked => { root.duties = root.copy-points(root.stored); } }
+                    }
+                }
+            }
+            if root.quick : Panel {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding: 18px; spacing: 8px;
+                    Label { text: "Kühlung anfordern"; font-size: 18px; font-weight: 650; }
+                    Caption { text: "Aktuelle Anforderung (Demo): " + root.modes[root.mode]; }
+                    Rectangle { height: 6px; }
+                    for mode-label[i] in root.modes : Rectangle {
+                        height: 42px; border-radius: 5px; border-width: 1px;
+                        border-color: root.mode == i ? Ink.green : Ink.rule;
+                        background: root.mode == i ? Ink.tint : item.hovered ? Ink.canvas : Ink.paper;
+                        HorizontalLayout {
+                            padding-left: 14px; padding-right: 14px;
+                            Label { text: mode-label; font-weight: root.mode == i ? 650 : 500; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Caption { text: i == 0 ? "Eigene Regelung pausieren" : i == 1 ? "Gespeichertes Preset" : "Maximale Lüfterstufe"; }
+                        }
+                        item := ClickTarget { name: mode-label + " anfordern (Demo)"; invoked => { root.mode = i; } }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    Action { height: 32px; label: "Kurve bearbeiten"; clicked => { root.quick = false; } }
+                }
+            }
+            Label { height: 23px; text: "Sensorwerte"; font-size: 17px; font-weight: 650; }
+            HorizontalLayout {
+                height: 78px; spacing: 12px;
+                Sensor { channel: "CPU · Tctl"; temperature: "64"; speed: "2 800"; }
+                Sensor { channel: "GPU · Kern"; temperature: "58"; speed: "2 600"; }
+            }
+        }
+    }
+}

@@ -1,0 +1,309 @@
+// Signal · stand-alone telemetry concept. All measurements are fixed examples.
+global Ink {
+    out property <color> background: #131716;
+    out property <color> panel: #1b201e;
+    out property <color> rule: #39413d;
+    out property <color> label: #b0bbb3;
+    out property <color> text: #eff2e9;
+    out property <color> cpu: #dbf476;
+    out property <color> gpu: #a7bafa;
+}
+
+component Label inherits Text {
+    color: Ink.text;
+    font-size: 14px;
+    vertical-alignment: center;
+}
+
+component NumberText inherits Label {
+    font-family: "Consolas";
+}
+
+component Command inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    in property <bool> outline;
+    callback activated;
+    forward-focus: keys;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.activated(); }
+    min-width: 56px;
+    height: 32px;
+    border-radius: 4px;
+    border-width: keys.has-focus || root.outline ? 1px : 0px;
+    border-color: keys.has-focus ? Ink.cpu : Ink.rule;
+    background: root.selected ? Ink.cpu : touch.has-hover ? #343c36 : transparent;
+
+    Label {
+        text: root.label;
+        font-size: 13px;
+        font-weight: root.selected ? 650 : 500;
+        color: root.selected ? Ink.background : Ink.text;
+        horizontal-alignment: center;
+    }
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == " ") {
+                root.activated();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { keys.focus(); root.activated(); }
+    }
+}
+
+component RangeCommand inherits Command {
+    accessible-role: radio-button;
+    accessible-checked: root.selected;
+}
+
+component Readout inherits Rectangle {
+    in property <bool> gpu;
+    in property <bool> available: true;
+    in property <string> peak;
+    private property <color> ink: root.gpu ? Ink.gpu : Ink.cpu;
+    VerticalLayout {
+        y: (parent.height - self.height) / 2;
+        height: 92px;
+        spacing: 1px;
+        HorizontalLayout {
+            height: 20px;
+            spacing: 8px;
+            Rectangle {
+                width: 16px;
+                Rectangle { width: 16px; height: 3px; border-radius: 1px; background: root.ink; }
+            }
+            Label {
+                text: root.gpu ? "GPU · CHIP" : "CPU · TCTL";
+                letter-spacing: 0.8px; font-size: 12px; font-weight: 650;
+            }
+            Rectangle {}
+        }
+        HorizontalLayout {
+            height: 52px; spacing: 3px;
+            NumberText {
+                text: !root.available ? "—" : root.gpu ? "64" : "72";
+                font-size: 48px; font-weight: 600; color: root.ink;
+            }
+            NumberText { text: root.available ? "°C" : ""; font-size: 22px; color: root.ink; }
+            Rectangle {}
+        }
+        Label { text: root.available ? "Spitze  " + root.peak + " °C" : "Sensor fehlt"; color: Ink.label; font-size: 13px; }
+    }
+}
+
+// One specimen every 3 s. x advances by 6; y = (90 − temperature) × 4.
+// A 60 s viewport shows the tail of exactly the same five-minute trace.
+component Trace inherits Path {
+    in property <bool> short-range;
+    viewbox-x: root.short-range ? 480 : 0;
+    viewbox-width: root.short-range ? 120 : 600;
+    viewbox-height: 160;
+    fit: fill;
+    stroke-width: 2px;
+    stroke-line-join: round;
+}
+
+component ThermalPlot inherits Rectangle {
+    in property <bool> short-range;
+    in property <bool> cpu-available;
+    accessible-role: image;
+    accessible-label: root.short-range ? "Temperaturverlauf über eine Minute" : "Temperaturverlauf über fünf Minuten";
+    private property <[string]> time-labels: root.short-range
+        ? ["14:31:00", "14:31:15", "14:31:30", "14:31:45", "14:32:00"]
+        : ["14:27:00", "14:28:15", "14:29:30", "14:30:45", "14:32:00"];
+
+    graph := Rectangle {
+        x: 0; y: 7px;
+        width: parent.width - 40px; height: parent.height - 34px;
+        clip: true;
+        background: @linear-gradient(180deg, #242e25, Ink.panel);
+        for index in 5: Rectangle {
+            x: 0; y: (parent.height - 1px) * index / 4;
+            width: 100%; height: 1px; background: Ink.rule;
+        }
+        for index in 5: Rectangle {
+            x: (parent.width - 1px) * index / 4; y: 0;
+            width: 1px; height: 100%; background: #303a32;
+        }
+        Trace {
+            short-range: root.short-range; stroke: Ink.gpu;
+            commands: "M0 144 L6 144 12 144 18 144 24 140 30 140 36 140 42 144 48 140 54 140 60 140 66 140 72 136 78 136 84 136 90 136 96 132 102 132 108 128 114 128 120 128 126 124 132 120 138 120 144 116 150 116 156 116 162 112 168 112 174 112 180 112 186 112 192 116 198 116 204 116 210 116 216 116 222 116 228 116 234 116 240 112 246 112 252 112 258 108 264 108 270 104 276 104 282 100 288 96 294 92 300 92 306 84 312 88 318 84 324 84 330 80 336 80 342 84 348 80 354 84 360 84 366 88 372 88 378 92 384 96 390 96 396 100 402 100 408 104 414 104 420 104 426 108 432 108 438 108 444 108 450 112 456 112 462 112 468 112 474 112 480 112 486 112 492 112 498 112 504 112 510 112 516 108 522 108 528 108 534 104 540 100 546 100 552 100 558 96 564 96 570 96 576 100 582 100 588 100 594 104 600 104";
+        }
+        if root.cpu-available: Trace {
+            short-range: root.short-range; stroke: Ink.cpu;
+            commands: "M0 128 L6 124 12 124 18 128 24 124 30 120 36 116 42 120 48 124 54 124 60 116 66 112 72 112 78 116 84 116 90 108 96 100 102 96 108 96 114 88 120 84 126 84 132 72 138 60 144 64 150 64 156 64 162 68 168 64 174 72 180 80 186 76 192 88 198 92 204 88 210 80 216 80 222 84 228 76 234 80 240 76 246 80 252 68 258 48 264 44 270 44 276 52 282 48 288 40 294 36 300 44 306 32 312 36 318 32 324 40 330 48 336 52 342 44 348 56 354 52 360 68 366 68 372 72 378 84 384 88 390 84 396 92 402 96 408 96 414 88 420 100 426 96 432 92 438 96 444 100 450 104 456 104 462 96 468 100 474 104 480 100 486 100 492 92 498 84 504 92 510 80 516 72 522 68 528 56 534 48 540 52 546 48 552 60 558 68 564 64 570 68 576 76 582 68 588 72 594 76 600 72";
+        }
+        for endpoint in [
+            {value: 72, ink: Ink.cpu, available: root.cpu-available},
+            {value: 64, ink: Ink.gpu, available: true}
+        ]: Rectangle {
+            visible: endpoint.available;
+            x: parent.width - 7px; y: parent.height * (90 - endpoint.value) / 40 - 3.5px;
+            width: 7px; height: 7px; border-radius: 4px; background: endpoint.ink;
+        }
+    }
+    for i in 5: NumberText {
+        x: graph.width + 7px; y: graph.y + (graph.height - 1px) * i / 4 - 8px;
+        width: 35px; height: 16px;
+        text: (90 - i * 10) + "°"; font-size: 12px; color: Ink.label;
+    }
+    for stamp[i] in root.time-labels: NumberText {
+        x: clamp(graph.width * i / 4 - 32.5px, 0px, graph.width - 65px);
+        y: graph.y + graph.height + 8px;
+        width: 65px; height: 16px;
+        horizontal-alignment: i == 0 ? left : i == 4 ? right : center;
+        text: stamp; font-size: 11px; color: Ink.label;
+    }
+}
+
+component SensorRow inherits Rectangle {
+    in property <bool> header;
+    in property <string> sensor;
+    in property <string> watts;
+    in property <string> clock;
+    in property <string> load;
+    in property <string> origin;
+    height: root.header ? 27px : 36px;
+    background: root.header ? Ink.panel : transparent;
+    Rectangle { x: 0; y: parent.height - 1px; width: 100%; height: 1px; background: Ink.rule; }
+    HorizontalLayout {
+        padding-left: 12px; padding-right: 12px; spacing: 16px;
+        Label {
+            width: 23%; text: root.sensor; font-size: root.header ? 12px : 14px;
+            color: root.header ? Ink.label : Ink.text; font-weight: root.header ? 400 : 600;
+        }
+        NumberText {
+            width: 14%; text: root.watts; horizontal-alignment: right;
+            font-size: root.header ? 12px : 15px; color: root.header ? Ink.label : Ink.text;
+        }
+        NumberText {
+            width: 20%; text: root.clock; horizontal-alignment: right;
+            font-size: root.header ? 12px : 15px; color: root.header ? Ink.label : Ink.text;
+        }
+        NumberText {
+            width: 10%; text: root.load; horizontal-alignment: right;
+            font-size: root.header ? 12px : 15px; color: root.header ? Ink.label : Ink.text;
+        }
+        Label {
+            text: root.origin; horizontal-alignment: right; font-size: root.header ? 12px : 13px; color: Ink.label;
+        }
+    }
+}
+
+export component Signal inherits Window {
+    title: "PerformanceHub · Signal";
+    default-font-family: "Segoe UI";
+    background: Ink.background;
+    in-out property <bool> compact: false;
+    in-out property <bool> short-range: false;
+    in property <bool> cpu-available: true;
+    width: root.compact ? 420px : 940px;
+    height: root.compact ? 264px : 622px;
+
+    VerticalLayout {
+        Rectangle {
+            height: 54px;
+            Rectangle { x: 0; y: parent.height - 1px; width: 100%; height: 1px; background: Ink.rule; }
+            HorizontalLayout {
+                padding-left: 24px; padding-right: 24px; spacing: 10px;
+                Rectangle {
+                    width: 27px;
+                    Image { width: 27px; height: 27px; source: @image-url("signal.svg"); }
+                }
+                Label { text: "PerformanceHub"; font-size: 15px; font-weight: 650; }
+                Label { text: "/"; color: Ink.label; }
+                Label { text: "Signal"; color: Ink.label; }
+                Rectangle {}
+                Label { text: "Beispieldaten"; font-size: 12px; color: Ink.label; }
+            }
+        }
+        if !root.compact: VerticalLayout {
+            padding-left: 24px; padding-right: 24px; padding-top: 13px; padding-bottom: 12px; spacing: 14px;
+            HorizontalLayout {
+                height: 69px;
+                VerticalLayout {
+                    Label { text: "Telemetrie"; font-size: 34px; font-weight: 650; letter-spacing: -1px; }
+                    Label { text: "HP OMEN 16   /   Ryzen 9 8940HX   ·   GeForce RTX 5070 Laptop"; color: Ink.label; font-size: 13px; }
+                }
+                Rectangle {}
+                Rectangle {
+                    width: 120px;
+                    Command { label: "Kompaktansicht"; outline: true; activated => { root.compact = true; } }
+                }
+            }
+            Rectangle {
+                min-height: 256px; vertical-stretch: 1;
+                background: Ink.panel; border-radius: 8px; border-width: 1px; border-color: Ink.rule;
+                HorizontalLayout {
+                    padding: 18px; spacing: 20px;
+                    VerticalLayout {
+                        spacing: 12px;
+                        HorizontalLayout {
+                            height: 34px;
+                            Label { text: "Temperaturverlauf"; font-weight: 620; font-size: 18px; }
+                            Rectangle {}
+                            Rectangle {
+                                width: 122px; height: 34px; background: Ink.background; border-radius: 5px;
+                                HorizontalLayout {
+                                    padding: 2px; spacing: 2px;
+                                    RangeCommand { label: "60 s"; height: 30px; selected: root.short-range; activated => { root.short-range = true; } }
+                                    RangeCommand { label: "5 min"; height: 30px; selected: !root.short-range; activated => { root.short-range = false; } }
+                                }
+                            }
+                        }
+                        ThermalPlot { short-range: root.short-range; cpu-available: root.cpu-available; }
+                    }
+                    Rectangle { width: 1px; background: Ink.rule; }
+                    VerticalLayout {
+                        width: 141px;
+                        Readout { peak: root.short-range ? "78" : "82"; available: root.cpu-available; }
+                        Rectangle { height: 1px; background: Ink.rule; }
+                        Readout { gpu: true; peak: root.short-range ? "66" : "70"; }
+                    }
+                }
+            }
+            VerticalLayout {
+                height: 134px;
+                Label { height: 34px; text: "Sensorvergleich"; font-size: 18px; font-weight: 620; }
+                SensorRow { header: true; sensor: "Messkanal"; watts: "Leistung"; clock: "Takt"; load: "Last"; origin: "Messquelle"; }
+                SensorRow {
+                    sensor: "CPU-Package";
+                    watts: root.cpu-available ? "48 W" : "—";
+                    clock: root.cpu-available ? "3 840 MHz eff." : "—";
+                    load: "34 %"; origin: root.cpu-available ? "PawnIO · Windows" : "Windows";
+                }
+                SensorRow { sensor: "GPU-Chip"; watts: "87 W"; clock: "2 115 MHz"; load: "—"; origin: "NVML · NVAPI"; }
+            }
+        }
+        if root.compact: VerticalLayout {
+            padding-left: 24px; padding-right: 24px; padding-top: 12px; padding-bottom: 12px; spacing: 12px;
+            HorizontalLayout {
+                Label { text: "Thermik"; font-size: 24px; font-weight: 620; }
+                Rectangle {}
+                Command { label: "Verlauf öffnen"; width: 109px; outline: true; activated => { root.compact = false; } }
+            }
+            HorizontalLayout {
+                spacing: 20px;
+                Readout { peak: root.short-range ? "78" : "82"; available: root.cpu-available; }
+                Rectangle { width: 1px; background: Ink.rule; }
+                Readout { gpu: true; peak: root.short-range ? "66" : "70"; }
+            }
+        }
+        Rectangle {
+            height: 32px;
+            Rectangle { x: 0; y: 0; width: 100%; height: 1px; background: Ink.rule; }
+            HorizontalLayout {
+                padding-left: 24px; padding-right: 24px; spacing: 12px;
+                Label { text: root.compact ? (root.short-range ? "Letzte 60 Sekunden" : "Letzte 5 Minuten") : "Abtastintervall  3 s"; color: Ink.label; font-size: 12px; }
+                Rectangle {}
+                NumberText { text: "Stand  14:32:00"; font-size: 12px; color: Ink.label; }
+            }
+        }
+    }
+}

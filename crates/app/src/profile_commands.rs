@@ -753,9 +753,10 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             // on HP without legacy Dynamic Boost, setting PPAB=0 stops the -15 W
             // GPU subtraction under simultaneous CPU load (e.g. 140 W stays 140 W
             // even while CPU draws 45-64 W), while preserving cTGP and GPS max-temp.
-            let legacy_boost = profile.settings.iter().any(|s| {
-                matches!(s.feature, Feature::GpuUnleashed | Feature::GpuDynamicBoost)
-            });
+            let legacy_boost = profile
+                .settings
+                .iter()
+                .any(|s| matches!(s.feature, Feature::GpuUnleashed | Feature::GpuDynamicBoost));
             if ac
                 && requested_tgp_w.is_some()
                 && !legacy_boost

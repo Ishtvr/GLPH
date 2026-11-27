@@ -828,8 +828,7 @@ impl CeilingSource {
                     max_mw
                 } else {
                     let stock_max_w = self.stock.limit_max_mw / 1_000;
-                    self.stock.limit_rated_mw
-                        + s.target_watts.saturating_sub(stock_max_w) * 1_000
+                    self.stock.limit_rated_mw + s.target_watts.saturating_sub(stock_max_w) * 1_000
                 }
             });
             (def_mw, min_mw, max_mw)
@@ -939,14 +938,7 @@ pub fn apply_for_profile(
     match target {
         Some(target_w) => {
             let direct_fixed = !legacy_dynamic_boost || target_w < GPU_DYNAMIC_BOOST_LIMIT_MIN_W;
-            apply_target_with_mode(
-                inventory,
-                store,
-                target_w,
-                max_w,
-                direct_fixed,
-                read_limits,
-            )
+            apply_target_with_mode(inventory, store, target_w, max_w, direct_fixed, read_limits)
         }
         None => {
             if store.vbios_tgp_state().is_some()
@@ -1000,7 +992,8 @@ fn apply_target_with_mode(
     let (target_bytes, expected_limits) = if stock_target {
         (None, source.stock_limits())
     } else if direct_fixed {
-        let (bytes, stock) = patch_policy2_direct_fixed_w_with_max(&source.stock_rom, target_w, ceiling)?;
+        let (bytes, stock) =
+            patch_policy2_direct_fixed_w_with_max(&source.stock_rom, target_w, ceiling)?;
         let mw = target_w * 1_000;
         (Some(bytes), (mw, stock.limit_min_mw, mw))
     } else {
@@ -1212,8 +1205,14 @@ mod tests {
         assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_LIMIT_RATED), Some(135_000));
         assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_LIMIT_MAX), Some(135_000));
         assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_TGP_RATED), Some(135_000));
-        assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_INFLECTION_0), Some(135_000));
-        assert_eq!(read_u32_le(&p135, 0x57B1B + OFF_INFLECTION_0 + 4), Some(60_000));
+        assert_eq!(
+            read_u32_le(&p135, 0x57B1B + OFF_INFLECTION_0),
+            Some(135_000)
+        );
+        assert_eq!(
+            read_u32_le(&p135, 0x57B1B + OFF_INFLECTION_0 + 4),
+            Some(60_000)
+        );
 
         // 115 W direct fixed (flat 115 W without needing Dynamic Boost)
         let (p115, _) = patch_policy2_direct_fixed_w_with_max(&stock, 115, 135).unwrap();
@@ -1225,8 +1224,14 @@ mod tests {
         assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_LIMIT_RATED), Some(50_000));
         assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_LIMIT_MAX), Some(50_000));
         assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_INFLECTION_0), Some(50_000));
-        assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_INFLECTION_0 + 4), Some(50_000));
-        assert_eq!(read_u32_le(&p50, 0x57B1B + OFF_INFLECTION_0 + 8), Some(20_000));
+        assert_eq!(
+            read_u32_le(&p50, 0x57B1B + OFF_INFLECTION_0 + 4),
+            Some(50_000)
+        );
+        assert_eq!(
+            read_u32_le(&p50, 0x57B1B + OFF_INFLECTION_0 + 8),
+            Some(20_000)
+        );
 
         // Out-of-bounds direct targets rejected.
         assert!(patch_policy2_direct_fixed_w_with_max(&stock, 49, 135).is_err());

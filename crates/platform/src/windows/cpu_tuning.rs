@@ -569,7 +569,10 @@ pub fn validate_original(feature: Feature, original: &SmuImage) -> Result<(), St
             if (2000..=6500).contains(mhz) {
                 Ok(())
             } else {
-                Err("SMU boost clock original is implausible; no automatic restore is attempted".into())
+                Err(
+                    "SMU boost clock original is implausible; no automatic restore is attempted"
+                        .into(),
+                )
             }
         }
         SmuImage::RsmuLimit {

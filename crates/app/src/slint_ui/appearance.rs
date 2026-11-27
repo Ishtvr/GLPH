@@ -62,7 +62,7 @@ impl Host {
             }
             Err(e) => d.set_appearance_error(crate::i18n::error_message(&e).into()),
         }
-        d.set_settings_dirty(self.settings_dirty());
+        self.sync_settings_dirty();
     }
     pub(super) fn paint_about(&self) {
         if let Some(window) = self.about.borrow().as_ref() {

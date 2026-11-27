@@ -61,7 +61,9 @@ pub struct ModeDefaults {
 
 impl ModeDefaults {
     pub fn is_empty(&self) -> bool {
-        self.standard.as_ref().is_none_or(ModePowerDefaults::is_empty)
+        self.standard
+            .as_ref()
+            .is_none_or(ModePowerDefaults::is_empty)
             && self
                 .performance
                 .as_ref()
@@ -138,7 +140,10 @@ impl DeviceDefaultsRecord {
     /// general device default if per-mode measurements are absent.
     pub fn mode_tdc_edc(&self, performance: bool) -> (Option<i64>, Option<i64>) {
         let mode = if performance {
-            self.modes.performance.as_ref().or(self.modes.standard.as_ref())
+            self.modes
+                .performance
+                .as_ref()
+                .or(self.modes.standard.as_ref())
         } else {
             self.modes.standard.as_ref()
         };
@@ -146,8 +151,12 @@ impl DeviceDefaultsRecord {
             Some(Value::Integer(v)) => Some(*v),
             _ => None,
         };
-        let tdc = mode.and_then(|m| m.tdc_ma).or_else(|| top_int(Feature::CpuTdcMa));
-        let edc = mode.and_then(|m| m.edc_ma).or_else(|| top_int(Feature::CpuEdcMa));
+        let tdc = mode
+            .and_then(|m| m.tdc_ma)
+            .or_else(|| top_int(Feature::CpuTdcMa));
+        let edc = mode
+            .and_then(|m| m.edc_ma)
+            .or_else(|| top_int(Feature::CpuEdcMa));
         (tdc, edc)
     }
 
@@ -161,10 +170,11 @@ impl DeviceDefaultsRecord {
         } else {
             self.modes.standard.as_ref()
         };
-        mode.and_then(|m| m.slow_ppt_mw).or_else(|| match self.get(Feature::CpuSlowPptLimitMw) {
-            Some(Value::Integer(v)) => Some(*v),
-            _ => None,
-        })
+        mode.and_then(|m| m.slow_ppt_mw)
+            .or_else(|| match self.get(Feature::CpuSlowPptLimitMw) {
+                Some(Value::Integer(v)) => Some(*v),
+                _ => None,
+            })
     }
 }
 
@@ -208,7 +218,9 @@ pub fn sanitize_default(feature: Feature, value: Value) -> Option<Value> {
         }
         _ => value,
     };
-    if feature.descriptor().value_kind == ValueKind::Choice && normalized == Value::Choice(Choice::Manual) {
+    if feature.descriptor().value_kind == ValueKind::Choice
+        && normalized == Value::Choice(Choice::Manual)
+    {
         return None;
     }
     let setting = Setting {
@@ -543,8 +555,14 @@ mod tests {
         let resolved = resolve_defaults("9999", "F.01", Some(&stored));
         assert_eq!(resolved.mode_tdc_edc(false), (Some(75_000), Some(120_000)));
         assert_eq!(resolved.mode_tdc_edc(true), (Some(95_000), Some(150_000)));
-        assert_eq!(resolved.get(Feature::CpuTdcMa), Some(&Value::Integer(75_000)));
-        assert_eq!(resolved.get(Feature::CpuEdcMa), Some(&Value::Integer(120_000)));
+        assert_eq!(
+            resolved.get(Feature::CpuTdcMa),
+            Some(&Value::Integer(75_000))
+        );
+        assert_eq!(
+            resolved.get(Feature::CpuEdcMa),
+            Some(&Value::Integer(120_000))
+        );
         assert_eq!(
             resolved.get(Feature::DisplayRefreshRateHz),
             Some(&Value::Integer(165))
@@ -568,6 +586,9 @@ mod tests {
             resolved.get(Feature::CpuCurveOptimizerAllCore),
             Some(&Value::Integer(0))
         );
-        assert_eq!(resolved.get(Feature::CpuTdcMa), Some(&Value::Integer(108_000)));
+        assert_eq!(
+            resolved.get(Feature::CpuTdcMa),
+            Some(&Value::Integer(108_000))
+        );
     }
 }

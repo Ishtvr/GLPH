@@ -153,9 +153,7 @@ pub(crate) fn persist_options(
     if changed {
         store.save_ui_appearance(appearance)?;
     }
-    if tgp_changed
-        && let Err(error) = store.save_gpu_tgp_max_w(gpu_tgp_max_w)
-    {
+    if tgp_changed && let Err(error) = store.save_gpu_tgp_max_w(gpu_tgp_max_w) {
         if changed {
             let _ = store.save_ui_appearance(&before);
         }

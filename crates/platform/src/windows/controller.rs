@@ -477,9 +477,7 @@ impl Controller {
                 },
             );
         }
-        if uses_hp_gpu_power(setting.feature)
-            || setting.feature == Feature::GpuTemperatureLimitC
-        {
+        if uses_hp_gpu_power(setting.feature) || setting.feature == Feature::GpuTemperatureLimitC {
             let live = self.read(setting.feature)?;
             return Ok((live != setting.value).then_some(live));
         }
@@ -1506,7 +1504,8 @@ impl Backend for Controller {
                 .temperature_threshold_c
                 .ok_or_else(|| "HP BIOS 0x21 did not return a GPU temperature limit".to_owned())?;
             if live != *temp_c
-                && self.windows_targets.get(&saved.feature) != Some(&Value::Integer(i64::from(live)))
+                && self.windows_targets.get(&saved.feature)
+                    != Some(&Value::Integer(i64::from(live)))
             {
                 return Err("GPU max temperature differs from original and target".into());
             }
@@ -1518,7 +1517,8 @@ impl Backend for Controller {
                 .unwrap_or(omen_core::fan::IR_EMERGENCY_C);
             let orig = limit_c.unwrap_or(omen_core::fan::IR_EMERGENCY_C);
             if live != orig
-                && self.windows_targets.get(&saved.feature) != Some(&Value::Integer(i64::from(live)))
+                && self.windows_targets.get(&saved.feature)
+                    != Some(&Value::Integer(i64::from(live)))
             {
                 return Err("Chassis max temperature differs from original and target".into());
             }
@@ -2139,7 +2139,8 @@ impl Backend for Controller {
                 return Err("Chassis max temperature needs an integer in °C".into());
             };
             let limit_c = u8::try_from(c).map_err(|_| "Chassis max temperature out of range")?;
-            crate::profile_store::ProfileStore::user_data()?.save_chassis_max_temp_c(Some(limit_c))?;
+            crate::profile_store::ProfileStore::user_data()?
+                .save_chassis_max_temp_c(Some(limit_c))?;
             self.windows_targets
                 .insert(setting.feature, setting.value.clone());
             return Ok(());

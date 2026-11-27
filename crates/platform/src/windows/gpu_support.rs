@@ -7,7 +7,10 @@ use omen_core::Inventory;
 
 pub(super) fn driver_evidence(identity: &NvidiaIdentity) -> Result<(), String> {
     let name = identity.name.to_ascii_lowercase();
-    let is_nvidia = name.contains("nvidia") || name.contains("geforce") || name.contains("rtx") || name.contains("gtx");
+    let is_nvidia = name.contains("nvidia")
+        || name.contains("geforce")
+        || name.contains("rtx")
+        || name.contains("gtx");
     if !is_nvidia || identity.vbios.trim().is_empty() {
         return Err(omen_core::message::msg("support.err.gpu_vbios", &[]));
     }

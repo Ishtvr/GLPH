@@ -17,6 +17,7 @@ pub mod hp_control;
 mod lighting;
 mod nvidia;
 pub mod nvpcf_ppt;
+mod plugin_dialogs;
 mod smu;
 mod startup;
 mod thermal;
@@ -50,6 +51,7 @@ pub use hp::{
 pub use lighting::DirectLighting;
 pub use nvidia::{GpuLimitProbe, Nvidia, read_nvml_power_limits};
 use omen_core::{Inventory, PowerStatus};
+pub use plugin_dialogs::{open_plugins_folder, pick_plugin_file};
 pub use smu::{
     LimitCalibration, SmuProbe, calibrate_limits as smu_calibrate_limits, probe as smu_probe,
 };

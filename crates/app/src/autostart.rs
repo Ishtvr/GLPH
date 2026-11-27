@@ -133,10 +133,7 @@ mod tests {
     #[test]
     fn start_command_splits_back_into_program_and_arguments() {
         for tray in [true, false] {
-            let line = command(
-                Path::new(r"D:\PerformanceHub\performance-hub.exe"),
-                tray,
-            );
+            let line = command(Path::new(r"D:\PerformanceHub\performance-hub.exe"), tray);
             assert_eq!(
                 split(&line),
                 Some((

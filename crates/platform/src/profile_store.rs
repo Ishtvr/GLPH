@@ -704,7 +704,9 @@ impl ProfileStore {
         Ok(record.max_w)
     }
     pub fn save_gpu_tgp_max_w(&self, max_w: u32) -> Result<(), String> {
-        use omen_core::profiles::{GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W, GPU_DYNAMIC_BOOST_LIMIT_MIN_W};
+        use omen_core::profiles::{
+            GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W, GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
+        };
         if !(GPU_DYNAMIC_BOOST_LIMIT_MIN_W..=GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W).contains(&max_w) {
             return Err(omen_core::message::msg(
                 "settings.invalid_gpu_tgp_max",
@@ -929,7 +931,9 @@ impl ProfileStore {
         value["celsius"]
             .as_u64()
             .and_then(|c| u8::try_from(c).ok())
-            .filter(|c| (omen_core::fan::IR_LIMIT_MIN_C..=omen_core::fan::IR_LIMIT_MAX_C).contains(c))
+            .filter(|c| {
+                (omen_core::fan::IR_LIMIT_MIN_C..=omen_core::fan::IR_LIMIT_MAX_C).contains(c)
+            })
             .map(Some)
             .ok_or_else(|| "Chassis max temperature is outside 35..=55 °C".into())
     }
@@ -1209,7 +1213,9 @@ mod tests {
             edc_ma: Some(160_000),
             tctl_c: Some(100),
         });
-        record.settings.push(reading(Feature::CpuCurveOptimizerAllCore, 10));
+        record
+            .settings
+            .push(reading(Feature::CpuCurveOptimizerAllCore, 10));
         store.save_device_defaults_record(&record).unwrap();
         let loaded = store.device_defaults_record("8E35", "F.13").unwrap();
         assert_eq!(loaded.mode_tdc_edc(false), (Some(108_000), Some(160_000)));

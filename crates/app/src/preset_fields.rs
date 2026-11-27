@@ -369,10 +369,7 @@ pub fn format_device_defaults_summary(record: &DeviceDefaultsRecord) -> String {
 
 /// Enriches a preset field's explanation text with the device's own discovered
 /// Standard & Performance defaults where applicable.
-pub fn field_info_with_defaults(
-    field: &Field,
-    record: Option<&DeviceDefaultsRecord>,
-) -> String {
+pub fn field_info_with_defaults(field: &Field, record: Option<&DeviceDefaultsRecord>) -> String {
     let base = field.info();
     let Some(record) = record else {
         return base.to_owned();
@@ -382,10 +379,7 @@ pub fn field_info_with_defaults(
             let (std_tdc, _) = record.mode_tdc_edc(false);
             let (perf_tdc, _) = record.mode_tdc_edc(true);
             match (std_tdc, perf_tdc) {
-                (Some(s), Some(p)) => Some(tf(
-                    "defaults.info_tdc",
-                    &[&(s / 1000), &(p / 1000)],
-                )),
+                (Some(s), Some(p)) => Some(tf("defaults.info_tdc", &[&(s / 1000), &(p / 1000)])),
                 _ => None,
             }
         }
@@ -393,16 +387,17 @@ pub fn field_info_with_defaults(
             let (_, std_edc) = record.mode_tdc_edc(false);
             let (_, perf_edc) = record.mode_tdc_edc(true);
             match (std_edc, perf_edc) {
-                (Some(s), Some(p)) => Some(tf(
-                    "defaults.info_edc",
-                    &[&(s / 1000), &(p / 1000)],
-                )),
+                (Some(s), Some(p)) => Some(tf("defaults.info_edc", &[&(s / 1000), &(p / 1000)])),
                 _ => None,
             }
         }
         F::CpuSlowPptLimitMw => {
             let std_w = record.mode_slow_ppt_mw(false);
-            let perf_w = record.modes.performance.as_ref().and_then(|m| m.slow_ppt_mw);
+            let perf_w = record
+                .modes
+                .performance
+                .as_ref()
+                .and_then(|m| m.slow_ppt_mw);
             let unl_w = record.modes.unleashed.as_ref().and_then(|m| m.slow_ppt_mw);
             match (std_w, perf_w, unl_w) {
                 (Some(s), Some(p), Some(u)) => Some(tf(
@@ -519,7 +514,10 @@ mod tests {
         assert_eq!(GROUPS[0], "group.gpu");
         assert_eq!(GROUPS[1], "group.limits");
         assert_eq!(GROUPS[5], "group.thermals");
-        assert_eq!(slider_watts(F::GpuDynamicBoostLimitMw, false), Some((50, 135)));
+        assert_eq!(
+            slider_watts(F::GpuDynamicBoostLimitMw, false),
+            Some((50, 135))
+        );
         assert_eq!(
             slider_watts_with_gpu_max(F::GpuDynamicBoostLimitMw, false, 160),
             Some((50, 160))
@@ -534,9 +532,15 @@ mod tests {
         assert_eq!(slider_watts(F::CpuSlowPptLimitMw, true), Some((15, 80)));
         assert_eq!(slider_watts(F::CpuSlowPptLimitMw, false), Some((15, 80)));
         // Thermal sliders cover CPU (60-100 °C), GPU (65-87 °C), Chassis IR (35-55 °C).
-        assert_eq!(slider_watts(F::CpuTemperatureLimitC, false), Some((60, 100)));
+        assert_eq!(
+            slider_watts(F::CpuTemperatureLimitC, false),
+            Some((60, 100))
+        );
         assert_eq!(slider_watts(F::GpuTemperatureLimitC, false), Some((65, 87)));
-        assert_eq!(slider_watts(F::CpuSkinTemperatureLimitC, false), Some((35, 55)));
+        assert_eq!(
+            slider_watts(F::CpuSkinTemperatureLimitC, false),
+            Some((35, 55))
+        );
         // The seeds start inside their sliders.
         for field in fields() {
             if let Some((lo, hi)) = slider_watts(field.feature, false) {

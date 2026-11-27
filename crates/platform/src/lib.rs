@@ -19,6 +19,7 @@ pub fn power_status() -> omen_core::PowerStatus {
 mod cooling_store;
 #[cfg(any(windows, test))]
 mod ownership_store;
+pub mod plugin_store;
 pub mod profile_store;
 #[cfg(any(windows, test))]
 mod tray_task;

@@ -1,0 +1,361 @@
+import { Theme } from "theme.slint";
+import { ToggleSwitch } from "controls.slint";
+import { ActionButton, Hairline, InfoButton, SettingsCard, StatusPill } from "primitives.slint";
+
+export struct PluginRowData {
+    id: string,
+    folder-name: string,
+    name: string,
+    description: string,
+    version: string,
+    author: string,
+    category-label: string,
+    // 0 = active, 1 = inactive, 2 = incompatible/warning, 3 = error
+    status-kind: int,
+    status-text: string,
+    enabled: bool,
+    can-toggle: bool,
+    can-remove: bool,
+    busy: bool,
+    highlighted: bool,
+    icon-kind: int,
+    capabilities-text: string,
+    diagnostic: string,
+}
+
+export struct PluginNavData {
+    id: string,
+    label: string,
+    icon-kind: int,
+    // 0 = lighting-4zone, 1 = sensor-board, 2 = panel
+    surface-kind: int,
+}
+
+component PluginTableRow inherits Rectangle {
+    in property <PluginRowData> item;
+    in property <bool> last;
+    in property <bool> interactive: true;
+    in-out property <bool> show-details;
+    callback toggled(string, bool);
+    callback remove-clicked(string);
+
+    background: root.item.highlighted ? Theme.hover : row-area.has-hover ? Theme.hover.with-alpha(0.45) : transparent;
+    height: main-layout.preferred-height;
+
+    if root.item.highlighted: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 2px;
+        height: parent.height;
+        background: Theme.accent;
+    }
+
+    row-area := TouchArea {
+        enabled: false;
+    }
+
+    main-layout := VerticalLayout {
+        spacing: 0px;
+
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: 12px;
+
+            // Col 1: Plugin icon, name, description (flexible, elided cleanly at 820px)
+            HorizontalLayout {
+                horizontal-stretch: 1;
+                min-width: 0px;
+                spacing: 12px;
+
+                Rectangle {
+                    width: 32px;
+                    height: 32px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 6px;
+                    background: Theme.control;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    horizontal-stretch: 0;
+                    Image {
+                        width: 18px;
+                        height: 18px;
+                        source: root.item.icon-kind == 2 ? @image-url("icons/keyboard.svg")
+                              : root.item.icon-kind == 4 || root.item.icon-kind == 5 ? @image-url("icons/sensors.svg")
+                              : @image-url("icons/plug.svg");
+                        colorize: root.item.enabled ? Theme.accent : Theme.muted;
+                        accessible-role: none;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        min-width: 0px;
+                        Text {
+                            text: root.item.name;
+                            color: Theme.ink;
+                            font-size: 13px;
+                            font-weight: 600;
+                            overflow: elide;
+                            min-width: 0px;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Text {
+                        text: root.item.description;
+                        color: root.item.status-kind == 3 ? Theme.error : Theme.muted;
+                        font-size: 12px;
+                        overflow: elide;
+                        min-width: 0px;
+                    }
+                }
+            }
+
+            // Col 2: Version (tabular monospace)
+            Text {
+                width: 64px;
+                horizontal-stretch: 0;
+                text: root.item.version;
+                color: Theme.muted;
+                font-family: "Consolas";
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
+            // Col 3: Status pill "(aktiv)" / "(inaktiv)"
+            VerticalLayout {
+                width: 104px;
+                horizontal-stretch: 0;
+                alignment: center;
+                StatusPill {
+                    text: root.item.status-text;
+                    kind: root.item.status-kind;
+                }
+            }
+
+            // Col 4: Info + ToggleSwitch + Remove
+            HorizontalLayout {
+                width: 116px;
+                horizontal-stretch: 0;
+                spacing: 6px;
+                alignment: end;
+
+                InfoButton {
+                    label: Theme.tr("ui.info") + ": " + root.item.name;
+                    enabled: root.interactive;
+                    active: root.show-details;
+                    clicked => { root.show-details = !root.show-details; }
+                }
+
+                ToggleSwitch {
+                    label: root.item.name;
+                    checked: root.item.enabled;
+                    enabled: root.interactive && root.item.can-toggle && !root.item.busy;
+                    toggled(next) => { root.toggled(root.item.id, next); }
+                }
+
+                if root.item.can-remove: ActionButton {
+                    fixed-width: true;
+                    control-width: 28px;
+                    text: "";
+                    accessible-label: Theme.tr("plugins.remove") + ": " + root.item.name;
+                    enabled: root.interactive && !root.item.busy;
+                    clicked => { root.remove-clicked(root.item.id); }
+                    Image {
+                        width: 14px;
+                        height: 14px;
+                        source: @image-url("icons/trash.svg");
+                        colorize: Theme.muted;
+                        accessible-role: none;
+                    }
+                }
+            }
+        }
+
+        // Expandable inline detail drawer (0ms crisp reveal, shows full untruncated metadata)
+        if root.show-details: Rectangle {
+            background: Theme.canvas.with-alpha(0.55);
+            height: detail-box.preferred-height;
+            detail-box := VerticalLayout {
+                padding-left: 60px;
+                padding-right: 16px;
+                padding-top: 10px;
+                padding-bottom: 12px;
+                spacing: 6px;
+
+                Text {
+                    text: root.item.name + " · v" + root.item.version + (root.item.author != "" ? " · " + root.item.author : "");
+                    color: Theme.ink;
+                    font-size: 12px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
+
+                if root.item.description != "": Text {
+                    text: root.item.description;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                if root.item.capabilities-text != "": Text {
+                    text: Theme.tr("plugins.detail_capabilities") + ": " + root.item.capabilities-text;
+                    color: Theme.muted;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: Theme.tr("plugins.detail_folder") + ": " + root.item.folder-name + " (" + root.item.category-label + ")";
+                    color: Theme.quiet;
+                    font-family: "Consolas";
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                if root.item.diagnostic != "": Text {
+                    text: root.item.diagnostic;
+                    color: root.item.status-kind == 3 ? Theme.error : Theme.warning;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        if !root.last: Hairline {
+            x: 16px;
+            width: max(0px, parent.width - 32px);
+        }
+    }
+}
+
+export component PluginTable inherits SettingsCard {
+    in property <[PluginRowData]> items;
+    in property <bool> interactive: true;
+    callback toggled(string, bool);
+    callback remove-clicked(string);
+    callback add-clicked();
+    callback open-folder-clicked();
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // Table Header Row
+        Rectangle {
+            height: 36px;
+            background: Theme.control.with-alpha(0.55);
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 12px;
+
+                Text {
+                    text: Theme.tr("plugins.col_plugin");
+                    color: Theme.muted;
+                    font-size: 11px;
+                    font-weight: 600;
+                    letter-spacing: 0.6px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                }
+
+                Text {
+                    width: 64px;
+                    horizontal-stretch: 0;
+                    text: Theme.tr("plugins.col_version");
+                    color: Theme.muted;
+                    font-size: 11px;
+                    font-weight: 600;
+                    letter-spacing: 0.6px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    width: 104px;
+                    horizontal-stretch: 0;
+                    text: Theme.tr("plugins.col_status");
+                    color: Theme.muted;
+                    font-size: 11px;
+                    font-weight: 600;
+                    letter-spacing: 0.6px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    width: 116px;
+                    horizontal-stretch: 0;
+                    text: Theme.tr("plugins.col_action");
+                    color: Theme.muted;
+                    font-size: 11px;
+                    font-weight: 600;
+                    letter-spacing: 0.6px;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Hairline { }
+
+        if root.items.length == 0: VerticalLayout {
+            padding: 28px;
+            spacing: 10px;
+            alignment: center;
+
+            Text {
+                text: Theme.tr("plugins.empty_title");
+                color: Theme.ink;
+                font-size: 14px;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+
+            Text {
+                text: Theme.tr("plugins.empty_body");
+                color: Theme.muted;
+                font-size: 12px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+
+            HorizontalLayout {
+                alignment: center;
+                spacing: 8px;
+                padding-top: 6px;
+
+                ActionButton {
+                    text: Theme.tr("plugins.add");
+                    primary: true;
+                    enabled: root.interactive;
+                    clicked => { root.add-clicked(); }
+                }
+
+                ActionButton {
+                    text: Theme.tr("plugins.open_folder");
+                    enabled: root.interactive;
+                    clicked => { root.open-folder-clicked(); }
+                }
+            }
+        }
+
+        for row[index] in root.items: PluginTableRow {
+            item: row;
+            last: index == root.items.length - 1;
+            interactive: root.interactive;
+            toggled(id, next) => { root.toggled(id, next); }
+            remove-clicked(id) => { root.remove-clicked(id); }
+        }
+    }
+}

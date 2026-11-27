@@ -571,8 +571,8 @@ pub(crate) fn worker(
         snapshot.power = omen_platform::power_status();
         snapshot.cpu_reader_pid = hardware.as_ref().map(|r| r.process_id());
         if visible && !suspended {
-            let poll_due = last_chassis_poll
-                .is_none_or(|at| at.elapsed() >= Duration::from_secs(8));
+            let poll_due =
+                last_chassis_poll.is_none_or(|at| at.elapsed() >= Duration::from_secs(8));
             if poll_due {
                 last_chassis_poll = Some(Instant::now());
                 let chassis_c =

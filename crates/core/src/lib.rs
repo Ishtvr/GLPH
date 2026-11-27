@@ -24,6 +24,7 @@ pub mod latest_request;
 pub mod lighting_editor;
 pub mod message;
 pub mod ownership;
+pub mod plugins;
 pub mod power;
 pub mod preset;
 pub mod profiles;

@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "id": "hp-omen-4zone-lighting",
+  "name": {
+    "de": "HP OMEN Tastaturbeleuchtung",
+    "en": "HP OMEN Keyboard Lighting"
+  },
+  "description": {
+    "de": "4-Zonen-RGB-Steuerung, Helligkeit und Tasten-Vorschau für HP OMEN Notebooks.",
+    "en": "4-zone RGB lighting, brightness, and keyboard preview for HP OMEN laptops."
+  },
+  "version": "2.0.0",
+  "api_version": 1,
+  "author": "PerformanceHub",
+  "category": "lighting",
+  "runtime": "host_surface",
+  "capabilities": [
+    "hardware.hp_lighting",
+    "ui.sidebar_page"
+  ],
+  "vendor_filter": {
+    "manufacturers": ["HP"],
+    "require_hp_wmi": true
+  },
+  "ui_surface": {
+    "kind": "lighting-4zone",
+    "nav_label": {
+      "de": "Beleuchtung",
+      "en": "Lighting"
+    },
+    "nav_icon": "keyboard",
+    "nav_order": 10
+  }
+}

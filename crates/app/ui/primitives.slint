@@ -11,10 +11,11 @@ export component ActionButton inherits Rectangle {
     accessible-label: root.text;
     accessible-enabled: root.enabled;
     accessible-action-default => { if root.enabled { root.clicked(); } }
+    in property <bool> fixed-width: root.text == "+" || root.text == "−" || root.text == "i" || root.text == "";
     in property <length> control-width: root.text == "+" || root.text == "−" || root.text == "i" ? Theme.control-height : Theme.action-width;
-    min-width: root.control-width;
-    preferred-width: root.control-width;
-    max-width: root.control-width;
+    min-width: root.fixed-width ? root.control-width : max(root.control-width, label.preferred-width + 24px);
+    preferred-width: self.min-width;
+    max-width: root.fixed-width ? root.control-width : 1000px;
     min-height: Theme.control-height;
     max-height: Theme.control-height;
     vertical-stretch: 0;
@@ -25,16 +26,16 @@ export component ActionButton inherits Rectangle {
     border-width: 1px;
     border-color: root.enabled && (area.pressed || focus.has-focus) ? root.primary ? Theme.on-accent : Theme.accent : transparent;
     label := Text {
-        x: 8px;
+        x: 10px;
         y: 0px;
-        width: max(0px,parent.width - 16px);
+        width: max(0px,parent.width - 20px);
         height: parent.height;
         text: root.text;
         color: !root.enabled ? Theme.quiet : root.primary ? Theme.on-accent : Theme.ink;
         font-size: 13px;
         horizontal-alignment: center;
         vertical-alignment: center;
-        wrap: word-wrap;
+        overflow: elide;
         accessible-role: none;
     }
 
@@ -113,6 +114,7 @@ export component InfoButton inherits Rectangle {
 
 export component SegmentedTabs inherits Rectangle {
     in property <[string]> labels;
+    in property <[bool]> dirty-dots;
     in property <bool> enabled: true;
     in-out property <int> selected;
     callback changed(int);
@@ -123,6 +125,7 @@ export component SegmentedTabs inherits Rectangle {
     // An independent moving background used to disagree with intrinsic widths.
     for title[index] in root.labels: tab := ActionButton {
         enabled: root.enabled;
+        fixed-width: true;
         x: index * root.width / max(1, root.labels.length);
         width: root.width / max(1, root.labels.length);
         control-width: root.width / max(1, root.labels.length);
@@ -131,12 +134,157 @@ export component SegmentedTabs inherits Rectangle {
         accessible-item-selectable: true;
         accessible-item-selected: index == root.selected;
         clicked => { root.changed(index); }
+        Rectangle {
+            visible: index < root.dirty-dots.length && root.dirty-dots[index];
+            x: parent.width - 12px;
+            y: 7px;
+            width: 6px;
+            height: 6px;
+            border-radius: 3px;
+            background: Theme.warning;
+        }
     }
 }
 
 export component Hairline inherits Rectangle {
     height: 1px;
     background: Theme.line;
+}
+
+export component SettingsCard inherits Rectangle {
+    background: Theme.surface;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.line;
+    clip: true;
+    @children
+}
+
+export component SettingRow inherits Rectangle {
+    in property <string> label;
+    in property <string> description;
+    in property <bool> last;
+    height: max(54px, row-layout.preferred-height);
+    row-layout := HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 16px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+            min-width: 0px;
+            Text {
+                text: root.label;
+                color: Theme.ink;
+                font-size: 13px;
+                font-weight: 500;
+                wrap: word-wrap;
+            }
+
+            if root.description != "": Text {
+                text: root.description;
+                color: Theme.muted;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            horizontal-stretch: 0;
+            @children
+        }
+    }
+
+    if !root.last: Hairline {
+        x: 16px;
+        y: parent.height - 1px;
+        width: max(0px, parent.width - 32px);
+    }
+}
+
+export component CalloutBanner inherits Rectangle {
+    in property <string> text;
+    // 0 = info/muted, 1 = warning, 2 = error, 3 = good
+    in property <int> severity: 1;
+    private property <color> tone: root.severity == 2 ? Theme.error
+                                 : root.severity == 3 ? Theme.good
+                                 : root.severity == 1 ? Theme.warning
+                                 : Theme.accent;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.tone.with-alpha(0.55);
+    background: root.tone.with-alpha(0.14);
+    height: banner-layout.preferred-height;
+    banner-layout := HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 9px;
+        padding-bottom: 9px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: start;
+            padding-top: 5px;
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: root.tone;
+            }
+        }
+
+        Text {
+            text: root.text;
+            color: Theme.ink;
+            font-size: 12px;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+export component StatusPill inherits Rectangle {
+    in property <string> text;
+    // 0 = active (good), 1 = inactive (muted), 2 = incompatible/warning, 3 = error
+    in property <int> kind: 1;
+    private property <color> tone: root.kind == 0 ? Theme.good
+                                 : root.kind == 2 ? Theme.warning
+                                 : root.kind == 3 ? Theme.error
+                                 : Theme.muted;
+    width: 104px;
+    height: 26px;
+    border-radius: 13px;
+    border-width: 1px;
+    border-color: root.kind == 1 ? Theme.line : root.tone.with-alpha(0.55);
+    background: root.kind == 1 ? Theme.control : root.tone.with-alpha(0.14);
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        alignment: center;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: root.kind == 1 ? Theme.quiet : root.tone;
+            }
+        }
+
+        Text {
+            text: root.text;
+            color: root.kind == 1 ? Theme.muted : root.tone;
+            font-size: 12px;
+            font-weight: root.kind == 0 ? 600 : 500;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
 }
 
 export component SectionTitle inherits Text {

@@ -6,7 +6,7 @@ import {
 } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 export { Theme } from "theme.slint";
-import { ComboBox, LineEdit, CheckBox, BrightnessSlider } from "controls.slint";
+import { ComboBox, LineEdit, CheckBox, ToggleSwitch, BrightnessSlider } from "controls.slint";
 import { KeyboardPreview, KeyCap } from "keyboard.slint";
 import { ColorField } from "color-field.slint";
 import { ColorPicker, ColorEditor } from "color-picker.slint";
@@ -16,12 +16,18 @@ import { CaptionButton, NavigationItem } from "chrome.slint";
 import { NotificationPopup, MessageDialog } from "notifications.slint";
 import {
     ActionButton,
+    CalloutBanner,
     InfoButton,
     SegmentedTabs,
     Hairline,
     SectionTitle,
     SectionHeader,
+    SettingsCard,
+    SettingRow,
+    StatusPill,
 } from "primitives.slint";
+import { PluginRowData, PluginNavData, PluginTable } from "settings-plugins.slint";
+export { PluginRowData, PluginNavData } from "settings-plugins.slint";
 
 export struct FieldData {
     index: int,
@@ -148,6 +154,15 @@ export global Workbench {
     in-out property <int> battery-index;
     in property <bool> settings-ready;
     in-out property <bool> settings-dirty;
+    in-out property <int> settings-tab;
+    in property <[bool]> settings-tab-dirty;
+    in property <[PluginRowData]> plugins;
+    in property <[PluginNavData]> plugin-nav-items;
+    in property <string> plugins-dir;
+    in property <string> plugins-summary;
+    in property <string> active-plugin-id;
+    in property <string> active-plugin-title;
+    in property <string> plugin-confirm-text;
     in-out property <int> palette-index;
     in property <[PaletteChoice]> palette-choices;
     in property <color> background-preview;
@@ -220,7 +235,14 @@ export global Workbench {
     callback reset-lighting();
     callback refresh-lighting();
     callback save-settings();
+    callback discard-settings();
     callback settings-changed();
+    callback toggle-plugin(string, bool);
+    callback install-plugin();
+    callback open-plugins-folder();
+    callback reload-plugins();
+    callback remove-plugin(string);
+    callback select-plugin-page(string);
     callback palette-changed(int);
     callback colors-changed();
     callback open-color-picker(int);
@@ -730,7 +752,9 @@ component ConfirmPrompt inherits FocusScope {
             padding: 20px;
             spacing: 16px;
             Text {
-                text: Workbench.tr(root.kind == 2 ? "ui.confirm_delete" : root.kind == 3 ? "ui.confirm_exit" : "notice.unsaved_preset");
+                text: root.kind == 7 || root.kind == 8
+                    ? Workbench.plugin-confirm-text
+                    : Workbench.tr(root.kind == 2 ? "ui.confirm_delete" : root.kind == 3 ? "ui.confirm_exit" : "notice.unsaved_preset");
                 color: Theme.ink;
                 wrap: word-wrap;
             }
@@ -754,7 +778,7 @@ component ConfirmPrompt inherits FocusScope {
                 }
 
                 confirm-button := ActionButton {
-                    text: Workbench.tr(root.kind == 2 ? "preset.delete" : "notice.discard");
+                    text: Workbench.tr(root.kind == 2 ? "preset.delete" : root.kind == 7 ? "plugins.replace" : root.kind == 8 ? "plugins.remove" : "notice.discard");
                     primary: root.kind != 1;
                     clicked => { root.accepted(true); }
                 }
@@ -777,10 +801,8 @@ export component AppWindow inherits Window {
     public function edit-curve-value() { point-y.focus(); }
     callback color-picker-closed(int);
     color-picker-closed(target) => {
-        if target == 0 { color-background.focus(); }
-        else if target == 1 { color-foreground.focus(); }
-        else if target == 2 { color-accent.focus(); }
-        else { lighting-color.focus(); }
+        if target == 3 { lighting-color.focus(); }
+        else { settings-button.focus(); }
     }
     title: "PerformanceHub";
     no-frame: true;
@@ -826,7 +848,11 @@ export component AppWindow inherits Window {
             Text {
                 x: 164px;
                 width: parent.width - 184px;
-                text: Workbench.busy ? Workbench.tr("control.working") : Workbench.page < 2 ? Workbench.tr("ui.overview") : Workbench.page == 2 ? Workbench.tr("ui.cooling") : Workbench.page == 3 ? Workbench.tr("ui.lighting") : Workbench.tr("settings.title");
+                text: Workbench.busy ? Workbench.tr("control.working")
+                    : Workbench.page < 2 ? Workbench.tr("ui.overview")
+                    : Workbench.page == 2 ? Workbench.tr("ui.cooling")
+                    : Workbench.page == 3 ? (Workbench.active-plugin-title != "" ? Workbench.active-plugin-title : Workbench.tr("ui.lighting"))
+                    : Workbench.tr("settings.title");
                 color: Theme.muted;
                 vertical-alignment: center;
             }
@@ -891,15 +917,27 @@ export component AppWindow inherits Window {
                 clicked => { Workbench.navigate(2); }
             }
 
-            navigation-lighting := NavigationItem {
-                kind: 2;
-                text: Workbench.tr("ui.lighting");
-                selected: Workbench.page == 3;
-                enabled: Workbench.confirm-kind == 0;
-                clicked => { Workbench.navigate(3); }
+            if Workbench.plugin-nav-items.length > 0: Hairline { }
+
+            if Workbench.plugin-nav-items.length > 0: ScrollView {
+                vertical-stretch: 1;
+                content-width: self.visible-width;
+                content-height: plugin-nav-list.preferred-height;
+                plugin-nav-list := VerticalLayout {
+                    width: parent.width;
+                    height: self.preferred-height;
+                    spacing: 6px;
+                    for item in Workbench.plugin-nav-items: NavigationItem {
+                        kind: item.icon-kind;
+                        text: item.label;
+                        selected: Workbench.page == 3 && Workbench.active-plugin-id == item.id;
+                        enabled: Workbench.confirm-kind == 0;
+                        clicked => { Workbench.select-plugin-page(item.id); }
+                    }
+                }
             }
 
-            Rectangle {
+            if Workbench.plugin-nav-items.length == 0: Rectangle {
                 vertical-stretch: 1;
             }
 
@@ -1652,274 +1690,473 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                settings := ScrollView {
-                    content-width: self.visible-width - 12px;
-                    content-height: settings-content.preferred-height;
+                settings := Rectangle {
                     visible: Workbench.page == 4 && !Workbench.curve-open;
-                    settings-content := VerticalLayout {
-                        width: min(Theme.workspace-width,parent.width);
-                        x: (parent.width - self.width) / 2;
-                        y: 0px;
-                        height: self.preferred-height;
-                        padding: 20px;
-                        spacing: 14px;
-                        SectionTitle {
-                            text: Workbench.tr("settings.title");
-                        }
+                    VerticalLayout {
+                        spacing: 0px;
 
-                        SectionTitle {
-                            text: Workbench.tr("settings.appearance");
-                        }
+                        // 1. Non-scrolling structured header with canonical 4 sub-tabs
+                        Rectangle {
+                            vertical-stretch: 0;
+                            height: settings-header.preferred-height;
+                            settings-header := VerticalLayout {
+                                width: min(880px, parent.width);
+                                x: (parent.width - self.width) / 2;
+                                padding-left: 20px;
+                                padding-right: 20px;
+                                padding-top: 20px;
+                                padding-bottom: 12px;
+                                spacing: 12px;
 
-                        palette-selector := ThemeGallery {
-                            choices: Workbench.palette-choices;
-                            selected: Workbench.palette-index;
-                            enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                            changed(index) => { Workbench.palette-changed(index); }
-                        }
+                                Text {
+                                    text: Workbench.tr("settings.title");
+                                    color: Theme.ink;
+                                    font-size: 20px;
+                                    font-weight: 600;
+                                }
 
-                        HorizontalLayout {
-                            Text {
-                                text: Workbench.tr("settings.background");
-                                color: Theme.ink;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-
-                            color-background := ColorField {
-                                text: Workbench.tr("settings.background");
-                                value: Workbench.color-background;
-                                swatch-color: Workbench.background-preview;
-                                enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.open-color-picker(0); }
-                            }
-                        }
-
-                        HorizontalLayout {
-                            Text {
-                                text: Workbench.tr("settings.foreground");
-                                color: Theme.ink;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-
-                            color-foreground := ColorField {
-                                text: Workbench.tr("settings.foreground");
-                                value: Workbench.color-foreground;
-                                swatch-color: Workbench.foreground-preview;
-                                enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.open-color-picker(1); }
-                            }
-                        }
-
-                        HorizontalLayout {
-                            Text {
-                                text: Workbench.tr("settings.accent");
-                                color: Theme.ink;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-
-                            color-accent := ColorField {
-                                text: Workbench.tr("settings.accent");
-                                value: Workbench.color-accent;
-                                swatch-color: Workbench.accent-preview;
-                                enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.open-color-picker(2); }
-                            }
-                        }
-
-                        Text {
-                            text: Workbench.appearance-error != "" ? Workbench.appearance-error : Workbench.tr("settings.palette_note");
-                            color: Workbench.appearance-error != "" ? Theme.error : Theme.muted;
-                            wrap: word-wrap;
-                            font-size: 12px;
-                        }
-
-                        HorizontalLayout {
-                            Rectangle {
-                                horizontal-stretch: 1;
-                            }
-
-                            reset-appearance := ActionButton {
-                                text: Workbench.tr("settings.reset_palette");
-                                enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.reset-appearance(); }
+                                settings-tabs := SegmentedTabs {
+                                    labels: [
+                                        Workbench.tr("settings.tab_general"),
+                                        Workbench.tr("settings.tab_plugins"),
+                                        Workbench.tr("settings.tab_appearance"),
+                                        Workbench.tr("settings.tab_hardware"),
+                                    ];
+                                    dirty-dots: Workbench.settings-tab-dirty;
+                                    selected <=> Workbench.settings-tab;
+                                    enabled: Workbench.confirm-kind == 0;
+                                    changed(index) => {
+                                        Workbench.settings-tab = index;
+                                        settings-scroll.content-y = 0px;
+                                    }
+                                }
                             }
                         }
 
                         Hairline { }
 
-                        SectionTitle {
-                            text: Workbench.tr("settings.general");
+                        // 2. Scrollable card-based content per sub-tab
+                        settings-scroll := ScrollView {
+                            vertical-stretch: 1;
+                            content-width: self.visible-width - 12px;
+                            content-height: settings-content.preferred-height;
+                            settings-content := VerticalLayout {
+                                width: min(880px, parent.width);
+                                x: (parent.width - self.width) / 2;
+                                y: 0px;
+                                height: self.preferred-height;
+                                padding: 20px;
+                                spacing: 16px;
+
+                                // --- Sub-tab 0: Allgemein ---
+                                if Workbench.settings-tab == 0: VerticalLayout {
+                                    spacing: 14px;
+
+                                    Text {
+                                        text: Workbench.tr("settings.card_app");
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        letter-spacing: 0.6px;
+                                    }
+
+                                    SettingsCard {
+                                        VerticalLayout {
+                                            spacing: 0px;
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.language");
+                                                description: Workbench.tr("settings.restart_note");
+                                                language := ComboBox {
+                                                    width: Theme.field-width;
+                                                    model: [Workbench.tr("settings.language_system"), "Deutsch", "English"];
+                                                    current-index <=> Workbench.language-index;
+                                                    enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    selected(value) => { Workbench.settings-changed(); }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.autostart");
+                                                autostart := ToggleSwitch {
+                                                    label: Workbench.tr("settings.autostart");
+                                                    checked <=> Workbench.autostart;
+                                                    enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    toggled(v) => { Workbench.settings-changed(); }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.start_in_tray");
+                                                tray-start := ToggleSwitch {
+                                                    label: Workbench.tr("settings.start_in_tray");
+                                                    checked <=> Workbench.start-in-tray;
+                                                    enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    toggled(v) => { Workbench.settings-changed(); }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.close");
+                                                last: true;
+                                                close-behavior := ComboBox {
+                                                    width: Theme.field-width;
+                                                    model: [Workbench.tr("settings.close_tray"), Workbench.tr("settings.close_exit")];
+                                                    current-index <=> Workbench.close-index;
+                                                    enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    selected(value) => { Workbench.settings-changed(); }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Text {
+                                        text: Workbench.tr("settings.card_behavior");
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        letter-spacing: 0.6px;
+                                    }
+
+                                    SettingsCard {
+                                        VerticalLayout {
+                                            spacing: 0px;
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.hold_preset");
+                                                description: Workbench.tr("settings.startup_note");
+                                                last: true;
+                                                hold := ToggleSwitch {
+                                                    label: Workbench.tr("settings.hold_preset");
+                                                    checked <=> Workbench.hold-preset;
+                                                    enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    toggled(v) => { Workbench.settings-changed(); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // --- Sub-tab 1: Plugins ---
+                                if Workbench.settings-tab == 1: VerticalLayout {
+                                    spacing: 12px;
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+
+                                        VerticalLayout {
+                                            alignment: center;
+                                            spacing: 2px;
+                                            horizontal-stretch: 1;
+                                            min-width: 0px;
+
+                                            Text {
+                                                text: Workbench.tr("plugins.title");
+                                                color: Theme.ink;
+                                                font-size: 15px;
+                                                font-weight: 600;
+                                                overflow: elide;
+                                            }
+
+                                            Text {
+                                                text: Workbench.plugins-summary;
+                                                color: Theme.muted;
+                                                font-size: 12px;
+                                                overflow: elide;
+                                            }
+                                        }
+
+                                        plugins-reload := ActionButton {
+                                            fixed-width: true;
+                                            control-width: Theme.control-height;
+                                            text: "";
+                                            accessible-label: Workbench.tr("plugins.reload");
+                                            enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                            clicked => { Workbench.reload-plugins(); }
+                                            Image {
+                                                width: 15px;
+                                                height: 15px;
+                                                source: @image-url("icons/refresh.svg");
+                                                colorize: Theme.ink;
+                                                accessible-role: none;
+                                            }
+                                        }
+
+                                        plugins-open-folder := ActionButton {
+                                            text: Workbench.tr("plugins.open_folder");
+                                            enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                            clicked => { Workbench.open-plugins-folder(); }
+                                        }
+
+                                        plugins-add := ActionButton {
+                                            text: Workbench.tr("plugins.add");
+                                            primary: true;
+                                            enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                            clicked => { Workbench.install-plugin(); }
+                                        }
+                                    }
+
+                                    // Quiet storage path & instant-apply scope bar
+                                    HorizontalLayout {
+                                        spacing: 12px;
+
+                                        Text {
+                                            text: Workbench.tr("plugins.storage_path") + ": " + Workbench.plugins-dir;
+                                            color: Theme.quiet;
+                                            font-family: "Consolas";
+                                            font-size: 11px;
+                                            overflow: elide;
+                                            min-width: 0px;
+                                            horizontal-stretch: 1;
+                                        }
+
+                                        Text {
+                                            text: Workbench.tr("plugins.instant_apply_note");
+                                            color: Theme.muted;
+                                            font-size: 11px;
+                                            horizontal-stretch: 0;
+                                        }
+                                    }
+
+                                    PluginTable {
+                                        items: Workbench.plugins;
+                                        interactive: !Workbench.busy && Workbench.confirm-kind == 0;
+                                        toggled(id, next) => { Workbench.toggle-plugin(id, next); }
+                                        remove-clicked(id) => { Workbench.remove-plugin(id); }
+                                        add-clicked => { Workbench.install-plugin(); }
+                                        open-folder-clicked => { Workbench.open-plugins-folder(); }
+                                    }
+                                }
+
+                                // --- Sub-tab 2: Darstellung ---
+                                if Workbench.settings-tab == 2: VerticalLayout {
+                                    spacing: 14px;
+
+                                    Text {
+                                        text: Workbench.tr("settings.appearance");
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        letter-spacing: 0.6px;
+                                    }
+
+                                    SettingsCard {
+                                        VerticalLayout {
+                                            spacing: 0px;
+
+                                            VerticalLayout {
+                                                padding: 16px;
+                                                spacing: 12px;
+                                                palette-selector := ThemeGallery {
+                                                    choices: Workbench.palette-choices;
+                                                    selected: Workbench.palette-index;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    changed(index) => { Workbench.palette-changed(index); }
+                                                }
+                                            }
+
+                                            Hairline { }
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.background");
+                                                color-background := ColorField {
+                                                    text: Workbench.tr("settings.background");
+                                                    value: Workbench.color-background;
+                                                    swatch-color: Workbench.background-preview;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.open-color-picker(0); }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.foreground");
+                                                color-foreground := ColorField {
+                                                    text: Workbench.tr("settings.foreground");
+                                                    value: Workbench.color-foreground;
+                                                    swatch-color: Workbench.foreground-preview;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.open-color-picker(1); }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.accent");
+                                                last: true;
+                                                color-accent := ColorField {
+                                                    text: Workbench.tr("settings.accent");
+                                                    value: Workbench.color-accent;
+                                                    swatch-color: Workbench.accent-preview;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.open-color-picker(2); }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if Workbench.appearance-error != "": CalloutBanner {
+                                        text: Workbench.appearance-error;
+                                        severity: 2;
+                                    }
+
+                                    HorizontalLayout {
+                                        spacing: 12px;
+                                        Text {
+                                            text: Workbench.tr("settings.palette_note");
+                                            color: Theme.muted;
+                                            font-size: 12px;
+                                            wrap: word-wrap;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+
+                                        reset-appearance := ActionButton {
+                                            text: Workbench.tr("settings.reset_palette");
+                                            enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                            clicked => { Workbench.reset-appearance(); }
+                                        }
+                                    }
+                                }
+
+                                // --- Sub-tab 3: Hardware ---
+                                if Workbench.settings-tab == 3: VerticalLayout {
+                                    spacing: 14px;
+
+                                    Text {
+                                        text: Workbench.tr("settings.card_gpu_power");
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        letter-spacing: 0.6px;
+                                    }
+
+                                    SettingsCard {
+                                        VerticalLayout {
+                                            spacing: 0px;
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.gpu_tgp_max");
+                                                last: true;
+                                                gpu-tgp-max := LineEdit {
+                                                    accessible-label: Workbench.tr("settings.gpu_tgp_max");
+                                                    text <=> Workbench.gpu-tgp-max-w;
+                                                    unit: "W";
+                                                    width: Theme.number-width;
+                                                    horizontal-stretch: 0;
+                                                    enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    edited(text) => { Workbench.settings-changed(); }
+                                                }
+                                            }
+
+                                            VerticalLayout {
+                                                padding-left: 16px;
+                                                padding-right: 16px;
+                                                padding-bottom: 14px;
+                                                CalloutBanner {
+                                                    text: Workbench.gpu-tgp-max-error != "" ? Workbench.gpu-tgp-max-error : Workbench.tr("settings.gpu_tgp_max_warning");
+                                                    severity: Workbench.gpu-tgp-max-error != "" ? 2 : 1;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Text {
+                                        text: Workbench.tr("settings.device_defaults");
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        letter-spacing: 0.6px;
+                                    }
+
+                                    SettingsCard {
+                                        VerticalLayout {
+                                            spacing: 0px;
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.detect_defaults");
+                                                description: Workbench.device-defaults-summary != "" ? Workbench.device-defaults-summary : Workbench.tr("settings.device_defaults_note");
+                                                ActionButton {
+                                                    text: Workbench.tr("settings.detect_defaults");
+                                                    enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.detect-defaults(); }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.hp_service");
+                                                description: Workbench.tr("settings.detect_defaults_note");
+                                                ActionButton {
+                                                    text: Workbench.hp-disabled ? Workbench.tr("ui.hp_restore") : Workbench.tr("settings.hp_service");
+                                                    enabled: (Workbench.hp-available && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.hp-service(); }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("ui.about");
+                                                last: true;
+                                                ActionButton {
+                                                    enabled: Workbench.confirm-kind == 0;
+                                                    text: Workbench.tr("ui.about");
+                                                    clicked => { Workbench.show-about(); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
 
-                        HorizontalLayout {
-                            Text {
-                                text: Workbench.tr("settings.language");
-                                color: Theme.ink;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
+                        // 3. Sticky Dirty Footer (only visible when form settings have unsaved edits)
+                        if Workbench.settings-dirty: Rectangle {
+                            vertical-stretch: 0;
+                            height: 58px;
+                            background: Theme.surface;
+
+                            Hairline {
+                                y: 0px;
+                                width: parent.width;
                             }
 
-                            language := ComboBox {
-                                width: Theme.field-width;
-                                model: [Workbench.tr("settings.language_system"), "Deutsch", "English"];
-                                current-index <=> Workbench.language-index;
-                                enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
-                                selected(value) => { Workbench.settings-changed(); }
-                            }
-                        }
+                            HorizontalLayout {
+                                width: min(880px, parent.width);
+                                x: (parent.width - self.width) / 2;
+                                padding-left: 20px;
+                                padding-right: 20px;
+                                padding-top: 11px;
+                                padding-bottom: 11px;
+                                spacing: 10px;
 
-                        Text {
-                            text: Workbench.tr("settings.restart_note");
-                            color: Theme.muted;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 7px;
+                                        height: 7px;
+                                        border-radius: 4px;
+                                        background: Theme.warning;
+                                    }
+                                }
 
-                        autostart := CheckBox {
-                            text: Workbench.tr("settings.autostart");
-                            checked <=> Workbench.autostart;
-                            enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
-                            toggled => { Workbench.settings-changed(); }
-                        }
+                                Text {
+                                    text: Workbench.tr("settings.unsaved_form_changes");
+                                    color: Theme.ink;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
 
-                        tray-start := CheckBox {
-                            text: Workbench.tr("settings.start_in_tray");
-                            checked <=> Workbench.start-in-tray;
-                            enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
-                            toggled => { Workbench.settings-changed(); }
-                        }
+                                settings-discard := ActionButton {
+                                    text: Workbench.tr("notice.discard");
+                                    enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                    clicked => { Workbench.discard-settings(); }
+                                }
 
-                        HorizontalLayout {
-                            Text {
-                                text: Workbench.tr("settings.close");
-                                color: Theme.ink;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-
-                            close-behavior := ComboBox {
-                                width: Theme.field-width;
-                                model: [Workbench.tr("settings.close_tray"), Workbench.tr("settings.close_exit")];
-                                current-index <=> Workbench.close-index;
-                                enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
-                                selected(value) => { Workbench.settings-changed(); }
-                            }
-                        }
-
-                        Hairline { }
-
-                        hold := CheckBox {
-                            text: Workbench.tr("settings.hold_preset");
-                            checked <=> Workbench.hold-preset;
-                            enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
-                            toggled => { Workbench.settings-changed(); }
-                        }
-
-                        Text {
-                            text: Workbench.tr("settings.startup_note");
-                            color: Theme.muted;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-
-                        Hairline { }
-
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text {
-                                text: Workbench.tr("settings.gpu_tgp_max");
-                                color: Theme.ink;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-
-                            gpu-tgp-max := LineEdit {
-                                accessible-label: Workbench.tr("settings.gpu_tgp_max");
-                                text <=> Workbench.gpu-tgp-max-w;
-                                unit: "W";
-                                width: Theme.number-width;
-                                horizontal-stretch: 0;
-                                enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
-                                edited(text) => { Workbench.settings-changed(); }
-                            }
-                        }
-
-                        Text {
-                            text: Workbench.gpu-tgp-max-error != "" ? Workbench.gpu-tgp-max-error : Workbench.tr("settings.gpu_tgp_max_warning");
-                            color: Workbench.gpu-tgp-max-error != "" ? Theme.error : Theme.warning;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-
-                        HorizontalLayout {
-                            Rectangle {
-                                horizontal-stretch: 1;
-                            }
-
-                            settings-save := ActionButton {
-                                text: Workbench.tr("preset.save");
-                                min-width: 110px;
-                                max-width: 140px;
-                                primary: Workbench.settings-dirty;
-                                enabled: (Workbench.settings-ready && Workbench.settings-dirty && Workbench.appearance-error == "" && Workbench.gpu-tgp-max-error == "" && !Workbench.busy) && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.save-settings(); }
-                            }
-                        }
-
-                        Hairline { }
-
-                        SectionTitle {
-                            text: Workbench.tr("settings.device_defaults");
-                        }
-
-                        Text {
-                            text: Workbench.device-defaults-summary != "" ? Workbench.device-defaults-summary : Workbench.tr("settings.device_defaults_note");
-                            color: Theme.muted;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-
-                        HorizontalLayout {
-                            spacing: 8px;
-                            ActionButton {
-                                text: Workbench.tr("settings.detect_defaults");
-                                control-width: Theme.field-width;
-                                enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.detect-defaults(); }
-                            }
-
-                            Text {
-                                text: Workbench.tr("settings.detect_defaults_note");
-                                color: Theme.muted;
-                                font-size: 12px;
-                                wrap: word-wrap;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-                        }
-
-                        Hairline { }
-
-                        HorizontalLayout {
-                            ActionButton {
-                                text: Workbench.hp-disabled ? Workbench.tr("ui.hp_restore") : Workbench.tr("settings.hp_service");
-                                control-width: Theme.field-width;
-                                enabled: (Workbench.hp-available && !Workbench.busy) && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.hp-service(); }
-                            }
-
-                            Rectangle {
-                                horizontal-stretch: 1;
-                            }
-
-                            ActionButton {
-                                enabled: Workbench.confirm-kind == 0;
-                                text: Workbench.tr("ui.about");
-                                control-width: Theme.field-width;
-                                clicked => { Workbench.show-about(); }
+                                settings-save := ActionButton {
+                                    text: Workbench.tr("preset.save");
+                                    primary: true;
+                                    enabled: (Workbench.settings-ready && Workbench.settings-dirty && Workbench.appearance-error == "" && Workbench.gpu-tgp-max-error == "" && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                    clicked => { Workbench.save-settings(); }
+                                }
                             }
                         }
                     }
@@ -2088,7 +2325,7 @@ export component AppWindow inherits Window {
         }
     }
     if Workbench.confirm-kind == 4: ColorPicker { }
-    if Workbench.confirm-kind > 0 && Workbench.confirm-kind < 4: ConfirmPrompt {
+    if (Workbench.confirm-kind > 0 && Workbench.confirm-kind < 4) || Workbench.confirm-kind == 7 || Workbench.confirm-kind == 8: ConfirmPrompt {
         kind: Workbench.confirm-kind;
         save-requested => { Workbench.confirm-save(); }
         accepted(value) => {

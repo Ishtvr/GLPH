@@ -43,6 +43,7 @@ mod curve;
 mod lighting;
 mod notices;
 mod pacing;
+mod plugins;
 mod surface;
 slint::include_modules!();
 
@@ -133,6 +134,8 @@ enum Aux {
     Lighting(Option<(KeyboardState, [[u8; 3]; 4], bool)>),
     HpService(bool),
     DetectDefaults,
+    PickPluginFile(isize, String, String),
+    InstallPlugin(std::path::PathBuf, bool),
     Stop,
 }
 enum AuxResult {
@@ -157,6 +160,11 @@ enum AuxResult {
     Lighting(Result<KeyboardState, String>, bool),
     Hp(Result<bool, String>),
     DefaultsDetected(Result<omen_core::device_defaults::DeviceDefaultsRecord, String>),
+    PluginFilePicked(Result<Option<std::path::PathBuf>, String>),
+    PluginInstalled(
+        std::path::PathBuf,
+        Result<omen_platform::plugin_store::InstallOutcome, String>,
+    ),
 }
 fn aux_worker(hwnd: usize, rx: mpsc::Receiver<Aux>, tx: mpsc::Sender<AuxResult>) {
     while let Ok(request) = rx.recv() {
@@ -241,6 +249,14 @@ fn aux_worker(hwnd: usize, rx: mpsc::Receiver<Aux>, tx: mpsc::Sender<AuxResult>)
                             .map_err(|e| e.to_string())
                     }),
             ),
+            Aux::PickPluginFile(owner, title, filter) => {
+                AuxResult::PluginFilePicked(omen_platform::pick_plugin_file(owner, &title, &filter))
+            }
+            Aux::InstallPlugin(path, replace) => {
+                let outcome = omen_platform::plugin_store::PluginStore::user_data()
+                    .and_then(|store| store.install_from_path(&path, replace));
+                AuxResult::PluginInstalled(path, outcome)
+            }
             Aux::Stop => break,
         };
         if tx.send(result).is_err() {
@@ -312,6 +328,8 @@ struct Host {
     was_minimized: Cell<bool>,
     surface_timer: slint::Timer,
     drain: Cell<omen_core::battery::DrainWatch>,
+    plugins: RefCell<plugins::PluginHostState>,
+    self_rc: RefCell<Option<std::rc::Weak<Host>>>,
 }
 
 impl Host {
@@ -545,7 +563,9 @@ impl Host {
                 Aux::SaveFanPreset(..) => "preset.saving",
                 Aux::DeleteFanPreset(..) => "preset.deleting",
                 Aux::RequestFanPreset(..) => "control.working",
-                Aux::Stop => "control.working",
+                Aux::PickPluginFile(_, _, _) | Aux::InstallPlugin(_, _) | Aux::Stop => {
+                    "control.working"
+                }
             }),
             false,
         );
@@ -835,9 +855,9 @@ impl Host {
                 if let Some(val) = map.get(&field.feature) {
                     draft.value = val.clone();
                     draft.text = match val {
-                        Value::Integer(v) => {
-                            crate::i18n::number(&omen_core::preset::format_number(*v, field.scale()))
-                        }
+                        Value::Integer(v) => crate::i18n::number(
+                            &omen_core::preset::format_number(*v, field.scale()),
+                        ),
                         _ => String::new(),
                     };
                 }
@@ -1071,7 +1091,40 @@ impl Host {
             if w.global::<Workbench>().get_curve_open() {
                 self.curve_action("close");
             }
+            if page == 3 && !self.lighting_plugin_active() {
+                let d = w.global::<Workbench>();
+                d.set_page(4);
+                d.set_settings_tab(1);
+                self.status(t("plugins.lighting_inactive_notice"), false);
+                if !self.test && !self.settings_loaded.get() && !self.is_busy() {
+                    self.settings_loaded.set(true);
+                    self.send_aux(Aux::Settings);
+                }
+                return;
+            }
             w.global::<Workbench>().set_page(page);
+            if page != 3 {
+                w.global::<Workbench>().set_active_plugin_id("".into());
+                w.global::<Workbench>().set_active_plugin_title("".into());
+            } else if w.global::<Workbench>().get_active_plugin_id().is_empty() {
+                let lang = crate::i18n::language_code();
+                if let Some((id, label)) = self
+                    .plugins
+                    .borrow()
+                    .installed
+                    .iter()
+                    .find(|p| {
+                        p.status.is_active()
+                            && p.surface_kind()
+                                == Some(omen_core::plugins::UiSurfaceKind::Lighting4Zone)
+                    })
+                    .map(|p| (p.id.clone(), p.nav_label(lang)))
+                {
+                    let d = w.global::<Workbench>();
+                    d.set_active_plugin_id(id.into());
+                    d.set_active_plugin_title(label.into());
+                }
+            }
             if self.test {
                 return;
             }
@@ -1092,6 +1145,9 @@ impl Host {
             {
                 self.lighting_attempted.set(true);
                 self.send_aux(Aux::Lighting(None));
+            }
+            if page == 4 {
+                self.load_plugins(None);
             }
             if page == 4 && !self.settings_loaded.get() && !self.is_busy() {
                 self.settings_loaded.set(true);
@@ -1411,6 +1467,20 @@ impl Host {
                         }
                         Err(e) => self.status(&crate::i18n::error_message(&e), true),
                     },
+                    AuxResult::PluginFilePicked(result) => match result {
+                        Ok(Some(path)) => self.send_aux(Aux::InstallPlugin(path, false)),
+                        Ok(None) => {}
+                        Err(e) => self.status(&crate::i18n::error_message(&e), true),
+                    },
+                    AuxResult::PluginInstalled(path, result) => match result {
+                        Ok(outcome) => {
+                            let host_rc = self.self_rc.borrow().as_ref().and_then(|w| w.upgrade());
+                            if let Some(h) = host_rc {
+                                Host::handle_plugin_install_outcome(&h, path, outcome);
+                            }
+                        }
+                        Err(e) => self.status(&crate::i18n::error_message(&e), true),
+                    },
                 }
             }
         }
@@ -1567,6 +1637,7 @@ impl Host {
         let tgp_changed = self.gpu_tgp_max_w.replace(s.gpu_tgp_max_w) != s.gpu_tgp_max_w;
         d.set_settings_ready(true);
         d.set_settings_dirty(false);
+        d.set_settings_tab_dirty(Rc::new(VecModel::from(vec![false, false, false, false])).into());
         if tgp_changed {
             self.update_fields();
         }
@@ -2003,7 +2074,19 @@ pub fn run(
         was_minimized: Cell::new(false),
         surface_timer: Default::default(),
         drain: Default::default(),
+        plugins: RefCell::new(plugins::PluginHostState::default()),
+        self_rc: RefCell::new(None),
     });
+    *host.self_rc.borrow_mut() = Some(Rc::downgrade(&host));
+    {
+        let p = host.plugins.borrow();
+        let d = window.global::<Workbench>();
+        d.set_plugins(p.rows_model.clone().into());
+        d.set_plugin_nav_items(p.nav_model.clone().into());
+        d.set_settings_tab_dirty(Rc::new(VecModel::from(vec![false, false, false, false])).into());
+    }
+    window.global::<Theme>().set_reduce_motion(test);
+    host.load_plugins(None);
     let initial_appearance = if test {
         host.test_settings
             .as_ref()
@@ -2724,6 +2807,27 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
     callback!(on_save_settings, |h| {
         h.save_settings();
     });
+    callback!(on_discard_settings, |h| {
+        h.discard_settings();
+    });
+    callback!(on_toggle_plugin, |h, id, next| {
+        h.toggle_plugin(id.as_str(), next);
+    });
+    callback!(on_install_plugin, |h| {
+        h.install_plugin_prompt();
+    });
+    callback!(on_open_plugins_folder, |h| {
+        h.open_plugins_folder();
+    });
+    callback!(on_reload_plugins, |h| {
+        h.load_plugins(None);
+    });
+    callback!(on_remove_plugin, |h, id| {
+        h.request_remove_plugin(id.as_str());
+    });
+    callback!(on_select_plugin_page, |h, id| {
+        h.select_plugin_page(id.as_str());
+    });
     callback!(on_confirm_save, |h| {
         h.save_before_switch();
     });
@@ -2746,10 +2850,7 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
         h.arm_notice();
     });
     callback!(on_settings_changed, |h| {
-        if let Some(w) = h.window.upgrade() {
-            w.global::<Workbench>()
-                .set_settings_dirty(h.settings_dirty());
-        }
+        h.sync_settings_dirty();
     });
     callback!(on_lighting_power, |h| {
         if !h.blocked() {
@@ -2828,6 +2929,12 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
                 d.set_profile_index(index);
             }
             h.pending_select.set(None);
+            if kind == 7 {
+                h.plugins.borrow_mut().pending_install_path = None;
+            }
+            if kind == 8 {
+                h.plugins.borrow_mut().pending_remove_id = None;
+            }
             return;
         }
         match kind {
@@ -2855,6 +2962,8 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
                 d.set_dirty(false);
                 let _ = slint::quit_event_loop();
             }
+            7 => h.confirm_replace_plugin(),
+            8 => h.confirm_remove_plugin(),
             _ => (),
         }
     });

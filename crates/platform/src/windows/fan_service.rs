@@ -243,7 +243,9 @@ impl Lifecycle {
             unsafe {
                 CloseHandle(mutex);
             }
-            return Err("A PerformanceHub fan controller is already running in this session".into());
+            return Err(
+                "A PerformanceHub fan controller is already running in this session".into(),
+            );
         }
         let mut owner = Self {
             mutex,

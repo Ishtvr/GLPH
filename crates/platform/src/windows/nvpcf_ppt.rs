@@ -126,24 +126,29 @@ pub fn required_mode(profile: &PerformanceProfile, ac: bool) -> Option<NvpcfUnlo
         .settings
         .iter()
         .any(|s| s.feature == Feature::GpuDynamicBoostLimitMw);
-    let has_cpu_power = profile
-        .effective()
-        .settings
-        .iter()
-        .any(|s| matches!(s.feature, Feature::CpuPptLimitMw | Feature::CpuSlowPptLimitMw));
+    let has_cpu_power = profile.effective().settings.iter().any(|s| {
+        matches!(
+            s.feature,
+            Feature::CpuPptLimitMw | Feature::CpuSlowPptLimitMw
+        )
+    });
     if ac && has_direct_gpu_tgp && !legacy_dynamic_boost {
         return Some(NvpcfUnlockMode::CpuOnly);
     }
     if has_cpu_power {
         if legacy_dynamic_boost {
-            let needs_bypass = profile.effective().settings.iter().any(|s| match s.feature {
-                Feature::CpuPptLimitMw => true,
-                Feature::CpuSlowPptLimitMw => match s.value {
-                    Value::Integer(mw) => mw % 1000 != 0 || !(45_000..=80_000).contains(&mw),
+            let needs_bypass = profile
+                .effective()
+                .settings
+                .iter()
+                .any(|s| match s.feature {
+                    Feature::CpuPptLimitMw => true,
+                    Feature::CpuSlowPptLimitMw => match s.value {
+                        Value::Integer(mw) => mw % 1000 != 0 || !(45_000..=80_000).contains(&mw),
+                        _ => false,
+                    },
                     _ => false,
-                },
-                _ => false,
-            });
+                });
             return needs_bypass.then_some(NvpcfUnlockMode::CpuOnly);
         }
         return Some(NvpcfUnlockMode::CpuOnly);

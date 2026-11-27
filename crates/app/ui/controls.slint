@@ -202,6 +202,89 @@ export component LineEdit inherits Rectangle {
     @children
 }
 
+export component ToggleSwitch inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    callback toggled(bool);
+    forward-focus: focus;
+    width: 48px;
+    height: Theme.control-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    border-width: focus.has-focus ? 1px : 0px;
+    border-color: Theme.accent;
+    accessible-role: checkbox;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => { root.flip(); }
+
+    function flip() {
+        if root.enabled {
+            let next = !root.checked;
+            root.checked = next;
+            root.toggled(next);
+        }
+    }
+
+    track := Rectangle {
+        x: 4px;
+        y: (parent.height - self.height) / 2;
+        width: 40px;
+        height: 22px;
+        border-radius: 11px;
+        border-width: 1px;
+        background: !root.enabled ? Theme.surface
+                  : root.checked ? Theme.accent
+                  : area.has-hover ? Theme.hover : Theme.control;
+        border-color: !root.enabled ? Theme.line
+                    : root.checked ? Theme.accent : Theme.muted;
+        animate background, border-color {
+            duration: Theme.reduce-motion ? 0ms : 150ms;
+            easing: ease;
+        }
+
+        thumb := Rectangle {
+            x: root.checked ? 21px : 3px;
+            y: 3px;
+            width: 16px;
+            height: 16px;
+            border-radius: 8px;
+            background: !root.enabled ? Theme.quiet
+                      : root.checked ? Theme.on-accent : Theme.ink;
+            animate x {
+                duration: Theme.reduce-motion ? 0ms : 160ms;
+                easing: cubic-bezier(0.23, 1, 0.32, 1);
+            }
+            animate background {
+                duration: Theme.reduce-motion ? 0ms : 150ms;
+                easing: ease;
+            }
+        }
+    }
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { focus.focus(); root.flip(); }
+    }
+
+    focus := FocusScope {
+        x: 0px;
+        width: 0px;
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if e.text == " " || e.text == Key.Return {
+                root.flip();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
 export component CheckBox inherits Rectangle {
     in property <string> text;
     in property <bool> enabled: true;

@@ -63,19 +63,25 @@ export component NavigationItem inherits Rectangle {
         y: 12px;
         width: 20px;
         height: 20px;
-        source: root.kind == 0 ? @image-url("icons/overview.svg") : root.kind == 1 ? @image-url("icons/fan.svg") : root.kind == 2 ? @image-url("icons/keyboard.svg") : @image-url("icons/settings.svg");
+        source: root.kind == 0 ? @image-url("icons/overview.svg")
+              : root.kind == 1 ? @image-url("icons/fan.svg")
+              : root.kind == 2 ? @image-url("icons/keyboard.svg")
+              : root.kind == 3 ? @image-url("icons/settings.svg")
+              : root.kind == 4 || root.kind == 5 ? @image-url("icons/sensors.svg")
+              : @image-url("icons/plug.svg");
         colorize: root.selected ? Theme.accent : Theme.muted;
         accessible-role: none;
     }
 
     Text {
         x: 42px;
-        width: parent.width - 48px;
+        width: max(0px, parent.width - 48px);
         height: parent.height;
         text: root.text;
         color: root.enabled ? Theme.ink : Theme.quiet;
         vertical-alignment: center;
         font-size: 13px;
+        overflow: elide;
         accessible-role: none;
     }
 

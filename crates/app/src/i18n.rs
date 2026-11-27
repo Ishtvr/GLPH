@@ -422,6 +422,7 @@ mod tests {
         for source in [
             include_str!("../ui/app.slint"),
             include_str!("../ui/primitives.slint"),
+            include_str!("../ui/settings-plugins.slint"),
         ] {
             for literal in source.split('"').skip(1).step_by(2) {
                 if [
@@ -432,6 +433,7 @@ mod tests {
                     "lighting.",
                     "section.",
                     "mux.",
+                    "plugins.",
                 ]
                 .iter()
                 .any(|prefix| literal.starts_with(prefix))

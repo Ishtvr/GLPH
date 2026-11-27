@@ -12,6 +12,11 @@ pub(super) struct Picker {
     hsv: Hsv,
     valid: bool,
 }
+impl Picker {
+    pub(super) fn is_lighting_target(&self) -> bool {
+        self.target == 3
+    }
+}
 fn color(rgb: [u8; 3]) -> slint::Color {
     slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2])
 }

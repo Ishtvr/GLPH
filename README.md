@@ -22,4 +22,4 @@ cargo build --release
 
 ## License & Disclaimer
 
-[MIT](LICENSE), with separately licensed [third-party components](THIRD_PARTY.md). **Use at your own risk.**
+[MIT](LICENSE) **Use at your own risk.**

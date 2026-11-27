@@ -1,4 +1,4 @@
-# PerformanceHub
+# GLPH
 
 A lightweight, native Windows hardware performance & tuning tool for gaming laptops (starting on HP OMEN and expanding to vendor-agnostic AMD/NVIDIA/Windows control across ASUS, MSI, and more), written in **Rust** and **Slint**.
 

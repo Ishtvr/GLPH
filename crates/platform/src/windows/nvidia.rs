@@ -194,6 +194,7 @@ struct Nvml {
     gpu: Handle,
     name: String,
     power: NvmlValue,
+    enforced_limit: Option<NvmlValue>,
     default_limit: NvmlValue,
     constraints: NvmlLimits,
 }
@@ -213,6 +214,10 @@ impl Nvml {
             let power = *library
                 .get(b"nvmlDeviceGetPowerUsage\0")
                 .map_err(|e| e.to_string())?;
+            let enforced_limit = library
+                .get::<NvmlValue>(b"nvmlDeviceGetEnforcedPowerLimit\0")
+                .ok()
+                .map(|f| *f);
             let default_limit = *library
                 .get(b"nvmlDeviceGetPowerManagementDefaultLimit\0")
                 .map_err(|e| e.to_string())?;
@@ -246,6 +251,7 @@ impl Nvml {
                 gpu,
                 name,
                 power,
+                enforced_limit,
                 default_limit,
                 constraints,
             })
@@ -276,6 +282,15 @@ impl Nvml {
                     if nvml_session_lost(status) {
                         return true;
                     }
+                }
+            }
+            if let Some(getter) = self.enforced_limit {
+                let mut value = 0;
+                let status = getter(self.gpu, &mut value);
+                if status == 0 && value > 0 {
+                    sample.enforced_limit_w = Some(f64::from(value) / 1000.0);
+                } else if nvml_session_lost(status) {
+                    return true;
                 }
             }
             let (mut minimum, mut maximum) = (0, 0);

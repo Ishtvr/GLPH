@@ -893,7 +893,7 @@ impl Backend for Controller {
                     feature,
                     access: Access::ReadWrite,
                     reason: if feature == Feature::CpuCcdAffinity {
-                        "Saved for the Omen Hub++ background service, which pins the foreground program to the selected CCDs and restores it at all CCDs"
+                        "Saved for the PerformanceHub background service, which pins the foreground program to the selected CCDs and restores it at all CCDs"
                     } else {
                         "Windows setting with exact readback and restore"
                     }

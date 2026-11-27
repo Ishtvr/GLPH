@@ -1,4 +1,4 @@
-//! Hardware-independent policy for Omen Hub++. No OS access or firmware writes.
+//! Hardware-independent policy for PerformanceHub. No OS access or firmware writes.
 pub mod app_settings;
 pub mod appearance;
 pub mod battery;
@@ -35,7 +35,7 @@ pub mod vf;
 
 use serde::{Deserialize, Serialize};
 
-pub const APP_NAME: &str = "Omen Hub++";
+pub const APP_NAME: &str = "PerformanceHub";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Inventory {
@@ -62,6 +62,8 @@ pub struct GpuSample {
     pub temperature_c: Option<i32>,
     pub clock_mhz: Option<u32>,
     pub power_w: Option<f64>,
+    #[serde(default)]
+    pub enforced_limit_w: Option<f64>,
     pub default_limit_w: Option<f64>,
     /// A driver-reported constraint, NOT a measured sustainable TGP.
     pub maximum_limit_w: Option<f64>,
@@ -150,6 +152,12 @@ pub struct Snapshot {
     /// Diagnostic identity of our approved reader, never a hardware control.
     pub cpu_reader_pid: Option<u32>,
     pub gpu: Option<GpuSample>,
+    /// Live chassis IR surface temperature (°C, e.g. HP sensor 0x23), if present.
+    #[serde(default)]
+    pub chassis_temp_c: Option<u8>,
+    /// Active chassis IR surface max-temperature guard (°C), if applicable.
+    #[serde(default)]
+    pub chassis_max_temp_c: Option<u8>,
     pub warnings: Vec<String>,
 }
 

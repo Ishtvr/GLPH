@@ -122,3 +122,16 @@ impl FanControl {
 pub fn read_hp_fans(inv: &Inventory) -> Result<FanReport, String> {
     FanControl::new(inv)?.report()
 }
+
+/// Lightweight live read of the HP chassis infrared surface sensor (`0x23`).
+/// Returns `None` on non-HP systems, unelevated runs, or unreadable sensors.
+pub fn read_hp_surface_temp_c(inv: &Inventory) -> Option<u8> {
+    if !inv.hp_bios_interface_present {
+        return None;
+    }
+    let bios = HpBios::new(inv).ok()?;
+    let (_, raw) = bios.get(Read::SurfaceSensor).ok()?;
+    FirmwareIrTemperature::decode(0, &raw)
+        .ok()
+        .map(|reading| reading.celsius)
+}

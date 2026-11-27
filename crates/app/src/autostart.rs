@@ -11,7 +11,7 @@ use windows_sys::Win32::{
 };
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const VALUE: &str = "Omen Hub++";
+const VALUE: &str = "PerformanceHub";
 
 /// Command line the logon task runs.
 pub fn command(executable: &Path, start_in_tray: bool) -> String {
@@ -119,14 +119,14 @@ mod tests {
     fn start_command_quotes_the_path_and_starts_in_tray() {
         assert_eq!(
             command(
-                Path::new(r"C:\Program Files\OmenHubPlusPlus\Omen Hub++.exe"),
+                Path::new(r"C:\Program Files\PerformanceHub\performance-hub.exe"),
                 true
             ),
-            r#""C:\Program Files\OmenHubPlusPlus\Omen Hub++.exe" --tray"#
+            r#""C:\Program Files\PerformanceHub\performance-hub.exe" --tray"#
         );
         assert_eq!(
-            command(Path::new(r"D:\Omen Hub++.exe"), false),
-            r#""D:\Omen Hub++.exe""#
+            command(Path::new(r"D:\performance-hub.exe"), false),
+            r#""D:\performance-hub.exe""#
         );
     }
 
@@ -134,13 +134,13 @@ mod tests {
     fn start_command_splits_back_into_program_and_arguments() {
         for tray in [true, false] {
             let line = command(
-                Path::new(r"D:\Omen Gaming Hub Rewrite\Omen Hub++.exe"),
+                Path::new(r"D:\PerformanceHub\performance-hub.exe"),
                 tray,
             );
             assert_eq!(
                 split(&line),
                 Some((
-                    r"D:\Omen Gaming Hub Rewrite\Omen Hub++.exe",
+                    r"D:\PerformanceHub\performance-hub.exe",
                     if tray { "--tray" } else { "" }
                 ))
             );

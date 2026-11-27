@@ -15,13 +15,13 @@ use windows_sys::Win32::{
 };
 
 /// Posted to a running dashboard: show yourself (it may be hidden in the tray).
-pub const ACTIVATE: &str = "OmenHubPP.Activate";
+pub const ACTIVATE: &str = "PerformanceHub.Activate";
 
 /// Held for the lifetime of the process; Windows releases it on exit.
 pub struct Instance(#[allow(dead_code)] HANDLE);
 
 fn mutex_name(kind: &str) -> String {
-    format!("Local\\OmenHubPP.SingleInstance.{kind}")
+    format!("Local\\PerformanceHub.SingleInstance.{kind}")
 }
 
 /// Claims the window kind for this process. `None`: another instance of the

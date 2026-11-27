@@ -22,7 +22,7 @@ use windows_sys::Win32::{
 };
 
 /// Window class and single-instance kind of the dashboard.
-pub const CLASS: &str = "OmenHubPlusPlusWindow";
+pub const CLASS: &str = "PerformanceHubWindow";
 pub const KIND: &str = "Dashboard";
 pub(crate) const UPDATE: u32 = WM_APP + 1;
 const TRAY: u32 = crate::tray::CALLBACK;
@@ -464,6 +464,7 @@ pub(crate) fn worker(
     let mut cpu = None;
     let mut hardware: Option<crate::cpu_sensor_bridge::CpuSensorBridge> = None;
     let mut reopen_at = Instant::now();
+    let mut last_chassis_poll: Option<Instant> = None;
     // Startup check of the battery switch (a crash or restart on battery).
     let mut evaluate_at = Some(Instant::now() + omen_core::battery::debounce(ac));
     // Failed automatic switches since the last power event.
@@ -569,6 +570,32 @@ pub(crate) fn worker(
         }
         snapshot.power = omen_platform::power_status();
         snapshot.cpu_reader_pid = hardware.as_ref().map(|r| r.process_id());
+        if visible && !suspended {
+            let poll_due = last_chassis_poll
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(8));
+            if poll_due {
+                last_chassis_poll = Some(Instant::now());
+                let chassis_c =
+                    omen_platform::read_hp_surface_temp_c(&snapshot.inventory).or_else(|| {
+                        omen_platform::profile_store::ProfileStore::user_data()
+                            .ok()
+                            .and_then(|store| store.fan_status().ok().flatten())
+                            .and_then(|v| v.get("ir_c").and_then(|n| n.as_u64()))
+                            .and_then(|n| u8::try_from(n).ok())
+                    });
+                snapshot.chassis_temp_c = chassis_c;
+                snapshot.chassis_max_temp_c = chassis_c.map(|_| {
+                    omen_platform::profile_store::ProfileStore::user_data()
+                        .ok()
+                        .and_then(|store| store.chassis_max_temp_c().ok().flatten())
+                        .unwrap_or(omen_core::fan::IR_EMERGENCY_C)
+                });
+            }
+        } else {
+            last_chassis_poll = None;
+            snapshot.chassis_temp_c = None;
+            snapshot.chassis_max_temp_c = None;
+        }
         publish(&snapshot);
         if snapshot.power.ac_connected != ac {
             ac = snapshot.power.ac_connected;

@@ -629,6 +629,7 @@ mod tests {
                 if let Some(literal) = after.strip_prefix('"').and_then(|s| s.split('"').next())
                     && !literal.is_empty()
                         && !literal.starts_with("OmenHubPP")
+                        && !literal.starts_with("PerformanceHub")
                         // The i glyph is the language-neutral information icon.
                         && !["PerformanceHub", "Omen Hub++", "OmenHubPlusPlusWindow", "Segoe UI", "runas", "TaskbarCreated", "i"].contains(&literal)
                 {

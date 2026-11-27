@@ -500,7 +500,7 @@ fn run() -> Result<(), String> {
             println!("{}", i18n::tf("cli.help", &[&env!("CARGO_PKG_VERSION")]));
             #[cfg(not(windows))]
             println!(
-                "Omen Hub++ {}: native UI and hardware controls require Windows x64.",
+                "PerformanceHub {}: native UI and hardware controls require Windows x64.",
                 env!("CARGO_PKG_VERSION")
             );
         }

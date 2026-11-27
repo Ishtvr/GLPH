@@ -56,10 +56,12 @@ export global Workbench {
     in property <string> gpu-power;
     in property <string> gpu-temp;
     in property <string> gpu-clock;
+    in property <string> gpu-tgp;
     in property <string> cpu-name;
     in property <string> cpu-power;
     in property <string> cpu-temp;
     in property <string> cpu-load;
+    in property <string> chassis-temp;
     in property <string> sensor-details;
     in property <string> cpu-source;
     in property <string> power-source;
@@ -970,6 +972,15 @@ export component AppWindow inherits Window {
                                             color: Theme.muted;
                                             font-family: "Consolas";
                                         }
+
+                                        Text {
+                                            visible: Workbench.gpu-tgp != "";
+                                            text: Workbench.gpu-tgp;
+                                            color: Theme.muted;
+                                            font-family: "Consolas";
+                                            font-size: 12px;
+                                            wrap: word-wrap;
+                                        }
                                     }
 
                                     Rectangle {
@@ -1005,6 +1016,15 @@ export component AppWindow inherits Window {
                                             text: Workbench.cpu-load;
                                             color: Theme.muted;
                                             font-family: "Consolas";
+                                            wrap: word-wrap;
+                                        }
+
+                                        Text {
+                                            visible: Workbench.chassis-temp != "";
+                                            text: Workbench.chassis-temp;
+                                            color: Theme.muted;
+                                            font-family: "Consolas";
+                                            font-size: 12px;
                                             wrap: word-wrap;
                                         }
                                     }

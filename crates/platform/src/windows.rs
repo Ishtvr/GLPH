@@ -28,7 +28,7 @@ mod windows_settings;
 pub use ccd::{WindowsProcesses, ccd_masks};
 pub use control_lease::ControlLease;
 pub use controller::{Controller, RestoreState};
-pub use cooling::{FanReport, MaxFanImage, read_hp_fans};
+pub use cooling::{FanReport, MaxFanImage, read_hp_fans, read_hp_surface_temp_c};
 pub use cpu::Cpu;
 pub use cpu_hardware::{CPU_DRIVER_SHA256, CPU_MODULE_SHA256, CpuHardwareReader};
 pub use cpu_tuning::{CpuReadbackTrace, SmuImage};

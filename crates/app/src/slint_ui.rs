@@ -48,7 +48,7 @@ slint::include_modules!();
 
 const AUX_DONE: u32 = WM_APP + 92;
 fn navigate_message() -> u32 {
-    unsafe { RegisterWindowMessageW(crate::native_ui::wide("OmenHubPP.Navigate").as_ptr()) }
+    unsafe { RegisterWindowMessageW(crate::native_ui::wide("PerformanceHub.Navigate").as_ptr()) }
 }
 const MODES: [(&str, HpMode); 4] = [
     ("mode.quiet", HpMode::Quiet),
@@ -1497,10 +1497,29 @@ impl Host {
             )
             .into(),
         );
+        let gpu_tgp = match s.gpu.as_ref() {
+            Some(g) => match (g.enforced_limit_w, g.maximum_limit_w.or(g.default_limit_w)) {
+                (Some(enforced), Some(max_w)) => tf(
+                    "ui.gpu_tgp_line",
+                    &[&format!("{enforced:.0}"), &format!("{max_w:.0}")],
+                ),
+                (Some(enforced), None) => tf("ui.gpu_tgp_enforced", &[&format!("{enforced:.0}")]),
+                (None, Some(max_w)) => tf("ui.gpu_tgp_enforced", &[&format!("{max_w:.0}")]),
+                (None, None) => String::new(),
+            },
+            None => String::new(),
+        };
+        d.set_gpu_tgp(gpu_tgp.into());
         d.set_cpu_name(s.inventory.cpus.join(" · ").into());
         d.set_cpu_power(number(s.cpu.as_ref().and_then(|c| c.package_power_w), "W").into());
         d.set_cpu_temp(number(s.cpu.as_ref().and_then(|c| c.temperature_c), "°C").into());
         d.set_cpu_load(crate::dashboard::cpu_load_line(s).into());
+        let chassis_temp = match (s.chassis_temp_c, s.chassis_max_temp_c) {
+            (Some(ir_c), Some(limit_c)) => tf("ui.chassis_ir_line", &[&ir_c, &limit_c]),
+            (Some(ir_c), None) => tf("ui.chassis_ir_only", &[&ir_c]),
+            _ => String::new(),
+        };
+        d.set_chassis_temp(chassis_temp.into());
         d.set_cpu_source(crate::dashboard::cpu_detail(s).into());
         d.set_sensor_details(
             s.warnings
@@ -2121,6 +2140,24 @@ pub fn run(
                     gpus: vec![format!("GPU · {}", t("ui.test_data"))],
                     ..Default::default()
                 },
+                gpu: Some(omen_core::GpuSample {
+                    name: format!("GPU · {}", t("ui.test_data")),
+                    temperature_c: Some(64),
+                    clock_mhz: Some(2490),
+                    power_w: Some(92.4),
+                    enforced_limit_w: Some(135.0),
+                    default_limit_w: Some(135.0),
+                    maximum_limit_w: Some(135.0),
+                    warnings: vec![],
+                }),
+                cpu: Some(omen_core::CpuSample {
+                    busy_percent: Some(38.5),
+                    package_power_w: Some(45.0),
+                    temperature_c: Some(68.5),
+                    ..Default::default()
+                }),
+                chassis_temp_c: Some(37),
+                chassis_max_temp_c: Some(50),
                 ..Default::default()
             });
             let _ = ptx.send(preset_ui::Update::List(Ok((profiles, None, false))));

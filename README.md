@@ -6,7 +6,7 @@ A lightweight, native Windows hardware performance & tuning tool for gaming lapt
 
 ## Goals & Architecture
 
-- **Decoupled Power Control:** Independent **GPU**, **CPU**, and **Windows** sections on the Overview page — no cross-domain locks or hidden coupling between GPU power limits and CPU PPT/Slow/TDC/EDC/Curve Optimizer settings.
+- **Decoupled Power Control:** Independent **GPU**, **CPU**, **Thermals / Temperature**, and **Windows** sections on the Overview page — no cross-domain locks or hidden coupling between GPU power limits and CPU PPT/Slow/TDC/EDC/Curve Optimizer settings.
 - **Direct Hardware Paths:** Prioritizes vendor-agnostic interfaces (**PawnIO / AMD SMU**, **NVIDIA NVML / `nvlddmkm`**, and **Windows Power/Display APIs**) over proprietary OEM WMI modes wherever verified safe.
 - **Optional Vendor Modules:** OEM-specific features (such as HP fan curves, Max-Fan, and 4-zone RGB) remain cleanly isolated so PerformanceHub can run on other laptop vendors without blocking core GPU/CPU/Windows controls.
 - **Safety & Transparency:** Zero telemetry, Defender-safe, Secure-Boot-compatible, explicit readback and rollback journals.

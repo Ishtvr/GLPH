@@ -1,10 +1,28 @@
 /target/
 /dist/
-# Local research, proprietary inputs and installed design skills stay off Git.
+# Local research, proprietary inputs, agent instructions and internal notes stay off Git.
 /.tools/
 /.local/
 /.agents/
 /.impeccable/
+/.claude/
+/.codex/
+/.cursor/
+/.vscode/
+/.idea/
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
+/DESIGN.md
+/PRODUCT.md
+/THIRD_PARTY.md
+/docs/plans/
+/docs/history/
+/docs/releases/
+/docs/PROJECT_REVIEW.md
+/docs/REPLACEMENT_PLAN.md
+/docs/ROADMAP.md
+/docs/UNLOCKED_STATUS.md
 
 # Compiled artifacts, installers and diagnostic dumps are release/local files.
 *.exe
@@ -36,4 +54,3 @@ Desktop.ini
 .env
 .env.*
 !.env.example
-!docs/**/*.md

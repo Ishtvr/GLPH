@@ -1,0 +1,447 @@
+//! Automatic preset change when the charger is unplugged or plugged in again.
+//! Pure policy: the dashboard applies the chosen selection through the same
+//! elevated commands as a manual apply.
+use crate::hp_mode::HpMode;
+
+/// A built-in HP mode or a saved custom preset, as chosen on the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    Mode(HpMode),
+    Preset(String),
+}
+impl Selection {
+    /// Stable stored form: `mode:<name>` or `preset:<id>`.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Mode(mode) => format!("mode:{}", mode.name()),
+            Self::Preset(id) => format!("preset:{id}"),
+        }
+    }
+    /// Unknown or malformed values read as no selection.
+    pub fn parse(stored: &str) -> Option<Self> {
+        if let Some(mode) = stored.strip_prefix("mode:") {
+            HpMode::parse(mode).ok().map(Self::Mode)
+        } else {
+            stored
+                .strip_prefix("preset:")
+                .filter(|id| crate::profiles::validate_id(id).is_ok())
+                .map(|id| Self::Preset(id.to_owned()))
+        }
+    }
+}
+
+/// Stored battery behaviour of a preset that turns the automatic change off.
+pub const OFF: &str = "off";
+
+/// The selection applied on battery while `ac` is the selection in use on AC.
+/// A preset's own battery behaviour (`links`: preset id to a selection key or
+/// [`OFF`]) wins; a preset without one, and every mode, uses `fallback` (the
+/// older global setting). Unknown or malformed stored values read as off.
+pub fn selection_for(
+    ac: Option<&Selection>,
+    links: &std::collections::BTreeMap<String, String>,
+    fallback: Option<&Selection>,
+) -> Option<Selection> {
+    if let Some(Selection::Preset(id)) = ac
+        && let Some(stored) = links.get(id)
+    {
+        return Selection::parse(stored);
+    }
+    fallback.cloned()
+}
+
+/// Persisted state of the automatic battery switch (`power-switch.json`).
+/// It survives restarts and crashes, so a later plug-in still returns to the
+/// AC state saved before unplugging.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct State {
+    /// Last selection applied on AC: the one to return to.
+    pub ac_selection: Option<Selection>,
+    /// The battery selection was applied automatically in this DC session.
+    pub switched: bool,
+    /// The user chose another selection by hand on battery; no automatic
+    /// battery switch until the charger is connected again.
+    pub manual_override: bool,
+    /// Boot in which this state was written (wall-clock boot time). A
+    /// restart returns volatile firmware values to stock, so a battery
+    /// session of an earlier boot is over. `None` in files of older builds.
+    pub boot_unix_s: Option<u64>,
+}
+
+/// Two readings of the same boot differ by clock adjustments only.
+const BOOT_TOLERANCE_S: u64 = 120;
+
+/// What to apply for the current power source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Switch {
+    /// On battery: apply the battery selection.
+    ToBattery(Selection),
+    /// Charger back: undo the automatic battery preset (`restore` names the
+    /// preset whose journal is restored first), then the saved AC selection.
+    BackToAc {
+        selection: Selection,
+        restore: Option<String>,
+    },
+}
+
+/// Level-based and idempotent: called at startup, after every debounced
+/// power-source event and after every resume (Windows may not report a plug
+/// change made during sleep). `ac` is the current source; `None` means
+/// Windows could not tell, which never switches.
+pub fn decide(ac: Option<bool>, battery: Option<&Selection>, state: &State) -> Option<Switch> {
+    match ac? {
+        false => {
+            let battery = battery?;
+            if state.switched || state.manual_override {
+                return None;
+            }
+            // The battery choice is already the active AC choice.
+            (state.ac_selection.as_ref() != Some(battery))
+                .then(|| Switch::ToBattery(battery.clone()))
+        }
+        true if state.switched || state.manual_override => Some(Switch::BackToAc {
+            // Balanced is the BIOS default mode and the Hub's own restore.
+            selection: state
+                .ac_selection
+                .clone()
+                .unwrap_or(Selection::Mode(HpMode::Balanced)),
+            restore: match battery {
+                Some(Selection::Preset(id)) if state.switched => Some(id.clone()),
+                _ => None,
+            },
+        }),
+        true => None,
+    }
+}
+
+impl State {
+    /// The state as it holds in the boot that started at `boot_unix_s`: an
+    /// automatic battery session or manual override of an earlier boot ended
+    /// with that boot, so the next check applies the battery selection again
+    /// (or nothing on AC, where sign-in applies its own preset).
+    pub fn at_boot(mut self, boot_unix_s: u64) -> Self {
+        if self
+            .boot_unix_s
+            .is_some_and(|saved| saved.abs_diff(boot_unix_s) > BOOT_TOLERANCE_S)
+        {
+            self.switched = false;
+            self.manual_override = false;
+        }
+        self.boot_unix_s = Some(boot_unix_s);
+        self
+    }
+    /// After an automatic switch completed.
+    pub fn switched_to(&mut self, battery: bool) {
+        self.switched = battery;
+        self.manual_override = false;
+    }
+    /// After a manual Apply of `selection`; `ac` is the current source.
+    pub fn manual(&mut self, selection: &Selection, ac: Option<bool>) {
+        if ac == Some(false) {
+            // Only an active battery session can be overridden; a selection
+            // made on battery is never saved as the AC state.
+            self.manual_override = self.switched || self.manual_override;
+        } else {
+            self.ac_selection = Some(selection.clone());
+            self.manual_override = false;
+        }
+        self.switched = false;
+    }
+}
+
+/// Quiet time after the last power event before the source is read again and
+/// acted on: lid, adapter and display events arrive in bursts. The values
+/// follow the OMEN Hub (1 s after a source change; 2 s on AC, where it lets
+/// the adapter and firmware settle before it writes its power limits).
+pub fn debounce(ac: Option<bool>) -> std::time::Duration {
+    std::time::Duration::from_millis(if ac == Some(false) { 1000 } else { 2000 })
+}
+
+/// Battery level lost on AC before the user is told. Firmware lets a full
+/// battery float a few points below 100 % before it recharges.
+pub const DRAIN_NOTICE_POINTS: u8 = 5;
+
+/// Notices a battery that discharges although the charger is connected: the
+/// applied limits draw more than the adapter delivers (measured 22 November
+/// 2026: 65.0 to 36.2 Wh in under five hours of gaming on AC). It only
+/// reports; it never changes a limit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DrainWatch {
+    /// Highest level seen in this AC session.
+    peak: Option<u8>,
+    reported: bool,
+}
+impl DrainWatch {
+    /// One reading of the power source and battery level. Returns the points
+    /// lost since the peak, once per AC session; a recovered battery arms it
+    /// again.
+    pub fn observe(&mut self, ac: Option<bool>, percent: Option<u8>) -> Option<u8> {
+        let (Some(true), Some(percent)) = (ac, percent) else {
+            // On battery or unknown: the next AC session starts fresh.
+            *self = Self::default();
+            return None;
+        };
+        let peak = self.peak.map_or(percent, |peak| peak.max(percent));
+        self.peak = Some(peak);
+        let lost = peak - percent;
+        if lost == 0 {
+            self.reported = false;
+        }
+        if lost >= DRAIN_NOTICE_POINTS && !self.reported {
+            self.reported = true;
+            return Some(lost);
+        }
+        None
+    }
+}
+
+/// Waits before a failed automatic switch is tried again; after the last one
+/// the switch rests until the next power event.
+pub const RETRY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(60),
+];
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quiet() -> Selection {
+        Selection::Mode(HpMode::Quiet)
+    }
+    fn gaming() -> Selection {
+        Selection::Preset("preset-gaming".into())
+    }
+
+    #[test]
+    fn stored_keys_round_trip_and_reject_unknown_values() {
+        for selection in [
+            Selection::Mode(HpMode::Quiet),
+            Selection::Mode(HpMode::Unleashed),
+            Selection::Preset("preset-abc123".into()),
+        ] {
+            assert_eq!(Selection::parse(&selection.key()), Some(selection));
+        }
+        for bad in ["", "mode:turbo", "preset:", "preset:../x", "quiet"] {
+            assert_eq!(Selection::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_presets_own_battery_behaviour_wins_over_the_global_setting() {
+        let links = std::collections::BTreeMap::from([
+            (
+                "preset-gaming".to_owned(),
+                "preset:preset-battery".to_owned(),
+            ),
+            ("preset-office".to_owned(), OFF.to_owned()),
+            ("preset-broken".to_owned(), "mode:turbo".to_owned()),
+        ]);
+        let fallback = quiet();
+        assert_eq!(
+            selection_for(Some(&gaming()), &links, Some(&fallback)),
+            Some(Selection::Preset("preset-battery".into()))
+        );
+        // Explicitly off, and a malformed value, never fall back.
+        for id in ["preset-office", "preset-broken"] {
+            assert_eq!(
+                selection_for(Some(&Selection::Preset(id.into())), &links, Some(&fallback)),
+                None
+            );
+        }
+        // A preset without its own choice, a mode and an unknown AC state use
+        // the global setting.
+        for ac in [
+            Some(Selection::Preset("preset-other".into())),
+            Some(Selection::Mode(HpMode::Balanced)),
+            None,
+        ] {
+            assert_eq!(
+                selection_for(ac.as_ref(), &links, Some(&fallback)),
+                Some(quiet())
+            );
+        }
+        assert_eq!(
+            selection_for(Some(&gaming()), &Default::default(), None),
+            None
+        );
+    }
+
+    #[test]
+    fn unplugging_applies_the_battery_choice_and_plugging_in_returns() {
+        let battery = Selection::Preset("preset-battery".into());
+        let mut state = State {
+            ac_selection: Some(gaming()),
+            ..State::default()
+        };
+        assert_eq!(
+            decide(Some(false), Some(&battery), &state),
+            Some(Switch::ToBattery(battery.clone()))
+        );
+        state.switched_to(true);
+        // Idempotent: a repeated event or resume on battery does nothing.
+        assert_eq!(decide(Some(false), Some(&battery), &state), None);
+        assert_eq!(
+            decide(Some(true), Some(&battery), &state),
+            Some(Switch::BackToAc {
+                selection: gaming(),
+                restore: Some("preset-battery".into())
+            })
+        );
+        state.switched_to(false);
+        assert_eq!(decide(Some(true), Some(&battery), &state), None);
+        // Without a known AC choice the BIOS default mode returns; a mode
+        // has no journal to restore.
+        let state = State {
+            switched: true,
+            ..State::default()
+        };
+        assert_eq!(
+            decide(Some(true), Some(&quiet()), &state),
+            Some(Switch::BackToAc {
+                selection: Selection::Mode(HpMode::Balanced),
+                restore: None
+            })
+        );
+    }
+
+    #[test]
+    fn startup_and_wake_sync_act_on_the_current_level_only() {
+        // Started (or woken) on battery after a crash: the saved state decides.
+        let state = State {
+            ac_selection: Some(gaming()),
+            ..State::default()
+        };
+        assert_eq!(
+            decide(Some(false), Some(&quiet()), &state),
+            Some(Switch::ToBattery(quiet()))
+        );
+        // Plugged in during sleep: the next check returns to AC.
+        let state = State {
+            ac_selection: Some(gaming()),
+            switched: true,
+            ..State::default()
+        };
+        assert!(matches!(
+            decide(Some(true), Some(&quiet()), &state),
+            Some(Switch::BackToAc { .. })
+        ));
+        // An unknown source never switches.
+        assert_eq!(decide(None, Some(&quiet()), &state), None);
+    }
+
+    #[test]
+    fn a_manual_choice_on_battery_blocks_the_switch_until_the_charger_returns() {
+        let mut state = State {
+            ac_selection: Some(gaming()),
+            ..State::default()
+        };
+        state.switched_to(true);
+        let other = Selection::Preset("preset-office".into());
+        state.manual(&other, Some(false));
+        assert!(state.manual_override && !state.switched);
+        assert_eq!(
+            state.ac_selection,
+            Some(gaming()),
+            "battery choice is not the AC state"
+        );
+        assert_eq!(decide(Some(false), Some(&quiet()), &state), None);
+        // Charger back: the saved AC state returns; the manual preset left no
+        // automatic journal to restore.
+        assert_eq!(
+            decide(Some(true), Some(&quiet()), &state),
+            Some(Switch::BackToAc {
+                selection: gaming(),
+                restore: None
+            })
+        );
+        state.switched_to(false);
+        assert!(!state.manual_override);
+        // A manual choice on AC becomes the new AC state.
+        state.manual(&other, Some(true));
+        assert_eq!(state.ac_selection, Some(other));
+    }
+
+    #[test]
+    fn a_restart_ends_the_battery_session_of_the_earlier_boot() {
+        let battery = quiet();
+        let saved = State {
+            ac_selection: Some(gaming()),
+            switched: true,
+            manual_override: true,
+            boot_unix_s: Some(1_000_000),
+        };
+        // Same boot (clock adjusted by a few seconds): nothing changes.
+        let same = saved.clone().at_boot(1_000_030);
+        assert!(same.switched && same.manual_override);
+        assert_eq!(decide(Some(false), Some(&battery), &same), None);
+        // Restarted on battery: firmware is back at stock, apply again.
+        let later = saved.clone().at_boot(1_003_600);
+        assert!(!later.switched && !later.manual_override);
+        assert_eq!(later.ac_selection, Some(gaming()));
+        assert_eq!(later.boot_unix_s, Some(1_003_600));
+        assert_eq!(
+            decide(Some(false), Some(&battery), &later),
+            Some(Switch::ToBattery(battery.clone()))
+        );
+        // Restarted on AC: sign-in applies its own preset, nothing to return.
+        assert_eq!(decide(Some(true), Some(&battery), &later), None);
+        // A file of an older build has no boot time and keeps its state.
+        let legacy = State {
+            boot_unix_s: None,
+            ..saved
+        }
+        .at_boot(1_003_600);
+        assert!(legacy.switched);
+        assert_eq!(legacy.boot_unix_s, Some(1_003_600));
+    }
+
+    #[test]
+    fn a_battery_that_drains_on_ac_is_reported_once_per_session() {
+        let mut watch = DrainWatch::default();
+        // Float below full is normal.
+        for level in [100, 99, 97, 96] {
+            assert_eq!(watch.observe(Some(true), Some(level)), None);
+        }
+        assert_eq!(watch.observe(Some(true), Some(95)), Some(5));
+        // Not repeated while it keeps falling.
+        for level in [94, 80, 56] {
+            assert_eq!(watch.observe(Some(true), Some(level)), None);
+        }
+        // Recovered to the peak: armed again.
+        assert_eq!(watch.observe(Some(true), Some(100)), None);
+        assert_eq!(watch.observe(Some(true), Some(90)), Some(10));
+        // A battery session resets the peak; charging up from low is no drain.
+        assert_eq!(watch.observe(Some(false), Some(60)), None);
+        for level in [40, 45, 60, 58] {
+            assert_eq!(watch.observe(Some(true), Some(level)), None);
+        }
+        assert_eq!(watch.observe(Some(true), Some(55)), Some(5));
+        // Unknown readings never report.
+        assert_eq!(watch.observe(Some(true), None), None);
+        assert_eq!(watch.observe(None, Some(10)), None);
+    }
+
+    #[test]
+    fn waits_follow_the_power_source() {
+        assert!(debounce(Some(false)) < debounce(Some(true)));
+        assert_eq!(debounce(None), debounce(Some(true)));
+        assert!(RETRY_DELAYS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn nothing_changes_without_a_choice_or_when_it_is_already_active() {
+        let state = State::default();
+        assert_eq!(decide(Some(false), None, &state), None);
+        assert_eq!(decide(Some(true), Some(&quiet()), &state), None);
+        let state = State {
+            ac_selection: Some(quiet()),
+            ..State::default()
+        };
+        assert_eq!(decide(Some(false), Some(&quiet()), &state), None);
+        // A manual choice on battery without an automatic session is no override.
+        let mut state = State::default();
+        state.manual(&gaming(), Some(false));
+        assert!(!state.manual_override);
+    }
+}

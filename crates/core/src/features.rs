@@ -1,0 +1,348 @@
+//! Semantic feature catalog. No hardware commands, addresses or executable strings.
+use serde::{Deserialize, Serialize};
+
+mod retired;
+pub use retired::RetiredFeature;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Feature {
+    GpuCoreOffsetMhz,
+    GpuMemoryOffsetMhz,
+    GpuCoreClockLimitMhz,
+    GpuMemoryClockLimitMhz,
+    GpuVoltageOffsetMv,
+    GpuMemoryVoltageOffsetMv,
+    GpuVoltageLimitMv,
+    GpuPowerLimitMw,
+    GpuTemperatureLimitC,
+    GpuFrameRateLimit,
+    GpuUnleashed,
+    GpuDynamicBoost,
+    GpuCustomTgp,
+    GpuVfCurve,
+    GraphicsMode,
+    CpuTemperatureLimitC,
+    CpuSkinTemperatureLimitC,
+    CpuStapmLimitMw,
+    CpuFastPptLimitMw,
+    CpuSlowPptLimitMw,
+    CpuPptLimitMw,
+    CpuStapmTimeSeconds,
+    CpuSlowPptTimeSeconds,
+    CpuTdcMa,
+    CpuEdcMa,
+    SocTdcMa,
+    SocEdcMa,
+    GfxTdcMa,
+    GfxEdcMa,
+    CpuCurveOptimizerAllCore,
+    GfxCurveOptimizer,
+    CpuCurveOptimizerPerCore,
+    CpuPboScalar,
+    CpuAllCoreVoltageOffsetMv,
+    AmdCpuVoltageMv,
+    AmdCpuClockMhz,
+    AmdIgpuClockMhz,
+    IgpuSoftMinMhz,
+    IgpuSoftMaxMhz,
+    CpuSoftMinMhz,
+    CpuSoftMaxMhz,
+    DataSoftMinMhz,
+    DataSoftMaxMhz,
+    FabricSoftMinMhz,
+    FabricSoftMaxMhz,
+    VcnSoftMinMhz,
+    VcnSoftMaxMhz,
+    SocSoftMinMhz,
+    SocSoftMaxMhz,
+    WindowsBoostMode,
+    WindowsEnergyMode,
+    WindowsPowerPlan,
+    WindowsMinimumProcessorPercent,
+    WindowsMaximumProcessorPercent,
+    WindowsProcessorEppPercent,
+    WindowsCoreParkingMinPercent,
+    WindowsCoreParkingMaxPercent,
+    CpuBoostProfile,
+    DisplayRefreshRateHz,
+    CpuCcdAffinity,
+    RadeonAntiLag,
+    RadeonRsr,
+    RadeonBoost,
+    RadeonImageSharpening,
+    RadeonEnhancedSync,
+    RadeonRsrSharpness,
+    RadeonBoostResolutionPercent,
+    RadeonImageSharpness,
+    UpscalingEnabled,
+    UpscalingVsync,
+    UpscalingAutoCapture,
+    UpscalingSharpness,
+    UpscalingResolutionIndex,
+    OmenPerformanceMode,
+    OmenThermalMode,
+    MaxFan,
+    CpuFanCurve,
+    GpuFanCurve,
+    KeyboardColors,
+    KeyboardBrightness,
+    KeyboardEffect,
+    /// HP shared CPU+GPU budget (TPP, `0x29` byte 3) in mW of whole watts.
+    /// Write-only on this firmware: no readback exists.
+    HpSharedPowerMw,
+    /// Whole-watt GPU Dynamic Boost / Max TGP target stored in mW.
+    /// Applied via reversible flashless VBIOS Policy[2] override and verified via NVML.
+    GpuDynamicBoostLimitMw,
+    /// Serialized legacy input only; never a current feature.
+    #[serde(untagged)]
+    Retired(RetiredFeature),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Category {
+    Gpu,
+    Graphics,
+    Cpu,
+    Windows,
+    Radeon,
+    Upscaling,
+    Omen,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueKind {
+    Integer,
+    Boolean,
+    Choice,
+    VfCurve,
+    PerCore,
+    CoreRatios,
+    FanCurve,
+    Colors,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unit {
+    None,
+    Mhz,
+    Millivolt,
+    Milliwatt,
+    Celsius,
+    FramesPerSecond,
+    Seconds,
+    Milliampere,
+    CurveStep,
+    Hz,
+    Percent,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Descriptor {
+    pub feature: Feature,
+    pub category: Category,
+    pub value_kind: ValueKind,
+    pub unit: Unit,
+}
+
+impl Feature {
+    pub fn descriptor(self) -> Descriptor {
+        let (category, value_kind, unit) = match self {
+            Self::Retired(feature) => (Category::Cpu, feature.kind(), feature.unit()),
+            Self::GpuCoreOffsetMhz => (Category::Gpu, ValueKind::Integer, Unit::Mhz),
+            Self::GpuMemoryOffsetMhz => (Category::Gpu, ValueKind::Integer, Unit::Mhz),
+            Self::GpuCoreClockLimitMhz => (Category::Gpu, ValueKind::Integer, Unit::Mhz),
+            Self::GpuMemoryClockLimitMhz => (Category::Gpu, ValueKind::Integer, Unit::Mhz),
+            Self::GpuVoltageOffsetMv => (Category::Gpu, ValueKind::Integer, Unit::Millivolt),
+            Self::GpuMemoryVoltageOffsetMv => (Category::Gpu, ValueKind::Integer, Unit::Millivolt),
+            Self::GpuVoltageLimitMv => (Category::Gpu, ValueKind::Integer, Unit::Millivolt),
+            Self::GpuPowerLimitMw => (Category::Gpu, ValueKind::Integer, Unit::Milliwatt),
+            Self::GpuTemperatureLimitC => (Category::Gpu, ValueKind::Integer, Unit::Celsius),
+            Self::GpuFrameRateLimit => (Category::Gpu, ValueKind::Integer, Unit::FramesPerSecond),
+            Self::GpuUnleashed => (Category::Gpu, ValueKind::Boolean, Unit::None),
+            Self::GpuDynamicBoost => (Category::Gpu, ValueKind::Boolean, Unit::None),
+            Self::GpuCustomTgp => (Category::Gpu, ValueKind::Boolean, Unit::None),
+            Self::GpuVfCurve => (Category::Gpu, ValueKind::VfCurve, Unit::None),
+            Self::GraphicsMode => (Category::Graphics, ValueKind::Choice, Unit::None),
+            Self::CpuTemperatureLimitC => (Category::Cpu, ValueKind::Integer, Unit::Celsius),
+            Self::CpuSkinTemperatureLimitC => (Category::Cpu, ValueKind::Integer, Unit::Celsius),
+            Self::CpuStapmLimitMw => (Category::Cpu, ValueKind::Integer, Unit::Milliwatt),
+            Self::CpuFastPptLimitMw => (Category::Cpu, ValueKind::Integer, Unit::Milliwatt),
+            Self::CpuSlowPptLimitMw => (Category::Cpu, ValueKind::Integer, Unit::Milliwatt),
+            Self::CpuPptLimitMw => (Category::Cpu, ValueKind::Integer, Unit::Milliwatt),
+            Self::CpuStapmTimeSeconds => (Category::Cpu, ValueKind::Integer, Unit::Seconds),
+            Self::CpuSlowPptTimeSeconds => (Category::Cpu, ValueKind::Integer, Unit::Seconds),
+            Self::CpuTdcMa => (Category::Cpu, ValueKind::Integer, Unit::Milliampere),
+            Self::CpuEdcMa => (Category::Cpu, ValueKind::Integer, Unit::Milliampere),
+            Self::SocTdcMa => (Category::Cpu, ValueKind::Integer, Unit::Milliampere),
+            Self::SocEdcMa => (Category::Cpu, ValueKind::Integer, Unit::Milliampere),
+            Self::GfxTdcMa => (Category::Cpu, ValueKind::Integer, Unit::Milliampere),
+            Self::GfxEdcMa => (Category::Cpu, ValueKind::Integer, Unit::Milliampere),
+            Self::CpuCurveOptimizerAllCore => (Category::Cpu, ValueKind::Integer, Unit::CurveStep),
+            Self::GfxCurveOptimizer => (Category::Cpu, ValueKind::Integer, Unit::CurveStep),
+            Self::CpuCurveOptimizerPerCore => (Category::Cpu, ValueKind::PerCore, Unit::CurveStep),
+            Self::CpuPboScalar => (Category::Cpu, ValueKind::Integer, Unit::None),
+            Self::CpuAllCoreVoltageOffsetMv => (Category::Cpu, ValueKind::Integer, Unit::Millivolt),
+            Self::AmdCpuVoltageMv => (Category::Cpu, ValueKind::Integer, Unit::Millivolt),
+            Self::AmdCpuClockMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::AmdIgpuClockMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::IgpuSoftMinMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::IgpuSoftMaxMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::CpuSoftMinMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::CpuSoftMaxMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::DataSoftMinMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::DataSoftMaxMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::FabricSoftMinMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::FabricSoftMaxMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::VcnSoftMinMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::VcnSoftMaxMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::SocSoftMinMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::SocSoftMaxMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
+            Self::WindowsBoostMode => (Category::Windows, ValueKind::Choice, Unit::None),
+            Self::WindowsEnergyMode => (Category::Windows, ValueKind::Choice, Unit::None),
+            Self::WindowsPowerPlan => (Category::Windows, ValueKind::Choice, Unit::None),
+            Self::WindowsMinimumProcessorPercent
+            | Self::WindowsMaximumProcessorPercent
+            | Self::WindowsProcessorEppPercent
+            | Self::WindowsCoreParkingMinPercent
+            | Self::WindowsCoreParkingMaxPercent => {
+                (Category::Windows, ValueKind::Integer, Unit::Percent)
+            }
+            Self::CpuBoostProfile => (Category::Cpu, ValueKind::Choice, Unit::None),
+            Self::DisplayRefreshRateHz => (Category::Windows, ValueKind::Integer, Unit::Hz),
+            Self::CpuCcdAffinity => (Category::Windows, ValueKind::Integer, Unit::None),
+            Self::RadeonAntiLag => (Category::Radeon, ValueKind::Boolean, Unit::None),
+            Self::RadeonRsr => (Category::Radeon, ValueKind::Boolean, Unit::None),
+            Self::RadeonBoost => (Category::Radeon, ValueKind::Boolean, Unit::None),
+            Self::RadeonImageSharpening => (Category::Radeon, ValueKind::Boolean, Unit::None),
+            Self::RadeonEnhancedSync => (Category::Radeon, ValueKind::Boolean, Unit::None),
+            Self::RadeonRsrSharpness => (Category::Radeon, ValueKind::Integer, Unit::Percent),
+            Self::RadeonBoostResolutionPercent => {
+                (Category::Radeon, ValueKind::Integer, Unit::Percent)
+            }
+            Self::RadeonImageSharpness => (Category::Radeon, ValueKind::Integer, Unit::Percent),
+            Self::UpscalingEnabled => (Category::Upscaling, ValueKind::Boolean, Unit::None),
+            Self::UpscalingVsync => (Category::Upscaling, ValueKind::Boolean, Unit::None),
+            Self::UpscalingAutoCapture => (Category::Upscaling, ValueKind::Boolean, Unit::None),
+            Self::UpscalingSharpness => (Category::Upscaling, ValueKind::Integer, Unit::Percent),
+            Self::UpscalingResolutionIndex => (Category::Upscaling, ValueKind::Integer, Unit::None),
+            Self::OmenPerformanceMode => (Category::Omen, ValueKind::Choice, Unit::None),
+            Self::OmenThermalMode => (Category::Omen, ValueKind::Choice, Unit::None),
+            Self::MaxFan => (Category::Omen, ValueKind::Boolean, Unit::None),
+            Self::CpuFanCurve => (Category::Omen, ValueKind::FanCurve, Unit::None),
+            Self::GpuFanCurve => (Category::Omen, ValueKind::FanCurve, Unit::None),
+            Self::KeyboardColors => (Category::Omen, ValueKind::Colors, Unit::None),
+            Self::KeyboardBrightness => (Category::Omen, ValueKind::Integer, Unit::Percent),
+            Self::KeyboardEffect => (Category::Omen, ValueKind::Choice, Unit::None),
+            Self::HpSharedPowerMw => (Category::Omen, ValueKind::Integer, Unit::Milliwatt),
+            Self::GpuDynamicBoostLimitMw => (Category::Gpu, ValueKind::Integer, Unit::Milliwatt),
+        };
+        Descriptor {
+            feature: self,
+            category,
+            value_kind,
+            unit,
+        }
+    }
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::GpuCoreOffsetMhz,
+            Self::GpuMemoryOffsetMhz,
+            Self::GpuCoreClockLimitMhz,
+            Self::GpuMemoryClockLimitMhz,
+            Self::GpuVoltageOffsetMv,
+            Self::GpuMemoryVoltageOffsetMv,
+            Self::GpuVoltageLimitMv,
+            Self::GpuPowerLimitMw,
+            Self::GpuTemperatureLimitC,
+            Self::GpuFrameRateLimit,
+            Self::GpuUnleashed,
+            Self::GpuDynamicBoost,
+            Self::GpuCustomTgp,
+            Self::GpuVfCurve,
+            Self::GraphicsMode,
+            Self::CpuTemperatureLimitC,
+            Self::CpuSkinTemperatureLimitC,
+            Self::CpuStapmLimitMw,
+            Self::CpuFastPptLimitMw,
+            Self::CpuSlowPptLimitMw,
+            Self::CpuPptLimitMw,
+            Self::CpuStapmTimeSeconds,
+            Self::CpuSlowPptTimeSeconds,
+            Self::CpuTdcMa,
+            Self::CpuEdcMa,
+            Self::SocTdcMa,
+            Self::SocEdcMa,
+            Self::GfxTdcMa,
+            Self::GfxEdcMa,
+            Self::CpuCurveOptimizerAllCore,
+            Self::GfxCurveOptimizer,
+            Self::CpuCurveOptimizerPerCore,
+            Self::CpuPboScalar,
+            Self::CpuAllCoreVoltageOffsetMv,
+            Self::AmdCpuVoltageMv,
+            Self::AmdCpuClockMhz,
+            Self::AmdIgpuClockMhz,
+            Self::IgpuSoftMinMhz,
+            Self::IgpuSoftMaxMhz,
+            Self::CpuSoftMinMhz,
+            Self::CpuSoftMaxMhz,
+            Self::DataSoftMinMhz,
+            Self::DataSoftMaxMhz,
+            Self::FabricSoftMinMhz,
+            Self::FabricSoftMaxMhz,
+            Self::VcnSoftMinMhz,
+            Self::VcnSoftMaxMhz,
+            Self::SocSoftMinMhz,
+            Self::SocSoftMaxMhz,
+            Self::WindowsBoostMode,
+            Self::WindowsEnergyMode,
+            Self::WindowsPowerPlan,
+            Self::WindowsMinimumProcessorPercent,
+            Self::WindowsMaximumProcessorPercent,
+            Self::WindowsProcessorEppPercent,
+            Self::WindowsCoreParkingMinPercent,
+            Self::WindowsCoreParkingMaxPercent,
+            Self::CpuBoostProfile,
+            Self::DisplayRefreshRateHz,
+            Self::CpuCcdAffinity,
+            Self::RadeonAntiLag,
+            Self::RadeonRsr,
+            Self::RadeonBoost,
+            Self::RadeonImageSharpening,
+            Self::RadeonEnhancedSync,
+            Self::RadeonRsrSharpness,
+            Self::RadeonBoostResolutionPercent,
+            Self::RadeonImageSharpness,
+            Self::UpscalingEnabled,
+            Self::UpscalingVsync,
+            Self::UpscalingAutoCapture,
+            Self::UpscalingSharpness,
+            Self::UpscalingResolutionIndex,
+            Self::OmenPerformanceMode,
+            Self::OmenThermalMode,
+            Self::MaxFan,
+            Self::CpuFanCurve,
+            Self::GpuFanCurve,
+            Self::KeyboardColors,
+            Self::KeyboardBrightness,
+            Self::KeyboardEffect,
+            Self::HpSharedPowerMw,
+            Self::GpuDynamicBoostLimitMw,
+        ]
+    }
+    pub fn retired(self) -> bool {
+        matches!(self, Self::Retired(_))
+    }
+    /// GPU settings written through the NVIDIA driver. cTGP and Dynamic Boost
+    /// are HP firmware flags (WMI `0x22`): they need no NVIDIA identity and
+    /// never wake the discrete GPU.
+    pub fn needs_nvidia(self) -> bool {
+        self.descriptor().category == Category::Gpu
+            && !matches!(
+                self,
+                Self::GpuUnleashed | Self::GpuDynamicBoost | Self::GpuCustomTgp
+            )
+    }
+}

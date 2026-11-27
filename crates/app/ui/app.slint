@@ -1,0 +1,2122 @@
+import {
+    TextEdit,
+    ScrollView,
+    Palette,
+    AboutSlint,
+} from "std-widgets.slint";
+import { Theme } from "theme.slint";
+export { Theme } from "theme.slint";
+import { ComboBox, LineEdit, CheckBox, BrightnessSlider } from "controls.slint";
+import { KeyboardPreview, KeyCap } from "keyboard.slint";
+import { ColorField } from "color-field.slint";
+import { ColorPicker, ColorEditor } from "color-picker.slint";
+export { ColorEditor } from "color-picker.slint";
+import { ThemeGallery, PaletteChoice } from "theme-gallery.slint";
+import { CaptionButton, NavigationItem } from "chrome.slint";
+import { NotificationPopup, MessageDialog } from "notifications.slint";
+import {
+    ActionButton,
+    InfoButton,
+    SegmentedTabs,
+    Hairline,
+    SectionTitle,
+    SectionHeader,
+} from "primitives.slint";
+
+export struct FieldData {
+    index: int,
+    label: string,
+    unit: string,
+    included: bool,
+    value: string,
+    kind: int,
+    choices: [string],
+    selected: int,
+    info: string,
+    // kind 5: slider bounds in the row's unit (whole watts).
+    slider-min: float,
+    slider-max: float,
+}
+export struct GroupData { title: string, expanded: bool, rows: [FieldData] }
+export struct CurveNode { x: float, y: float, reference-y: float, selected: bool }
+export struct CoreRow { label: string, value: string }
+export struct AxisTick { position: float, label: string }
+
+export global Workbench {
+    pure callback tr(string) -> string;
+    in-out property <int> page;
+    in property <bool> admin;
+    in property <bool> window-maximized;
+    in property <bool> test-mode;
+    in-out property <bool> busy;
+    in-out property <bool> apply-busy;
+    in-out property <string> status;
+    in property <string> identity;
+    in property <string> gpu-name;
+    in property <string> gpu-power;
+    in property <string> gpu-temp;
+    in property <string> gpu-clock;
+    in property <string> cpu-name;
+    in property <string> cpu-power;
+    in property <string> cpu-temp;
+    in property <string> cpu-load;
+    in property <string> sensor-details;
+    in property <string> cpu-source;
+    in property <string> power-source;
+    in property <string> last-apply;
+    in property <[string]> profiles;
+    in-out property <int> profile-index;
+    in-out property <string> preset-name;
+    in property <[GroupData]> groups;
+    in property <[CoreRow]> cores;
+    in-out property <bool> dirty;
+    in property <bool> preset-ready;
+    in property <bool> preset-saved;
+    in property <bool> preset-applicable;
+    in property <bool> recovery-pending;
+    in-out property <bool> preset-startup;
+    in-out property <int> fan-index;
+    in-out property <int> graphics-index;
+    in property <string> cooling-status;
+    in property <bool> fan-library-ready;
+    in property <bool> fan-library-dirty;
+    in property <bool> fan-library-saved;
+    in property <[string]> fan-library-names;
+    in-out property <int> fan-library-index;
+    in-out property <string> fan-library-name;
+    in property <[string]> profile-fan-choices;
+    in-out property <int> profile-fan-index;
+    in property <bool> profile-fan-linked;
+    in property <string> graphics-status;
+    in-out property <bool> curve-open;
+    in property <bool> curve-gpu;
+    in property <[CurveNode]> nodes;
+    in property <string> curve-path;
+    in property <string> reference-path;
+    in property <[AxisTick]> x-ticks;
+    in property <[AxisTick]> y-ticks;
+    // Plot size in logical px, reported by the canvas for tick spacing.
+    in-out property <float> plot-width;
+    in-out property <float> plot-height;
+    // The reference line is the NVIDIA driver default curve (GPU).
+    in property <bool> curve-driver-reference;
+    // Offset of the whole draft from the driver default curve.
+    in property <string> curve-delta;
+    in property <string> curve-title;
+    in property <string> curve-x-label;
+    in property <string> curve-y-label;
+    in-out property <string> point-x;
+    in-out property <string> point-y;
+    in property <[string]> point-labels;
+    in-out property <int> point-index;
+    in property <bool> can-undo;
+    in property <bool> can-redo;
+    in property <bool> curve-selection-mode;
+    // Values of the dragged or hovered point, shown beside it; position in 0..1.
+    in property <string> curve-readout;
+    in property <float> readout-x;
+    in property <float> readout-y;
+    in property <bool> readout-hover;
+    in property <bool> has-selection;
+    in property <float> selection-low;
+    in property <float> selection-high;
+    in property <string> selection-label;
+    in-out property <string> range-from;
+    in-out property <string> range-to;
+    in-out property <bool> lighting-on;
+    in property <bool> lighting-ready;
+    in property <[KeyCap]> keyboard-keys;
+    in-out property <bool> keyboard-german;
+    in property <int> lighting-group;
+    in property <bool> lighting-dirty;
+    in property <string> lighting-confirmed;
+    in property <string> lighting-error;
+    in-out property <string> lighting-color;
+    in-out property <string> lighting-brightness;
+    in property <float> lighting-level;
+    in property <[color]> zone-colors;
+    in-out property <int> language-index;
+    in-out property <bool> autostart;
+    in-out property <bool> start-in-tray;
+    in-out property <int> close-index;
+    in-out property <bool> hold-preset;
+    in-out property <string> gpu-tgp-max-w;
+    in property <string> gpu-tgp-max-error;
+    in property <[string]> battery-choices;
+    in-out property <int> battery-index;
+    in property <bool> settings-ready;
+    in-out property <bool> settings-dirty;
+    in-out property <int> palette-index;
+    in property <[PaletteChoice]> palette-choices;
+    in property <color> background-preview;
+    in property <color> foreground-preview;
+    in property <color> accent-preview;
+    in-out property <string> color-background;
+    in-out property <string> color-foreground;
+    in-out property <string> color-accent;
+    in property <string> appearance-error;
+    in property <bool> hp-disabled;
+    in property <bool> hp-available;
+    in property <string> device-defaults-summary;
+    in-out property <int> confirm-kind;
+    in property <bool> notice-visible;
+    in property <bool> notice-failed;
+    in property <string> notice-title;
+    in property <string> notice-text;
+    callback navigate(int);
+    callback window-action(int);
+    callback refresh();
+    callback select-preset(int);
+    callback new-preset();
+    callback name-edited(string);
+    callback include-field(int, bool);
+    callback edit-field(int, string);
+    callback choice-field(int, int);
+    callback edit-core(int, string);
+    callback toggle-group(int);
+    callback save-preset();
+    callback apply-preset();
+    callback delete-preset();
+    callback reset-preset();
+    callback cancel-preset();
+    callback profile-fan-selected(int);
+    callback battery-selected(int);
+    callback fan-library-selected(int);
+    callback fan-library-new();
+    callback fan-library-name-edited(string);
+    callback fan-library-reset();
+    callback fan-library-save();
+    callback fan-library-delete();
+    callback fan-library-request();
+    callback fan-library-refresh();
+    callback startup-edited(bool);
+    callback fan-change(int);
+    callback graphics-change(int);
+    callback open-curve(bool);
+    callback curve-action(string);
+    callback select-point(int);
+    // kind (0 down, 1 drag, 2 up, 3 cancel, 5 double-click), x/y in 0..1,
+    // plot width/height in px, Shift, Ctrl, Alt.
+    callback chart-event(int, float, float, float, float, bool, bool, bool);
+    // Wheel delta x/y in px, pointer x/y in 0..1, Shift, Ctrl.
+    callback chart-wheel(float, float, float, float, bool, bool);
+    callback chart-key(string, bool, bool, bool) -> bool;
+    // A slider row moved to a whole-watt value.
+    callback slider-field(int, float);
+    // Pointer x/y in 0..1 without a pressed button (x < 0: left the chart),
+    // plot width/height in px.
+    callback chart-hover(float, float, float, float);
+    callback chart-resized();
+    callback lighting-power();
+    callback select-lighting-group(int);
+    callback keyboard-layout(bool);
+    callback edit-lighting-color(string);
+    callback edit-lighting-brightness(string);
+    callback lighting-level-edited(float);
+    callback pick-lighting-color();
+    callback apply-lighting();
+    callback reset-lighting();
+    callback refresh-lighting();
+    callback save-settings();
+    callback settings-changed();
+    callback palette-changed(int);
+    callback colors-changed();
+    callback open-color-picker(int);
+    callback reset-appearance();
+    callback hp-service();
+    callback detect-defaults();
+    callback show-about();
+    callback confirm(bool);
+    callback confirm-save();
+    callback dismiss-notice();
+    callback notice-details();
+    callback close-notice-details();
+}
+
+component FieldRow inherits Rectangle {
+    in-out property <FieldData> item;
+    in-out property <bool> show-info;
+    // The last row of a group has no divider under it.
+    in property <bool> last;
+    height: Theme.row-height + (root.show-info ? info-text.preferred-height + 34px : 0px);
+
+    // Every control keeps the control height; the same space above and below
+    // centres label, info button, editor and unit on one line.
+    HorizontalLayout {
+        y: (Theme.row-height - Theme.control-height) / 2;
+        height: Theme.control-height;
+        spacing: 8px;
+        // The check box then starts where the group title text starts.
+        padding-left: 8px;
+        padding-right: 16px;
+        include := CheckBox {
+            text: root.item.label;
+            checked <=> root.item.included;
+            enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+            horizontal-stretch: 0;
+            toggled => { Workbench.include-field(root.item.index, self.checked); }
+        }
+
+        info := InfoButton {
+            label: Workbench.tr("ui.info") + ": " + root.item.label;
+            enabled: Workbench.confirm-kind == 0;
+            active: root.show-info;
+            clicked => { root.show-info = !root.show-info; }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        if root.item.kind == 0: LineEdit {
+            accessible-label: root.item.label;
+            text <=> root.item.value;
+            unit: root.item.unit;
+            width: Theme.number-width;
+            horizontal-stretch: 0;
+            enabled: (root.item.included && !Workbench.busy) && Workbench.confirm-kind == 0;
+            edited(text) => { Workbench.edit-field(root.item.index, text); }
+        }
+        if root.item.kind == 1: ComboBox {
+            accessible-label: root.item.label;
+            model: root.item.choices;
+            current-index <=> root.item.selected;
+            width: Theme.field-width;
+            horizontal-stretch: 0;
+            enabled: (root.item.included && !Workbench.busy) && Workbench.confirm-kind == 0;
+            selected(value) => { Workbench.choice-field(root.item.index, self.current-index); }
+        }
+        if root.item.kind == 2: Text {
+            text: root.item.included ? Workbench.tr("common.on") : Workbench.tr("common.off");
+            color: Theme.muted;
+            width: Theme.field-width;
+            vertical-alignment: center;
+        }
+        if root.item.kind == 3: ActionButton {
+            text: Workbench.tr("ui.edit_curve");
+            control-width: Theme.field-width;
+            enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+            clicked => { Workbench.open-curve(true); }
+        }
+        // The slider and its value with unit share the common field width.
+        if root.item.kind == 5: HorizontalLayout {
+            width: Theme.field-width;
+            horizontal-stretch: 0;
+            spacing: 8px;
+            BrightnessSlider {
+                accessible-label: root.item.label;
+                value: root.item.value.to-float();
+                minimum: root.item.slider-min;
+                maximum: root.item.slider-max;
+                enabled: (root.item.included && !Workbench.busy) && Workbench.confirm-kind == 0;
+                edited(v) => { Workbench.slider-field(root.item.index, v); }
+            }
+            Text {
+                text: root.item.unit == "" ? root.item.value : root.item.value + " " + root.item.unit;
+                width: 60px;
+                color: root.item.included ? Theme.ink : Theme.muted;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+        if root.item.kind == 4: Text {
+            text: Workbench.tr("ui.per_core_below");
+            color: Theme.muted;
+            width: Theme.field-width;
+            vertical-alignment: center;
+        }
+    }
+
+    Rectangle {
+        visible: root.show-info;
+        x: 36px;
+        y: Theme.row-height + 4px;
+        width: parent.width - 52px;
+        height: root.show-info ? info-text.preferred-height + 20px : 0px;
+        background: Theme.surface;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Theme.line;
+
+        info-text := Text {
+            x: 12px;
+            y: 10px;
+            width: parent.width - 24px;
+            text: root.item.info;
+            color: Theme.muted;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+
+    Rectangle {
+        visible: !root.last;
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.line;
+    }
+}
+
+component PresetGroup inherits Rectangle {
+    in property <GroupData> group;
+    in property <int> index;
+    height: layout.preferred-height;
+    layout := VerticalLayout {
+        spacing: 0px;
+        SectionHeader {
+            text: root.group.title;
+            expanded: root.group.expanded;
+            clicked => { Workbench.toggle-group(root.index); }
+        }
+
+        Rectangle {
+            height: root.group.expanded ? row-layout.preferred-height : 0px;
+            visible: root.group.expanded;
+            row-layout := VerticalLayout {
+                padding-bottom: 4px;
+                for row[row-index] in root.group.rows: FieldRow {
+                    item <=> row;
+                    last: row-index == root.group.rows.length - 1 && root.index != 5;
+                }
+                if root.index == 5: GridLayout {
+                    spacing: 8px;
+                    for item[index] in Workbench.cores: HorizontalLayout {
+                        row: floor(index / 4);
+                        col: mod(index, 4);
+                        Text {
+                            text: item.label;
+                            color: Theme.muted;
+                            vertical-alignment: center;
+                        }
+
+                        LineEdit {
+                            accessible-label: item.label;
+                            text: item.value;
+                            min-width: 40px;
+                            max-width: 60px;
+                            preferred-width: 52px;
+                            enabled: (root.group.rows[0].included && !Workbench.busy) && Workbench.confirm-kind == 0;
+                            edited(value) => { Workbench.edit-core(index, value); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component Measurement inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    height: 54px;
+    VerticalLayout {
+        spacing: 3px;
+        Text {
+            text: root.label;
+            color: Theme.muted;
+            font-size: 12px;
+        }
+
+        Text {
+            text: root.value;
+            color: Theme.ink;
+            font-size: root.value == Workbench.tr("common.unavailable") ? 13px : 24px;
+            font-family: "Consolas";
+            wrap: word-wrap;
+        }
+    }
+}
+
+component CurveCanvas inherits Rectangle {
+    forward-focus: chart-focus;
+    background: Theme.surface;
+    border-radius: 6px;
+    clip: true;
+    min-height: 190px;
+    // Margins around the plot: Y labels left, X labels below, captions above.
+    private property <length> plot-left: 52px;
+    private property <length> plot-top: 26px;
+    private property <length> plot-right: 18px;
+    private property <length> plot-bottom: 26px;
+
+    Text {
+        x: 4px;
+        y: 4px;
+        width: root.plot-left - 10px;
+        height: 16px;
+        text: Workbench.curve-y-label;
+        color: Theme.quiet;
+        font-size: 11px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    Text {
+        x: root.plot-left + 120px;
+        y: 4px;
+        width: max(0px, root.width - root.plot-left - root.plot-right - 120px);
+        height: 16px;
+        text: Workbench.curve-delta;
+        color: Theme.ink;
+        font-size: 12px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    for tick in Workbench.y-ticks: Text {
+        x: 4px;
+        y: root.plot-top + (1 - tick.position) * plot.height - self.height / 2;
+        width: root.plot-left - 10px;
+        height: 14px;
+        text: tick.label;
+        color: Theme.muted;
+        font-family: "Consolas";
+        font-size: 11px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    Text {
+        x: 4px;
+        y: root.plot-top + plot.height + 6px;
+        width: root.plot-left - 22px;
+        height: 14px;
+        text: Workbench.curve-x-label;
+        color: Theme.quiet;
+        font-size: 11px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    // Centred under their grid line; labels on the plot edges align with it.
+    for tick in Workbench.x-ticks: Text {
+        property <bool> first: tick.position < 0.001;
+        property <bool> last: tick.position > 0.999;
+        x: self.first ? root.plot-left : self.last ? root.plot-left + plot.width - self.width : min(root.plot-left + tick.position * plot.width - self.width / 2, root.width - self.width);
+        y: root.plot-top + plot.height + 6px;
+        width: 48px;
+        height: 14px;
+        text: tick.label;
+        color: Theme.muted;
+        font-family: "Consolas";
+        font-size: 11px;
+        horizontal-alignment: self.first ? TextHorizontalAlignment.left : self.last ? TextHorizontalAlignment.right : TextHorizontalAlignment.center;
+        vertical-alignment: center;
+    }
+
+    plot := Rectangle {
+        x: root.plot-left;
+        y: root.plot-top;
+        width: max(1px, root.width - root.plot-left - root.plot-right);
+        height: max(1px, root.height - root.plot-top - root.plot-bottom);
+        clip: true;
+        init => {
+            Workbench.plot-width = self.width / 1px;
+            Workbench.plot-height = self.height / 1px;
+        }
+        changed width => {
+            Workbench.plot-width = self.width / 1px;
+            Workbench.chart-resized();
+        }
+        changed height => {
+            Workbench.plot-height = self.height / 1px;
+            Workbench.chart-resized();
+        }
+
+        // Grid lines use the same mapping as points and path, snapped to one
+        // physical pixel so every line has the same weight.
+        for tick in Workbench.y-ticks: Rectangle {
+            y: floor((1 - tick.position) * parent.height / 1phx) * 1phx;
+            height: 1phx;
+            background: Theme.line;
+        }
+        for tick in Workbench.x-ticks: Rectangle {
+            x: floor(tick.position * parent.width / 1phx) * 1phx;
+            width: 1phx;
+            background: Theme.line;
+        }
+        selection-band := Rectangle {
+            visible: Workbench.has-selection;
+            x: clamp(Workbench.selection-low,0,1) * parent.width;
+            width: max(2px,(clamp(Workbench.selection-high,0,1) - clamp(Workbench.selection-low,0,1)) * parent.width);
+            background: Theme.accent.with-alpha(0.14);
+            border-width: 1px;
+            border-color: Theme.accent.with-alpha(0.55);
+        }
+
+        reference-line := Path {
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            fit: fill;
+            commands: Workbench.reference-path;
+            stroke: Theme.muted;
+            stroke-width: 1px;
+            fill: transparent;
+        }
+
+        curve-line := Path {
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            fit: fill;
+            commands: Workbench.curve-path;
+            stroke: Theme.accent;
+            stroke-width: 2px;
+            fill: transparent;
+        }
+
+        Rectangle {
+            visible: Workbench.nodes.length > 0;
+            x: floor(Workbench.nodes[Workbench.point-index].x * parent.width / 1phx) * 1phx;
+            width: 1phx;
+            background: Theme.accent.with-alpha(0.25);
+        }
+
+        Rectangle {
+            visible: Workbench.nodes.length > 0;
+            y: floor((1 - Workbench.nodes[Workbench.point-index].y) * parent.height / 1phx) * 1phx;
+            height: 1phx;
+            background: Theme.accent.with-alpha(0.25);
+        }
+
+        for point[index] in Workbench.nodes: draft-node := Rectangle {
+            x: point.x * parent.width - self.width / 2;
+            y: (1 - point.y) * parent.height - self.height / 2;
+            width: point.selected ? 8px : 5px;
+            height: self.width;
+            background: point.selected ? Theme.accent : Theme.ink;
+        }
+
+        hover-marker := Rectangle {
+            visible: Workbench.curve-readout != "" && Workbench.readout-hover;
+            x: Workbench.readout-x * parent.width - self.width / 2;
+            y: (1 - Workbench.readout-y) * parent.height - self.height / 2;
+            width: 13px;
+            height: 13px;
+            border-radius: 3px;
+            border-width: 2px;
+            border-color: Theme.accent;
+        }
+
+        readout := Rectangle {
+            visible: Workbench.curve-readout != "";
+            property <length> anchor-x: Workbench.readout-x * parent.width;
+            property <length> anchor-y: (1 - Workbench.readout-y) * parent.height;
+            width: readout-text.preferred-width + 16px;
+            height: readout-text.preferred-height + 10px;
+            // Beside the point, flipped away from the plot edges.
+            x: clamp(self.anchor-x + 12px + self.width > parent.width ? self.anchor-x - 12px - self.width : self.anchor-x + 12px, 0px, max(0px, parent.width - self.width));
+            y: clamp(self.anchor-y - 12px - self.height < 0px ? self.anchor-y + 12px : self.anchor-y - 12px - self.height, 0px, max(0px, parent.height - self.height));
+            background: Theme.control;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Theme.accent.with-alpha(0.55);
+            readout-text := Text {
+                x: 8px;
+                y: 5px;
+                text: Workbench.curve-readout;
+                color: Theme.ink;
+                font-family: "Consolas";
+                font-size: 11px;
+            }
+        }
+
+        canvas-input := TouchArea {
+            mouse-cursor: crosshair;
+            clicked => { chart-focus.focus(); }
+            moved => {
+                if (self.pressed) {
+                    Workbench.chart-event(1, self.mouse-x / self.width, self.mouse-y / self.height,
+                    self.width / 1px, self.height / 1px, false, false, false);
+                }
+            }
+            double-clicked => {
+                Workbench.chart-event(5, self.mouse-x / self.width, self.mouse-y / self.height,
+                self.width / 1px, self.height / 1px, false, false, false);
+            }
+            changed has-hover => {
+                if !self.has-hover {
+                    Workbench.chart-hover(-1, -1, self.width / 1px, self.height / 1px);
+                }
+            }
+            pointer-event(e) => {
+                if e.kind == PointerEventKind.move {
+                    if !self.pressed {
+                        Workbench.chart-hover(self.mouse-x / self.width, self.mouse-y / self.height,
+                        self.width / 1px, self.height / 1px);
+                    }
+                } else if e.kind == PointerEventKind.cancel {
+                    Workbench.chart-event(3, 0, 0, self.width / 1px, self.height / 1px, false, false, false);
+                } else if (e.button == PointerEventButton.left) {
+                    chart-focus.focus();
+                    Workbench.chart-event(e.kind == PointerEventKind.down ? 0 : e.kind == PointerEventKind.up ? 2 : 3,
+                    self.mouse-x / self.width, self.mouse-y / self.height, self.width / 1px, self.height / 1px,
+                    e.modifiers.shift, e.modifiers.control, e.modifiers.alt);
+                }
+            }
+            scroll-event(e) => {
+                Workbench.chart-wheel(e.delta-x / 1px, e.delta-y / 1px, self.mouse-x / self.width,
+                self.mouse-y / self.height, e.modifiers.shift, e.modifiers.control);
+                return accept;
+            }
+        }
+
+        chart-focus := FocusScope {
+            x: 0px;
+            width: 0px;
+            key-pressed(e) => {
+                return Workbench.chart-key(e.text, e.modifiers.shift, e.modifiers.control, e.modifiers.alt) ? accept : reject;
+            }
+        }
+    }
+}
+
+component ConfirmPrompt inherits FocusScope {
+    in property <int> kind;
+    callback accepted(bool);
+    callback save-requested();
+    private property <bool> confirm-focused;
+    forward-focus: cancel-button;
+    init => { cancel-button.focus(); }
+    capture-key-pressed(e) => {
+        if e.text == Key.Escape { root.accepted(false); return accept; }
+        if e.text == Key.Tab || e.text == Key.Backtab {
+            let count = root.kind == 1 ? 3 : 2;
+            let at = cancel-button.keyboard-focus ? 0 : confirm-button.keyboard-focus ? 1 : 2;
+            let next = mod(at + (e.text == Key.Backtab || e.modifiers.shift ? count - 1 : 1),count);
+            if next == 0 { cancel-button.focus(); } else if next == 1 { confirm-button.focus(); } else { save-button.focus(); }
+            return accept;
+        }
+        return reject;
+    }
+    Rectangle {
+        background: #00000099;
+        TouchArea { }
+    }
+
+    Rectangle {
+        width: min(480px, parent.width - 48px);
+        height: confirm-layout.preferred-height;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.line;
+        border-radius: 6px;
+        confirm-layout := VerticalLayout {
+            padding: 20px;
+            spacing: 16px;
+            Text {
+                text: Workbench.tr(root.kind == 2 ? "ui.confirm_delete" : root.kind == 3 ? "ui.confirm_exit" : "notice.unsaved_preset");
+                color: Theme.ink;
+                wrap: word-wrap;
+            }
+
+            if root.kind == 1 && Workbench.preset-startup: Text {
+                text: Workbench.tr("preset.startup_on_save");
+                color: Theme.warning;
+                wrap: word-wrap;
+                font-size: 12px;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                cancel-button := ActionButton {
+                    text: Workbench.tr("ui.cancel");
+                    clicked => { root.accepted(false); }
+                }
+
+                confirm-button := ActionButton {
+                    text: Workbench.tr(root.kind == 2 ? "preset.delete" : "notice.discard");
+                    primary: root.kind != 1;
+                    clicked => { root.accepted(true); }
+                }
+
+                save-button := ActionButton {
+                    visible: root.kind == 1;
+                    control-width: root.kind == 1 ? Theme.action-width : 0px;
+                    text: Workbench.tr("preset.save");
+                    primary: true;
+                    clicked => { root.save-requested(); }
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    public function focus-curve() { chart.focus(); }
+    // Enter in the chart: edit the selected point's value numerically.
+    public function edit-curve-value() { point-y.focus(); }
+    callback color-picker-closed(int);
+    color-picker-closed(target) => {
+        if target == 0 { color-background.focus(); }
+        else if target == 1 { color-foreground.focus(); }
+        else if target == 2 { color-accent.focus(); }
+        else { lighting-color.focus(); }
+    }
+    title: "PerformanceHub";
+    no-frame: true;
+    resize-border-width: Workbench.window-maximized ? 0px : 6px;
+    preferred-width: 1000px;
+    preferred-height: 720px;
+    min-width: 820px;
+    min-height: 500px;
+    max-width: 10000px;
+    max-height: 10000px;
+    background: Theme.canvas;
+    default-font-family: "Segoe UI";
+    default-font-size: 13px;
+    private property <bool> dark-appearance: Theme.dark;
+    changed dark-appearance => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    private property <bool> device-details;
+    private property <bool> battery-details;
+    private property <bool> fan-link-details;
+
+    titlebar := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 40px;
+        background: Theme.surface;
+        titlebar-move := WindowMoveArea {
+            x: 6px;
+            y: 0px;
+            width: parent.width - 150px;
+            height: parent.height;
+            Text {
+                x: 14px;
+                width: 140px;
+                text: "PERFORMANCEHUB";
+                font-size: 12px;
+                font-weight: 600;
+                letter-spacing: 0.8px;
+                color: Theme.ink;
+                vertical-alignment: center;
+            }
+
+            Text {
+                x: 164px;
+                width: parent.width - 184px;
+                text: Workbench.busy ? Workbench.tr("control.working") : Workbench.page < 2 ? Workbench.tr("ui.overview") : Workbench.page == 2 ? Workbench.tr("ui.cooling") : Workbench.page == 3 ? Workbench.tr("ui.lighting") : Workbench.tr("settings.title");
+                color: Theme.muted;
+                vertical-alignment: center;
+            }
+
+            TouchArea {
+                double-clicked => { Workbench.window-action(1); }
+                pointer-event(e) => { if e.kind == PointerEventKind.up && e.button == PointerEventButton.right { Workbench.window-action(3); } }
+            }
+        }
+
+        window-minimize := CaptionButton {
+            x: parent.width - 144px;
+            kind: 0;
+            text: Workbench.tr("window.minimize");
+            clicked => { Workbench.window-action(0); }
+        }
+
+        window-maximize := CaptionButton {
+            x: parent.width - 96px;
+            kind: 1;
+            maximized: Workbench.window-maximized;
+            text: Workbench.tr(Workbench.window-maximized ? "window.restore" : "window.maximize");
+            clicked => { Workbench.window-action(1); }
+        }
+
+        window-close := CaptionButton {
+            x: parent.width - 48px;
+            kind: 2;
+            text: Workbench.tr("settings.close");
+            clicked => { Workbench.window-action(2); }
+        }
+    }
+
+    sidebar := Rectangle {
+        x: 0px;
+        y: 40px;
+        width: 160px;
+        height: parent.height - 40px;
+        background: Theme.surface;
+        Rectangle {
+            x: parent.width - 1px;
+            width: 1px;
+            background: Theme.line;
+        }
+
+        VerticalLayout {
+            padding: 8px;
+            spacing: 6px;
+            navigation-overview := NavigationItem {
+                kind: 0;
+                text: Workbench.tr("ui.overview");
+                selected: Workbench.page < 2;
+                enabled: Workbench.confirm-kind == 0;
+                clicked => { Workbench.navigate(0); }
+            }
+
+            navigation-cooling := NavigationItem {
+                kind: 1;
+                text: Workbench.tr("ui.cooling");
+                selected: Workbench.page == 2;
+                enabled: Workbench.confirm-kind == 0;
+                clicked => { Workbench.navigate(2); }
+            }
+
+            navigation-lighting := NavigationItem {
+                kind: 2;
+                text: Workbench.tr("ui.lighting");
+                selected: Workbench.page == 3;
+                enabled: Workbench.confirm-kind == 0;
+                clicked => { Workbench.navigate(3); }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+            }
+
+            Hairline { }
+
+            settings-button := NavigationItem {
+                kind: 3;
+                text: Workbench.tr("settings.title");
+                selected: Workbench.page == 4;
+                enabled: Workbench.confirm-kind == 0;
+                clicked => { Workbench.navigate(4); }
+            }
+        }
+    }
+
+    workspace := Rectangle {
+        x: 160px;
+        y: 40px;
+        width: parent.width - 160px;
+        height: parent.height - 40px;
+        VerticalLayout {
+            spacing: 0px;
+            if Workbench.test-mode: Text {
+                text: Workbench.tr("ui.test_mode");
+                color: Theme.warning;
+                height: 22px;
+                horizontal-alignment: center;
+            }
+            Rectangle {
+                vertical-stretch: 1;
+                overview := Rectangle {
+                    visible: Workbench.page < 2 && !Workbench.curve-open;
+                    VerticalLayout {
+                        width: min(Theme.workspace-width,parent.width);
+                        x: (parent.width - self.width) / 2;
+                        padding: 20px;
+                        spacing: 12px;
+                        preset-list := ScrollView {
+                            content-width: self.visible-width - 12px;
+                            VerticalLayout {
+                                spacing: 12px;
+                                HorizontalLayout {
+                                    spacing: 24px;
+                                    VerticalLayout {
+                                        spacing: 12px;
+                                        SectionTitle {
+                                            text: Workbench.tr("section.gpu");
+                                        }
+
+                                        Text {
+                                            text: Workbench.gpu-name;
+                                            color: Theme.muted;
+                                            wrap: word-wrap;
+                                        }
+
+                                        HorizontalLayout {
+                                            Measurement {
+                                                label: Workbench.tr("ui.power");
+                                                value: Workbench.gpu-power;
+                                            }
+
+                                            Measurement {
+                                                label: Workbench.tr("ui.temperature");
+                                                value: Workbench.gpu-temp;
+                                            }
+                                        }
+
+                                        Text {
+                                            text: Workbench.gpu-clock;
+                                            color: Theme.muted;
+                                            font-family: "Consolas";
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: 1px;
+                                        background: Theme.line;
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 12px;
+                                        SectionTitle {
+                                            text: Workbench.tr("section.cpu");
+                                        }
+
+                                        Text {
+                                            text: Workbench.cpu-name;
+                                            color: Theme.muted;
+                                            wrap: word-wrap;
+                                        }
+
+                                        HorizontalLayout {
+                                            Measurement {
+                                                label: Workbench.tr("ui.power");
+                                                value: Workbench.cpu-power;
+                                            }
+
+                                            Measurement {
+                                                label: Workbench.tr("ui.tctl");
+                                                value: Workbench.cpu-temp;
+                                            }
+                                        }
+
+                                        Text {
+                                            text: Workbench.cpu-load;
+                                            color: Theme.muted;
+                                            font-family: "Consolas";
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    device-details-toggle := ActionButton {
+                                        text: Workbench.tr("ui.device_modes");
+                                        background: transparent;
+                                        clicked => { root.device-details = !root.device-details; }
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    refresh := ActionButton {
+                                        text: Workbench.tr("ui.refresh");
+                                        enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.refresh(); }
+                                    }
+                                }
+
+                                if root.device-details: VerticalLayout {
+                                    spacing: 12px;
+                                    Text {
+                                        text: Workbench.cpu-source;
+                                        color: Theme.muted;
+                                        wrap: word-wrap;
+                                        font-size: 12px;
+                                    }
+
+                                    Text {
+                                        visible: Workbench.sensor-details != "";
+                                        text: Workbench.sensor-details;
+                                        color: Theme.warning;
+                                        wrap: word-wrap;
+                                        font-size: 12px;
+                                    }
+
+                                    Text {
+                                        text: Workbench.last-apply;
+                                        color: Theme.muted;
+                                        wrap: word-wrap;
+                                        font-size: 12px;
+                                    }
+
+                                    Hairline { }
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: Workbench.tr("ui.graphics");
+                                            color: Theme.ink;
+                                            vertical-alignment: center;
+                                        }
+
+                                        ComboBox {
+                                            accessible-label: Workbench.tr("ui.graphics");
+                                            model: [Workbench.tr("mux.hybrid"), Workbench.tr("mux.discrete")];
+                                            current-index <=> Workbench.graphics-index;
+                                            enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                            selected(value) => { Workbench.graphics-change(self.current-index); }
+                                        }
+
+                                        Text {
+                                            text: Workbench.graphics-status;
+                                            color: Theme.muted;
+                                            wrap: word-wrap;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+
+                                    ActionButton {
+                                        visible: Workbench.recovery-pending;
+                                        text: Workbench.tr("preset.restore_button");
+                                        enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.apply-preset(); }
+                                    }
+
+                                    Text {
+                                        text: Workbench.identity + "  ·  " + Workbench.power-source + "  ·  " + Workbench.tr(Workbench.admin ? "ui.admin" : "ui.user");
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                                Hairline { }
+
+                                SectionTitle {
+                                    text: Workbench.tr("ui.presets");
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    padding-right: 16px;
+                                    Text {
+                                        text: Workbench.tr("preset.selector_label");
+                                        color: Theme.muted;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    preset-selector := ComboBox {
+                                        width: Theme.field-width;
+                                        accessible-label: Workbench.tr("preset.selector_label");
+                                        model: Workbench.profiles;
+                                        current-index <=> Workbench.profile-index;
+                                        enabled: Workbench.preset-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        selected(value) => { Workbench.select-preset(self.current-index); }
+                                    }
+
+                                    new-preset := ActionButton {
+                                        text: "+";
+                                        control-width: Theme.info-width;
+                                        accessible-label: Workbench.tr("preset.new");
+                                        enabled: Workbench.preset-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.new-preset(); }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    padding-right: 16px;
+                                    Text {
+                                        text: Workbench.tr("ui.preset_name");
+                                        color: Theme.muted;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    preset-name := LineEdit {
+                                        width: Theme.field-width;
+                                        accessible-label: Workbench.tr("ui.preset_name");
+                                        text <=> Workbench.preset-name;
+                                        placeholder-text: Workbench.tr("ui.preset_name");
+                                        enabled: Workbench.preset-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        edited(text) => { Workbench.name-edited(text); }
+                                    }
+
+                                    Rectangle {
+                                        width: Theme.info-width;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    padding-right: 16px;
+                                    Text {
+                                        text: Workbench.tr("battery.behaviour");
+                                        color: Theme.muted;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    battery := ComboBox {
+                                        accessible-label: Workbench.tr("battery.behaviour");
+                                        width: Theme.field-width;
+                                        model: Workbench.battery-choices;
+                                        current-index <=> Workbench.battery-index;
+                                        enabled: Workbench.preset-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        selected(value) => { Workbench.battery-selected(self.current-index); }
+                                    }
+
+                                    battery-info := InfoButton {
+                                        label: Workbench.tr("battery.behaviour_info");
+                                        enabled: Workbench.confirm-kind == 0;
+                                        active: root.battery-details;
+                                        clicked => { root.battery-details = !root.battery-details; }
+                                    }
+                                }
+
+                                if root.battery-details: Text {
+                                    text: Workbench.tr("info.battery_behaviour");
+                                    color: Theme.muted;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    padding-right: 16px;
+                                    Text {
+                                        text: Workbench.tr("fan_profile.link");
+                                        color: Theme.muted;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    profile-fan := ComboBox {
+                                        accessible-label: Workbench.tr("fan_profile.link");
+                                        width: Theme.field-width;
+                                        model: Workbench.profile-fan-choices;
+                                        current-index <=> Workbench.profile-fan-index;
+                                        enabled: Workbench.preset-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        selected(value) => { Workbench.profile-fan-selected(self.current-index); }
+                                    }
+
+                                    fan-link-info := InfoButton {
+                                        label: Workbench.tr("ui.info") + ": " + Workbench.tr("fan_profile.link");
+                                        enabled: Workbench.confirm-kind == 0;
+                                        active: root.fan-link-details;
+                                        clicked => { root.fan-link-details = !root.fan-link-details; }
+                                    }
+                                }
+
+                                if root.fan-link-details: Text {
+                                    text: Workbench.tr("fan_profile.manual_note");
+                                    color: Theme.muted;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+
+                                for group[index] in Workbench.groups: PresetGroup {
+                                    group: group;
+                                    index: index;
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-right: 12px;
+                            startup := CheckBox {
+                                text: Workbench.tr("preset.startup_label");
+                                checked <=> Workbench.preset-startup;
+                                enabled: Workbench.preset-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                toggled => { Workbench.startup-edited(self.checked); }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            Text {
+                                text: Workbench.dirty ? Workbench.tr("preset.unsaved") : "";
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        if Workbench.preset-startup && Workbench.dirty: Text {
+                            text: Workbench.tr("preset.startup_on_save");
+                            color: Theme.warning;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        preset-actions := Rectangle {
+                            height: self.width < 720px ? 80px : Theme.control-height;
+                            vertical-stretch: 0;
+                            HorizontalLayout {
+                                y: 0px;
+                                height: Theme.control-height;
+                                spacing: 8px;
+                                ActionButton {
+                                    text: Workbench.tr("ui.reset_draft");
+                                    enabled: Workbench.preset-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                    clicked => { Workbench.reset-preset(); }
+                                }
+
+                                cancel-preset := ActionButton {
+                                    control-width: 160px;
+                                    text: Workbench.tr("preset.cancel_edit");
+                                    enabled: Workbench.preset-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                    clicked => { Workbench.cancel-preset(); }
+                                }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                width: 400px;
+                                x: parent.width - self.width - 12px;
+                                y: parent.width < 720px ? 44px : 0px;
+                                height: Theme.control-height;
+                                spacing: 8px;
+                                delete-preset := ActionButton {
+                                    text: Workbench.tr("preset.delete");
+                                    enabled: (Workbench.preset-saved && !Workbench.busy && !Workbench.recovery-pending) && Workbench.confirm-kind == 0;
+                                    clicked => { Workbench.delete-preset(); }
+                                }
+
+                                save-preset := ActionButton {
+                                    text: Workbench.tr("preset.save");
+                                    enabled: (Workbench.preset-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                    clicked => { Workbench.save-preset(); }
+                                }
+
+                                apply-preset := ActionButton {
+                                    text: Workbench.tr("preset.apply_button");
+                                    primary: true;
+                                    enabled: Workbench.preset-saved && !Workbench.dirty && Workbench.confirm-kind == 0;
+                                    clicked => { Workbench.apply-preset(); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                cooling := ScrollView {
+                    content-width: self.visible-width - 12px;
+                    content-height: cooling-content.preferred-height;
+                    visible: Workbench.page == 2 && !Workbench.curve-open;
+                    cooling-content := VerticalLayout {
+                        width: min(Theme.workspace-width,parent.width);
+                        x: (parent.width - self.width) / 2;
+                        y: 0px;
+                        height: self.preferred-height;
+                        padding: 20px;
+                        spacing: 16px;
+                        SectionTitle {
+                            text: Workbench.tr("ui.cooling");
+                        }
+
+                        HorizontalLayout {
+                            Text {
+                                text: Workbench.tr("ui.fan_request");
+                                color: Theme.ink;
+                                vertical-alignment: center;
+                            }
+
+                            fan-selector := ComboBox {
+                                model: [
+                                    Workbench.tr("ui.fan_bios"),
+                                    Workbench.tr("ui.fan_curve"),
+                                    Workbench.tr("ui.fan_max")
+                                ];
+                                current-index <=> Workbench.fan-index;
+                                enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                selected(value) => { Workbench.fan-change(self.current-index); }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+                        }
+
+                        Text {
+                            text: Workbench.cooling-status;
+                            color: Theme.muted;
+                            wrap: word-wrap;
+                        }
+
+                        Hairline { }
+
+                        SectionTitle {
+                            text: Workbench.tr("fan_profile.library_title");
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: Workbench.tr("fan_profile.preset");
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            fan-library-selector := ComboBox {
+                                width: Theme.field-width;
+                                accessible-label: Workbench.tr("fan_profile.preset");
+                                model: Workbench.fan-library-names;
+                                current-index <=> Workbench.fan-library-index;
+                                enabled: Workbench.fan-library-ready && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                selected(value) => { Workbench.fan-library-selected(self.current-index); }
+                            }
+
+                            ActionButton {
+                                text: "+";
+                                accessible-label: Workbench.tr("fan_profile.new");
+                                enabled: Workbench.fan-library-ready && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.fan-library-new(); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            Text {
+                                text: Workbench.tr("fan_profile.name");
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            fan-library-name := LineEdit {
+                                width: Theme.field-width;
+                                accessible-label: Workbench.tr("fan_profile.name");
+                                text <=> Workbench.fan-library-name;
+                                enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                edited(value) => { Workbench.fan-library-name-edited(value); }
+                            }
+
+                            Rectangle {
+                                width: Theme.control-height + 8px;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            edit-fan := ActionButton {
+                                text: Workbench.tr("ui.edit_curve");
+                                enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.open-curve(false); }
+                            }
+
+                            fan-library-reset := ActionButton {
+                                text: Workbench.tr("preset.cancel_edit");
+                                control-width: 160px;
+                                enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.fan-library-reset(); }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            ActionButton {
+                                text: Workbench.tr("ui.refresh");
+                                enabled: !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.fan-library-refresh(); }
+                            }
+                        }
+
+                        Text {
+                            text: Workbench.tr("fan_profile.library_note");
+                            color: Theme.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            fan-library-delete := ActionButton {
+                                text: Workbench.tr("preset.delete");
+                                enabled: Workbench.fan-library-saved && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.fan-library-delete(); }
+                            }
+
+                            fan-library-save := ActionButton {
+                                text: Workbench.tr("preset.save");
+                                enabled: Workbench.fan-library-ready && Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.fan-library-save(); }
+                            }
+
+                            fan-library-request := ActionButton {
+                                text: Workbench.tr("preset.apply_button");
+                                primary: true;
+                                enabled: Workbench.fan-library-saved && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.fan-library-request(); }
+                            }
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                        }
+                    }
+                }
+
+                lighting := Rectangle {
+                    visible: Workbench.page == 3 && !Workbench.curve-open;
+                    VerticalLayout {
+                        width: min(Theme.workspace-width,parent.width);
+                        x: (parent.width - self.width) / 2;
+                        padding: 20px;
+                        spacing: 12px;
+                        HorizontalLayout {
+                            SectionTitle {
+                                text: Workbench.tr("ui.lighting");
+                                horizontal-stretch: 1;
+                            }
+
+                            keyboard-layout := ComboBox {
+                                accessible-label: Workbench.tr("lighting.layout");
+                                width: Theme.field-width;
+                                model: ["Deutsch · QWERTZ", "English · QWERTY"];
+                                current-index: Workbench.keyboard-german ? 0 : 1;
+                                enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                selected(value) => { Workbench.keyboard-layout(self.current-index == 0); }
+                            }
+
+                            lighting-power := ActionButton {
+                                text: Workbench.lighting-on ? Workbench.tr("common.on") : Workbench.tr("common.off");
+                                enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.lighting-power(); }
+                            }
+
+                            Text {
+                                text: Workbench.lighting-dirty ? Workbench.tr("lighting.preview") : "";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        lighting-scroll := ScrollView {
+                            content-width: self.visible-width - 12px;
+                            content-height: lighting-content.preferred-height;
+                            lighting-content := VerticalLayout {
+                                height: self.preferred-height;
+                                y: 0px;
+                                spacing: 12px;
+                                keyboard-preview := KeyboardPreview {
+                                    keys: Workbench.keyboard-keys;
+                                    colors: Workbench.zone-colors;
+                                    selected: Workbench.lighting-group;
+                                    enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                    selected-group(index) => { Workbench.select-lighting-group(index); }
+                                }
+
+                                lighting-groups := SegmentedTabs {
+                                    enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                    labels: [
+                                        Workbench.tr("lighting.wasd"),
+                                        Workbench.tr("lighting.zone_left"),
+                                        Workbench.tr("lighting.zone_middle"),
+                                        Workbench.tr("lighting.numpad_right")
+                                    ];
+                                    selected: Workbench.lighting-group;
+                                    changed(index) => { Workbench.select-lighting-group(index); }
+                                }
+
+                                HorizontalLayout {
+                                    Text {
+                                        text: Workbench.tr("lighting.color");
+                                        color: Theme.ink;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    lighting-color := ColorField {
+                                        text: Workbench.tr("lighting.color");
+                                        value: Workbench.lighting-color;
+                                        mixed: Workbench.lighting-color == "";
+                                        swatch-color: Workbench.zone-colors[3 - Workbench.lighting-group];
+                                        enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.pick-lighting-color(); }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    Text {
+                                        text: Workbench.tr("lighting.brightness");
+                                        color: Theme.ink;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    lighting-value := Rectangle {
+                                        width: Theme.field-width;
+                                        height: Theme.control-height;
+                                        border-radius: 6px;
+                                        border-width: 1px;
+                                        border-color: lighting-brightness.has-focus || lighting-slider.has-focus ? Theme.accent : Theme.line;
+                                        background: Theme.control;
+                                        HorizontalLayout {
+                                            padding-left: 4px;
+                                            padding-right: 8px;
+                                            spacing: 8px;
+                                            lighting-slider := BrightnessSlider {
+                                                accessible-label: Workbench.tr("lighting.brightness");
+                                                value: Workbench.lighting-level;
+                                                enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                edited(value) => { Workbench.lighting-level-edited(value); }
+                                            }
+
+                                            lighting-brightness := LineEdit {
+                                                width: 60px;
+                                                background: transparent;
+                                                border-width: 0px;
+                                                accessible-label: Workbench.tr("lighting.brightness");
+                                                text <=> Workbench.lighting-brightness;
+                                                placeholder-text: Workbench.tr("lighting.mixed");
+                                                enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                edited(value) => { Workbench.edit-lighting-brightness(value); }
+                                            }
+
+                                            Text {
+                                                text: "%";
+                                                color: Theme.muted;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if Workbench.lighting-error != "": Text {
+                                    text: Workbench.lighting-error;
+                                    color: Theme.error;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            lighting-reset := ActionButton {
+                                text: Workbench.tr("ui.reset_draft");
+                                enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.reset-lighting(); }
+                            }
+
+                            lighting-refresh := ActionButton {
+                                text: Workbench.tr("ui.refresh");
+                                enabled: !Workbench.busy && !Workbench.lighting-dirty && Workbench.lighting-error == "" && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.refresh-lighting(); }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            lighting-apply := ActionButton {
+                                text: Workbench.tr("preset.apply_button");
+                                accessible-description: Workbench.lighting-confirmed;
+                                primary: true;
+                                enabled: Workbench.lighting-ready && Workbench.lighting-dirty && Workbench.lighting-error == "" && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.apply-lighting(); }
+                            }
+                        }
+                    }
+                }
+
+                settings := ScrollView {
+                    content-width: self.visible-width - 12px;
+                    content-height: settings-content.preferred-height;
+                    visible: Workbench.page == 4 && !Workbench.curve-open;
+                    settings-content := VerticalLayout {
+                        width: min(Theme.workspace-width,parent.width);
+                        x: (parent.width - self.width) / 2;
+                        y: 0px;
+                        height: self.preferred-height;
+                        padding: 20px;
+                        spacing: 14px;
+                        SectionTitle {
+                            text: Workbench.tr("settings.title");
+                        }
+
+                        SectionTitle {
+                            text: Workbench.tr("settings.appearance");
+                        }
+
+                        palette-selector := ThemeGallery {
+                            choices: Workbench.palette-choices;
+                            selected: Workbench.palette-index;
+                            enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                            changed(index) => { Workbench.palette-changed(index); }
+                        }
+
+                        HorizontalLayout {
+                            Text {
+                                text: Workbench.tr("settings.background");
+                                color: Theme.ink;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            color-background := ColorField {
+                                text: Workbench.tr("settings.background");
+                                value: Workbench.color-background;
+                                swatch-color: Workbench.background-preview;
+                                enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.open-color-picker(0); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            Text {
+                                text: Workbench.tr("settings.foreground");
+                                color: Theme.ink;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            color-foreground := ColorField {
+                                text: Workbench.tr("settings.foreground");
+                                value: Workbench.color-foreground;
+                                swatch-color: Workbench.foreground-preview;
+                                enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.open-color-picker(1); }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            Text {
+                                text: Workbench.tr("settings.accent");
+                                color: Theme.ink;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            color-accent := ColorField {
+                                text: Workbench.tr("settings.accent");
+                                value: Workbench.color-accent;
+                                swatch-color: Workbench.accent-preview;
+                                enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.open-color-picker(2); }
+                            }
+                        }
+
+                        Text {
+                            text: Workbench.appearance-error != "" ? Workbench.appearance-error : Workbench.tr("settings.palette_note");
+                            color: Workbench.appearance-error != "" ? Theme.error : Theme.muted;
+                            wrap: word-wrap;
+                            font-size: 12px;
+                        }
+
+                        HorizontalLayout {
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            reset-appearance := ActionButton {
+                                text: Workbench.tr("settings.reset_palette");
+                                enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.reset-appearance(); }
+                            }
+                        }
+
+                        Hairline { }
+
+                        SectionTitle {
+                            text: Workbench.tr("settings.general");
+                        }
+
+                        HorizontalLayout {
+                            Text {
+                                text: Workbench.tr("settings.language");
+                                color: Theme.ink;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            language := ComboBox {
+                                width: Theme.field-width;
+                                model: [Workbench.tr("settings.language_system"), "Deutsch", "English"];
+                                current-index <=> Workbench.language-index;
+                                enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                selected(value) => { Workbench.settings-changed(); }
+                            }
+                        }
+
+                        Text {
+                            text: Workbench.tr("settings.restart_note");
+                            color: Theme.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        autostart := CheckBox {
+                            text: Workbench.tr("settings.autostart");
+                            checked <=> Workbench.autostart;
+                            enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                            toggled => { Workbench.settings-changed(); }
+                        }
+
+                        tray-start := CheckBox {
+                            text: Workbench.tr("settings.start_in_tray");
+                            checked <=> Workbench.start-in-tray;
+                            enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                            toggled => { Workbench.settings-changed(); }
+                        }
+
+                        HorizontalLayout {
+                            Text {
+                                text: Workbench.tr("settings.close");
+                                color: Theme.ink;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            close-behavior := ComboBox {
+                                width: Theme.field-width;
+                                model: [Workbench.tr("settings.close_tray"), Workbench.tr("settings.close_exit")];
+                                current-index <=> Workbench.close-index;
+                                enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                selected(value) => { Workbench.settings-changed(); }
+                            }
+                        }
+
+                        Hairline { }
+
+                        hold := CheckBox {
+                            text: Workbench.tr("settings.hold_preset");
+                            checked <=> Workbench.hold-preset;
+                            enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                            toggled => { Workbench.settings-changed(); }
+                        }
+
+                        Text {
+                            text: Workbench.tr("settings.startup_note");
+                            color: Theme.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        Hairline { }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: Workbench.tr("settings.gpu_tgp_max");
+                                color: Theme.ink;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+
+                            gpu-tgp-max := LineEdit {
+                                accessible-label: Workbench.tr("settings.gpu_tgp_max");
+                                text <=> Workbench.gpu-tgp-max-w;
+                                unit: "W";
+                                width: Theme.number-width;
+                                horizontal-stretch: 0;
+                                enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                edited(text) => { Workbench.settings-changed(); }
+                            }
+                        }
+
+                        Text {
+                            text: Workbench.gpu-tgp-max-error != "" ? Workbench.gpu-tgp-max-error : Workbench.tr("settings.gpu_tgp_max_warning");
+                            color: Workbench.gpu-tgp-max-error != "" ? Theme.error : Theme.warning;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            settings-save := ActionButton {
+                                text: Workbench.tr("preset.save");
+                                min-width: 110px;
+                                max-width: 140px;
+                                primary: Workbench.settings-dirty;
+                                enabled: (Workbench.settings-ready && Workbench.settings-dirty && Workbench.appearance-error == "" && Workbench.gpu-tgp-max-error == "" && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.save-settings(); }
+                            }
+                        }
+
+                        Hairline { }
+
+                        SectionTitle {
+                            text: Workbench.tr("settings.device_defaults");
+                        }
+
+                        Text {
+                            text: Workbench.device-defaults-summary != "" ? Workbench.device-defaults-summary : Workbench.tr("settings.device_defaults_note");
+                            color: Theme.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            ActionButton {
+                                text: Workbench.tr("settings.detect_defaults");
+                                control-width: Theme.field-width;
+                                enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.detect-defaults(); }
+                            }
+
+                            Text {
+                                text: Workbench.tr("settings.detect_defaults_note");
+                                color: Theme.muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                        }
+
+                        Hairline { }
+
+                        HorizontalLayout {
+                            ActionButton {
+                                text: Workbench.hp-disabled ? Workbench.tr("ui.hp_restore") : Workbench.tr("settings.hp_service");
+                                control-width: Theme.field-width;
+                                enabled: (Workbench.hp-available && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.hp-service(); }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            ActionButton {
+                                enabled: Workbench.confirm-kind == 0;
+                                text: Workbench.tr("ui.about");
+                                control-width: Theme.field-width;
+                                clicked => { Workbench.show-about(); }
+                            }
+                        }
+                    }
+                }
+
+                curve-editor := ScrollView {
+                    content-width: self.visible-width - 12px;
+                    visible: Workbench.curve-open;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 10px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            SectionTitle {
+                                text: Workbench.curve-title;
+                                horizontal-stretch: 1;
+                            }
+
+                            // Mouse and keyboard reference for the chart (also F1).
+                            curve-help := ActionButton {
+                                enabled: Workbench.confirm-kind == 0;
+                                text: "i";
+                                border-radius: self.height / 2;
+                                accessible-label: Workbench.tr("curve.shortcuts");
+                                clicked => { Workbench.curve-action("help"); }
+                            }
+
+                            ActionButton {
+                                enabled: Workbench.confirm-kind == 0;
+                                text: Workbench.tr("ui.back");
+                                clicked => { Workbench.curve-action("close"); }
+                            }
+
+                            ActionButton {
+                                text: Workbench.tr("ui.use_curve");
+                                primary: true;
+                                enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                clicked => { Workbench.curve-action("save"); }
+                            }
+                        }
+
+                        Text {
+                            text: Workbench.tr(Workbench.curve-gpu ? "ui.curve_draft_note" : "fan_profile.curve_draft_note");
+                            color: Theme.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        chart := CurveCanvas {
+                            preferred-height: max(240px, curve-editor.visible-height - 186px);
+                        }
+
+                        // Legend, then the selected point with its exact value.
+                        // Every other action is on the chart: mouse and hotkeys (i).
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 18px;
+                                    height: 2px;
+                                    background: Theme.accent;
+                                }
+                            }
+
+                            Text {
+                                text: Workbench.tr("ui.curve_draft");
+                                color: Theme.muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 18px;
+                                    height: 1px;
+                                    background: Theme.muted;
+                                }
+                            }
+
+                            Text {
+                                text: Workbench.tr(Workbench.curve-driver-reference ? "curve.legend_driver" : "ui.curve_reference");
+                                color: Theme.muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+
+                            Text {
+                                text: Workbench.has-selection ? Workbench.selection-label : "";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: Workbench.point-labels[Workbench.point-index];
+                                color: Theme.ink;
+                                font-family: "Consolas";
+                                vertical-alignment: center;
+                            }
+
+                            if !Workbench.curve-gpu: LineEdit {
+                                accessible-label: Workbench.curve-x-label;
+                                text <=> Workbench.point-x;
+                                enabled: Workbench.confirm-kind == 0;
+                                width: 72px;
+                                accepted => {
+                                    Workbench.curve-action("set");
+                                    chart.focus();
+                                }
+                            }
+
+                            if !Workbench.curve-gpu: Text {
+                                text: Workbench.curve-x-label;
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                            }
+
+                            // Enter sets the point; with a GPU selection it sets the
+                            // whole selection to this frequency.
+                            point-y := LineEdit {
+                                accessible-label: Workbench.curve-y-label;
+                                text <=> Workbench.point-y;
+                                enabled: Workbench.confirm-kind == 0;
+                                width: 80px;
+                                accepted => {
+                                    Workbench.curve-action(Workbench.curve-gpu && Workbench.has-selection ? "flatten" : "set");
+                                    chart.focus();
+                                }
+                            }
+
+                            Text {
+                                text: Workbench.curve-y-label;
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    notification := NotificationPopup {
+        visible: Workbench.notice-visible && Workbench.confirm-kind == 0;
+        width: min(420px,parent.width - 192px);
+        x: parent.width - self.width - 16px;
+        y: max(48px,parent.height - self.height - 76px);
+        title: Workbench.notice-title;
+        text: Workbench.notice-text;
+        failed: Workbench.notice-failed;
+        dismissed => { Workbench.dismiss-notice(); }
+        details => { Workbench.notice-details(); }
+    }
+
+    if Workbench.confirm-kind == 5: MessageDialog {
+        title: Workbench.notice-title;
+        text: Workbench.notice-text;
+        closed => {
+            Workbench.close-notice-details();
+            if Workbench.curve-open && !Workbench.notice-visible { chart.focus(); } else { notification.focus-details(); }
+        }
+    }
+    if Workbench.confirm-kind == 4: ColorPicker { }
+    if Workbench.confirm-kind > 0 && Workbench.confirm-kind < 4: ConfirmPrompt {
+        kind: Workbench.confirm-kind;
+        save-requested => { Workbench.confirm-save(); }
+        accepted(value) => {
+            Workbench.confirm(value);
+            if Workbench.curve-open { chart.focus(); } else if Workbench.page < 2 { preset-name.focus(); } else { settings-button.focus(); }
+        }
+    }
+}
+
+export component AboutWindow inherits Window {
+    in property <string> window-title;
+    in property <string> version-text;
+    in property <string> close-text;
+    callback dismiss();
+    title: root.window-title;
+    no-frame: true;
+    resize-border-width: 6px;
+    preferred-width: 400px;
+    preferred-height: 320px;
+    min-width: 400px;
+    min-height: 320px;
+    background: Theme.canvas;
+    default-font-family: "Segoe UI";
+    default-font-size: 13px;
+    private property <bool> dark-appearance: Theme.dark;
+    changed dark-appearance => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            height: 40px;
+            background: Theme.surface;
+            WindowMoveArea {
+                x: 6px;
+                width: parent.width - 54px;
+                Text {
+                    x: 10px;
+                    text: root.window-title;
+                    color: Theme.ink;
+                    vertical-alignment: center;
+                }
+            }
+
+            CaptionButton {
+                x: parent.width - 48px;
+                kind: 2;
+                text: root.close-text;
+                clicked => { root.dismiss(); }
+            }
+        }
+
+        VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+            SectionTitle {
+                text: "PerformanceHub";
+            }
+
+            Text {
+                text: root.version-text;
+                color: Theme.muted;
+            }
+
+            AboutSlint {
+                height: 110px;
+            }
+
+            ActionButton {
+                text: root.close-text;
+                clicked => { root.dismiss(); }
+            }
+        }
+    }
+}

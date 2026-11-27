@@ -1,0 +1,234 @@
+# Save-only preset integration. No Apply/Restore/Startup action is invoked.
+#requires -Version 5.1
+param([string]$Executable='')
+$ErrorActionPreference='Stop'
+# UI labels below are German; pin the app language so the checks stay stable.
+$env:OMEN_HUB_LANG = 'de'
+$taskRepo=Split-Path -Parent $PSScriptRoot
+$taskExe=if($Executable){(Resolve-Path -LiteralPath $Executable).Path}else{Join-Path $taskRepo 'dist\Omen Hub++.exe'}
+$taskName='Preset UI '+[Guid]::NewGuid().ToString('N')
+$taskStore=& $taskExe profile-storage|Out-String|ConvertFrom-Json
+$taskProfiles=[IO.Path]::GetFullPath((Join-Path $taskStore.directory 'profiles'))
+$taskFile=$null;$taskProcess=$null;$taskId=$null
+$taskOtherId='preset-switch-test-'+[Guid]::NewGuid().ToString('N')
+$taskOtherFile=Join-Path $taskProfiles ($taskOtherId+'.json')
+$taskOtherCreated=$false
+if(-not('OmenPresetSmoke'-as[type])){
+    Add-Type @'
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class OmenPresetSmoke {
+    public delegate bool EnumWindow(IntPtr hwnd, IntPtr arg);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow callback, IntPtr arg);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumWindow callback, IntPtr arg);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint owner);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd,StringBuilder value,int length);
+    [DllImport("user32.dll",EntryPoint="SendMessageTimeoutW",CharSet=CharSet.Unicode)] static extern IntPtr Read(IntPtr hwnd,uint message,UIntPtr capacity,StringBuilder value,uint flags,uint timeout,out UIntPtr result);
+    [DllImport("user32.dll",EntryPoint="SendMessageTimeoutW",CharSet=CharSet.Unicode)] static extern IntPtr Write(IntPtr hwnd,uint message,UIntPtr parameter,string text,uint flags,uint timeout,out UIntPtr result);
+    public static void SetWindowText(IntPtr hwnd,string text) { UIntPtr result; if (hwnd == IntPtr.Zero || Write(hwnd,0x000C,UIntPtr.Zero,text,2,1000,out result) == IntPtr.Zero) throw new Exception("Cannot set owned test control text"); }
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd,uint message,UIntPtr parameter,IntPtr other);
+    [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd,int id);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll",EntryPoint="SendMessageTimeoutW")] static extern IntPtr Send(IntPtr hwnd,uint message,UIntPtr parameter,IntPtr other,uint flags,uint timeout,out UIntPtr result);
+    public static ulong Message(IntPtr hwnd,uint message,ulong parameter=0,long other=0) { UIntPtr result; if (Send(hwnd,message,(UIntPtr)parameter,(IntPtr)other,2,1000,out result)==IntPtr.Zero) throw new Exception("Owned control did not answer"); return result.ToUInt64(); }
+    [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
+    public static IntPtr Control(IntPtr parent,int id) { var found=GetDlgItem(parent,id); if(found!=IntPtr.Zero)return found; EnumChildWindows(parent,(h,a)=>{if(GetDlgCtrlID(h)==id){found=h;return false;}return true;},IntPtr.Zero);return found; }
+    public static string Caption(IntPtr hwnd) {var text=new StringBuilder(8192);UIntPtr result;Read(hwnd,13,(UIntPtr)text.Capacity,text,2,1000,out result);return text.ToString();}
+    public static IntPtr Labeled(IntPtr parent,string label) {IntPtr found=IntPtr.Zero;EnumChildWindows(parent,(h,a)=>{if(Caption(h)==label){found=h;return false;}return true;},IntPtr.Zero);return found;}
+    public static int Id(IntPtr hwnd) {return GetDlgCtrlID(hwnd);}
+    public static string Item(IntPtr hwnd,int index) {var text=new StringBuilder(512);UIntPtr result;Read(hwnd,0x0148,(UIntPtr)index,text,2,1000,out result);return text.ToString();}
+    public static IntPtr Dialog(uint process) {IntPtr found=IntPtr.Zero;EnumWindows((h,a)=>{uint owner;GetWindowThreadProcessId(h,out owner);var name=new StringBuilder(128);GetClassName(h,name,name.Capacity);if(owner==process&&name.ToString()=="#32770"){found=h;return false;}return true;},IntPtr.Zero);return found;}
+    public static IntPtr Find(uint process) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows((hwnd,arg) => { uint owner; GetWindowThreadProcessId(hwnd,out owner); var name = new StringBuilder(128); GetClassName(hwnd,name,name.Capacity);
+            if (owner == process && name.ToString() == "OmenHubPPPresetEditor") { found = hwnd; return false; } return true; },IntPtr.Zero);
+        return found;
+    }
+    public static string Text(IntPtr parent) {
+        var values = new List<string>();
+        EnumChildWindows(parent,(hwnd,arg) => { var value = new StringBuilder(8192); UIntPtr result; Read(hwnd,0x000D,(UIntPtr)value.Capacity,value,2,500,out result); values.Add(value.ToString()); return true; },IntPtr.Zero);
+        return string.Join("\n",values);
+    }
+}
+'@
+}
+function Read-Json {param([string[]]$ArgsList);$taskRaw=& $taskExe @ArgsList|Out-String;if($LASTEXITCODE-ne0){throw $taskRaw};$taskRaw|ConvertFrom-Json}
+function Wait-Ready {param([IntPtr]$Window,[string]$Pattern='Preset geladen.|Preset gespeichert.|Preset benennen|gewählte Einstellungen|entfernte Optionen')
+ $taskUntil=(Get-Date).AddSeconds(15)
+ do{ $taskText=[OmenPresetSmoke]::Caption([OmenPresetSmoke]::Control($Window,711));if($taskText-match$Pattern-and[OmenPresetSmoke]::IsWindowEnabled([OmenPresetSmoke]::Control($Window,704))){return $taskText};Start-Sleep -Milliseconds 80}while((Get-Date)-lt$taskUntil)
+ throw ('Missing preset state: '+$Pattern+' / '+$taskText)
+}
+function Click {param([IntPtr]$Window,[int]$Id);[void][OmenPresetSmoke]::PostMessage($Window,0x0111,[UIntPtr]::new([uint64]$Id),[OmenPresetSmoke]::Control($Window,$Id))}
+function Set-Included {param([IntPtr]$Window,[int]$Index,[bool]$Included)
+ $taskId=2000+$Index*64;$taskControl=[OmenPresetSmoke]::Control($Window,$taskId)
+ [void][OmenPresetSmoke]::Message($taskControl,0x00F1,[uint64]$Included)
+ Click $Window $taskId
+}
+function Open-Preset {param([string]$Id='')
+ $taskArgs=if($Id){@('presets-ui',$Id)}else{@('presets-ui')}
+ $script:taskProcess=Start-Process -FilePath $taskExe -ArgumentList $taskArgs -PassThru -WindowStyle Hidden
+ $taskUntil=(Get-Date).AddSeconds(15);$taskWindow=[IntPtr]::Zero
+ do{$taskWindow=[OmenPresetSmoke]::Find([uint32]$script:taskProcess.Id);if($taskWindow-ne[IntPtr]::Zero){break};Start-Sleep -Milliseconds 80}while((Get-Date)-lt$taskUntil)
+ if($taskWindow-eq[IntPtr]::Zero){throw 'No owned preset window.'}
+ $null=Wait-Ready $taskWindow
+ return $taskWindow
+}
+function Close-Preset {param([IntPtr]$Window)
+ [void][OmenPresetSmoke]::PostMessage($Window,0x0010,[UIntPtr]::Zero,[IntPtr]::Zero)
+ if(-not$script:taskProcess.WaitForExit(4000)-or$script:taskProcess.ExitCode-ne0){throw 'Preset window did not close cleanly.'}
+ $script:taskProcess.Dispose();$script:taskProcess=$null
+}
+$taskBeforeCurve=Read-Json @('gpu-curve-read')
+$taskControlImage=@($taskBeforeCurve.nodes|ForEach-Object{@($_.index,$_.voltage_uv,$_.delta_khz)})|ConvertTo-Json -Depth 5 -Compress
+$taskFiles=@('control-journal.json','startup.json')|ForEach-Object{Join-Path $taskStore.directory $_}
+$taskMetadataBefore=@($taskFiles|ForEach-Object{if(Test-Path -LiteralPath $_){(Get-FileHash -LiteralPath $_).Hash}else{'absent'}})
+try{
+ $taskWindow=Open-Preset
+ $taskText=[OmenPresetSmoke]::Text($taskWindow)
+ foreach($taskLabel in @('Custom Presets','GPU','CPU','Windows','Anwenden','Speichern','Löschen','Bei Windows-Start aktivieren')){if($taskText-notmatch[regex]::Escape($taskLabel)){throw ('Missing label '+$taskLabel)}}
+ if([OmenPresetSmoke]::Caption([OmenPresetSmoke]::Control($taskWindow,721))-cne'CPU'-or[OmenPresetSmoke]::Caption([OmenPresetSmoke]::Control($taskWindow,722))-cne'Windows'){throw 'CPU and Windows must have independent section headings.'}
+ if($taskText-match'STAPM|PPT Fast|PPT Slow|iGPU|SoC |VCN|Fabric Clock|Data Clock|Oberflächentemperaturlimit'){throw 'An APU/iGPU tuning field remains in the CPU interface.'}
+ if($taskText-match'Radeon Graphics|Super Resolution'){throw 'Excluded option group is still shown.'}
+ [OmenPresetSmoke]::SetWindowText([OmenPresetSmoke]::Control($taskWindow,703),$taskName)
+ Click $taskWindow 1200
+ Set-Included $taskWindow 1 $true
+ [OmenPresetSmoke]::SetWindowText([OmenPresetSmoke]::Control($taskWindow,2065),'-24')
+ if([OmenPresetSmoke]::IsWindowEnabled([OmenPresetSmoke]::Control($taskWindow,705))){throw 'Draft could apply without save.'}
+ Click $taskWindow 704
+ $null=Wait-Ready $taskWindow 'Preset gespeichert.'
+ $taskItem=@(Get-ChildItem -LiteralPath $taskProfiles -Filter '*.json'|Where-Object{(Get-Content -LiteralPath $_.FullName -Raw|ConvertFrom-Json).name-eq$taskName})
+ if($taskItem.Count-ne1){throw 'Created preset not found exactly once.'}
+ $taskFile=$taskItem[0].FullName;$taskProfile=Get-Content -LiteralPath $taskFile -Raw|ConvertFrom-Json;$taskId=$taskProfile.id
+ if(@($taskProfile.settings|Where-Object feature -eq 'gpu_memory_offset_mhz')[0].value.value-ne-24){throw 'GPU memory edit was not saved.'}
+ # The public wattage adapter has its own original/range contract. Editing
+ # and saving exact watts is metadata-only even when this notebook driver
+ # cannot return a restorable current power limit.
+ $taskPower=[OmenPresetSmoke]::Labeled($taskWindow,'GPU-Leistungslimit (W)')
+ if($taskPower-eq[IntPtr]::Zero){throw 'Public GPU power-limit field is missing.'}
+ $taskPowerId=[OmenPresetSmoke]::Id($taskPower)
+ [void][OmenPresetSmoke]::Message($taskPower,0x00F1,1);Click $taskWindow $taskPowerId
+ [OmenPresetSmoke]::SetWindowText([OmenPresetSmoke]::Control($taskWindow,($taskPowerId+1)),'90,125')
+ Click $taskWindow 704;$null=Wait-Ready $taskWindow 'Preset gespeichert.'
+ $taskProfile=Get-Content -LiteralPath $taskFile -Raw|ConvertFrom-Json
+ $taskPowerSetting=@($taskProfile.settings|Where-Object feature -eq 'gpu_power_limit_mw')
+ if($taskPowerSetting.Count-ne1-or$taskPowerSetting[0].value.value-ne90125){throw 'GPU power watts did not save as exact milliwatts.'}
+ $taskPowerPlan=Read-Json @('profile-plan',$taskId)
+ $taskPowerCapability=@($taskPowerPlan.capabilities|Where-Object feature -eq 'gpu_power_limit_mw')
+ if($taskPowerCapability.Count-ne1){throw 'Public GPU power capability missing from plan.'}
+ if($taskPowerCapability[0].access-cne'read_write'-and($taskPowerPlan.applicable-or[OmenPresetSmoke]::IsWindowEnabled([OmenPresetSmoke]::Control($taskWindow,705)))){throw 'Unavailable driver power control was incorrectly made applicable.'}
+ [void][OmenPresetSmoke]::Message($taskPower,0x00F1,0);Click $taskWindow $taskPowerId
+ Click $taskWindow 704;$null=Wait-Ready $taskWindow 'Preset gespeichert.'
+ $taskProfile=Get-Content -LiteralPath $taskFile -Raw|ConvertFrom-Json
+ if(@($taskProfile.settings|Where-Object feature -eq 'gpu_power_limit_mw').Count-ne0){throw 'Unchecked GPU power limit was not omitted.'}
+ # Dynamic Boost remains an explicit profile option, including false. The
+ # qualified HP flag is available for Apply; Save alone never authorizes startup.
+ $taskBoost=[OmenPresetSmoke]::Labeled($taskWindow,'Dynamic Boost')
+ if($taskBoost-eq[IntPtr]::Zero){throw 'Required Dynamic Boost option is missing.'}
+ $taskBoostId=[OmenPresetSmoke]::Id($taskBoost)
+ [void][OmenPresetSmoke]::Message($taskBoost,0x00F1,1);Click $taskWindow $taskBoostId
+ foreach($taskOn in @($true,$false)){
+  $taskChoice=[OmenPresetSmoke]::Control($taskWindow,($taskBoostId+1))
+  [void][OmenPresetSmoke]::Message($taskChoice,0x014E,[uint64]$taskOn)
+  [void][OmenPresetSmoke]::PostMessage($taskWindow,0x0111,[UIntPtr]::new([uint64](($taskBoostId+1)-bor(1-shl16))),$taskChoice)
+  Click $taskWindow 704;$null=Wait-Ready $taskWindow 'Preset gespeichert.'
+  $taskProfile=Get-Content -LiteralPath $taskFile -Raw|ConvertFrom-Json
+  $taskSetting=@($taskProfile.settings|Where-Object feature -eq 'gpu_unleashed')
+  if($taskSetting.Count-ne1-or$taskSetting[0].value.value-ne$taskOn-or[OmenPresetSmoke]::Message($taskChoice,0x0147)-ne[uint64]$taskOn){throw 'Dynamic Boost Ein/Aus did not save/reload exactly.'}
+  $taskPlan=Read-Json @('profile-plan',$taskId)
+  $taskBoostCapability=@($taskPlan.capabilities|Where-Object feature -eq 'gpu_unleashed')
+  if(-not$taskPlan.applicable-or$taskBoostCapability.Count-ne1-or$taskBoostCapability[0].access-cne'read_write'-or-not$taskBoostCapability[0].startup_safe-or-not[OmenPresetSmoke]::IsWindowEnabled([OmenPresetSmoke]::Control($taskWindow,705))-or-not[OmenPresetSmoke]::IsWindowEnabled([OmenPresetSmoke]::Control($taskWindow,707))){throw 'Qualified Dynamic Boost apply/startup controls are wrong.'}
+ }
+ [void][OmenPresetSmoke]::Message($taskBoost,0x00F1,0);Click $taskWindow $taskBoostId
+ Click $taskWindow 704;$null=Wait-Ready $taskWindow 'Preset gespeichert.'
+ $taskProfile=Get-Content -LiteralPath $taskFile -Raw|ConvertFrom-Json
+ if(@($taskProfile.settings|Where-Object feature -eq 'gpu_unleashed').Count-ne0){throw 'Unchecked Dynamic Boost was not omitted.'}
+ Close-Preset $taskWindow
+ # Import a full curve, hidden lighting, a retired Intel entry and unsupported brightness as metadata.
+ $taskPoints=@($taskBeforeCurve.nodes|ForEach-Object{[ordered]@{voltage_mv=[uint32]($_.voltage_uv/1000);frequency_mhz=[uint32]($_.frequency_khz/1000)}})
+ $taskProfile.settings=@($taskProfile.settings)+@([pscustomobject]@{feature='gpu_vf_curve';value=[pscustomobject]@{kind='vf_curve';value=$taskPoints}},[pscustomobject]@{feature='keyboard_colors';value=[pscustomobject]@{kind='colors';value=@(@(1,2,3),@(4,5,6),@(7,8,9),@(10,11,12))}},[pscustomobject]@{feature='intel_pl1_mw';value=[pscustomobject]@{kind='integer';value=45000}},[pscustomobject]@{feature='keyboard_brightness';value=[pscustomobject]@{kind='integer';value=50}},[pscustomobject]@{feature='windows_power_plan';value=[pscustomobject]@{kind='choice';value='balanced'}})
+ $taskCurveJson=$taskPoints|ConvertTo-Json -Depth 6 -Compress
+ [IO.File]::WriteAllText($taskFile,($taskProfile|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+ Read-Json @('profile-create',$taskOtherId,'Other preset for discard check')|Out-Null;$taskOtherCreated=$true
+ $taskOtherHash=(Get-FileHash -LiteralPath $taskOtherFile).Hash
+ $taskWindow=Open-Preset $taskId
+ [OmenPresetSmoke]::SetWindowText([OmenPresetSmoke]::Control($taskWindow,703),($taskName+' edited'))
+ # Reject switching dirty A to B: the native selection, draft and save target
+ # must all remain A. Only our own process's discard dialog is answered.
+ $taskSelect=[OmenPresetSmoke]::Control($taskWindow,701)
+ $taskLoadedIndex=[OmenPresetSmoke]::Message($taskSelect,0x0147)
+ $taskOtherIndex=-1
+ for($taskI=1;$taskI-lt[OmenPresetSmoke]::Message($taskSelect,0x0146);$taskI++){if([OmenPresetSmoke]::Item($taskSelect,$taskI)-ceq'Other preset for discard check'){$taskOtherIndex=$taskI;break}}
+ if($taskOtherIndex-lt1){throw 'Switch-test preset is missing.'}
+ [void][OmenPresetSmoke]::Message($taskSelect,0x014E,[uint64]$taskOtherIndex)
+ [void][OmenPresetSmoke]::PostMessage($taskWindow,0x0111,[UIntPtr]::new([uint64]0x000102BD),$taskSelect)
+ $taskUntil=(Get-Date).AddSeconds(5)
+ do{$taskDialog=[OmenPresetSmoke]::Dialog([uint32]$taskProcess.Id);if($taskDialog-ne[IntPtr]::Zero){break};Start-Sleep -Milliseconds 50}while((Get-Date)-lt$taskUntil)
+ if($taskDialog-eq[IntPtr]::Zero){throw 'No owned discard confirmation.'}
+ [void][OmenPresetSmoke]::PostMessage($taskDialog,0x0111,[UIntPtr]::new([uint64]7),[OmenPresetSmoke]::Control($taskDialog,7))
+ $taskUntil=(Get-Date).AddSeconds(5)
+ do{if([OmenPresetSmoke]::Dialog([uint32]$taskProcess.Id)-eq[IntPtr]::Zero-and[OmenPresetSmoke]::Message($taskSelect,0x0147)-eq$taskLoadedIndex){break};Start-Sleep -Milliseconds 50}while((Get-Date)-lt$taskUntil)
+ if([OmenPresetSmoke]::Message($taskSelect,0x0147)-ne$taskLoadedIndex-or[OmenPresetSmoke]::Caption([OmenPresetSmoke]::Control($taskWindow,703))-cne($taskName+' edited')){throw 'Declined switch lost the loaded preset identity or dirty name.'}
+ # Concurrent changes to hidden fields must be retained by Save.
+ $taskFresh=Get-Content -LiteralPath $taskFile -Raw|ConvertFrom-Json
+ @($taskFresh.settings|Where-Object feature -eq 'keyboard_colors')[0].value.value[0][0]=22
+ [IO.File]::WriteAllText($taskFile,($taskFresh|ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+ Click $taskWindow 1201
+ $taskPpt=[OmenPresetSmoke]::Labeled($taskWindow,'Fast-Limit (PPT) (W)')
+ if($taskPpt-eq[IntPtr]::Zero){throw 'CPU PPT field is missing.'}
+ $taskPptId=[OmenPresetSmoke]::Id($taskPpt)
+ [void][OmenPresetSmoke]::Message($taskPpt,0x00F1,1);Click $taskWindow $taskPptId
+ [OmenPresetSmoke]::SetWindowText([OmenPresetSmoke]::Control($taskWindow,($taskPptId+1)),'45,125')
+ Click $taskWindow 1205
+ $taskEpp=[OmenPresetSmoke]::Labeled($taskWindow,'Energiepräferenz (EPP) (%)')
+ if($taskEpp-eq[IntPtr]::Zero){throw 'Windows EPP field is missing.'}
+ $taskEppId=[OmenPresetSmoke]::Id($taskEpp)
+ [void][OmenPresetSmoke]::Message($taskEpp,0x00F1,1);Click $taskWindow $taskEppId
+ [OmenPresetSmoke]::SetWindowText([OmenPresetSmoke]::Control($taskWindow,($taskEppId+1)),'74')
+ Click $taskWindow 1206
+ $taskEnergy=[OmenPresetSmoke]::Labeled($taskWindow,'Windows-Energiemodus')
+ if($taskEnergy-eq[IntPtr]::Zero){throw 'Windows energy mode is missing.'}
+ $taskEnergyId=[OmenPresetSmoke]::Id($taskEnergy)
+ [void][OmenPresetSmoke]::Message($taskEnergy,0x00F1,1);Click $taskWindow $taskEnergyId
+ $taskEnergyChoice=[OmenPresetSmoke]::Control($taskWindow,($taskEnergyId+1))
+ [void][OmenPresetSmoke]::Message($taskEnergyChoice,0x014E,2)
+ [void][OmenPresetSmoke]::PostMessage($taskWindow,0x0111,[UIntPtr]::new([uint64](($taskEnergyId+1)-bor(1-shl16))),$taskEnergyChoice)
+ Click $taskWindow 704
+ $null=Wait-Ready $taskWindow 'Preset gespeichert.'
+ $taskProfile=Get-Content -LiteralPath $taskFile -Raw|ConvertFrom-Json
+ if(@($taskProfile.settings|Where-Object feature -eq 'cpu_ppt_limit_mw')[0].value.value-ne45125){throw 'CPU PPT watts were not saved in exact milliwatts.'}
+ if(@($taskProfile.settings|Where-Object feature -eq 'windows_processor_epp_percent')[0].value.value-ne74-or@($taskProfile.settings|Where-Object feature -eq 'windows_energy_mode')[0].value.value-cne'best_performance'-or[OmenPresetSmoke]::Caption([OmenPresetSmoke]::Control($taskWindow,($taskEppId+1)))-cne'74'-or[OmenPresetSmoke]::Message($taskEnergyChoice,0x0147)-ne2){throw 'Separate Windows settings did not save/reload exactly.'}
+ if((@($taskProfile.settings|Where-Object feature -eq 'gpu_vf_curve')[0].value.value|ConvertTo-Json -Depth 6 -Compress)-cne$taskCurveJson){throw 'Full custom curve was changed by unrelated editing.'}
+ if(@($taskProfile.settings|Where-Object feature -eq 'keyboard_colors')[0].value.value[0][0]-ne22){throw 'Concurrent hidden setting was overwritten.'}
+ if($taskProfile.id-cne$taskId-or(Get-FileHash -LiteralPath $taskOtherFile).Hash-cne$taskOtherHash){throw 'Save after declined switch changed the wrong preset.'}
+ if(@($taskProfile.settings|Where-Object feature -like 'intel_*').Count-ne0){throw 'Explicit Save retained removed Intel settings.'}
+ $taskInvalidPlan=Read-Json @('profile-plan',$taskId)
+ if($taskInvalidPlan.applicable-or[OmenPresetSmoke]::IsWindowEnabled([OmenPresetSmoke]::Control($taskWindow,705))){throw 'Unsupported full preset became applicable.'}
+ # The startup checkbox permits choosing intent; the worker must reject this
+ # unsupported revision before UAC, hardware apply or logon authorization.
+ [void][OmenPresetSmoke]::Message([OmenPresetSmoke]::Control($taskWindow,707),0x00F1,1)
+ Click $taskWindow 707
+ $null=Wait-Ready $taskWindow 'noch nicht für den Windows-Start freigegeben'
+ if([OmenPresetSmoke]::Message([OmenPresetSmoke]::Control($taskWindow,707),0x00F0)-ne0){throw 'Rejected startup request left its checkbox enabled.'}
+ Click $taskWindow 706
+ $null=Wait-Ready $taskWindow 'Preset gelöscht.'
+ if(Test-Path -LiteralPath $taskFile){throw 'Delete left the preset selectable.'}
+ $taskArchiveRoot=[IO.Path]::GetFullPath((Join-Path $taskStore.directory 'deleted-profiles'))
+ $taskArchived=@(Get-ChildItem -LiteralPath $taskArchiveRoot -Filter ($taskId+'-*.json'))
+ if($taskArchived.Count-ne1){throw 'Delete did not preserve one exact archived preset.'}
+ $taskArchivedProfile=Get-Content -LiteralPath $taskArchived[0].FullName -Raw|ConvertFrom-Json
+ if($taskArchivedProfile.name-ne($taskName+' edited')){throw 'Archived preset differs.'}
+ Close-Preset $taskWindow
+ $taskAfterCurve=Read-Json @('gpu-curve-read')
+ $taskAfterImage=@($taskAfterCurve.nodes|ForEach-Object{@($_.index,$_.voltage_uv,$_.delta_khz)})|ConvertTo-Json -Depth 5 -Compress
+ $taskMetadataAfter=@($taskFiles|ForEach-Object{if(Test-Path -LiteralPath $_){(Get-FileHash -LiteralPath $_).Hash}else{'absent'}})
+ if($taskControlImage-cne$taskAfterImage-or($taskMetadataBefore-join',')-cne($taskMetadataAfter-join',')){throw 'Metadata test changed programmed controls or main journal/startup.'}
+ [pscustomobject]@{measured_at=(Get-Date).ToString('o');binary_sha256=(Get-FileHash -LiteralPath $taskExe).Hash;create_save_delete=$true;public_gpu_power_metadata=$true;dynamic_boost_on_off_save_reload=$true;dynamic_boost_qualified_apply=$true;saved_only_startup_blocked=$true;cpu_apu_fields_absent=$true;windows_separate_section=$true;windows_values_save_reload=$true;declined_switch_keeps_identity_draft_save_target=$true;cpu_gpu_separate=$true;exact_watt_units=$true;custom_curve_preserved=$true;concurrent_hidden_fields_preserved=$true;unsupported_apply_startup_blocked=$true;hardware_writes=$false;gpu_controls_and_metadata_unchanged=$true;clean_exit=$true}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $taskRepo '.local\presets-ui-smoke.json') -Encoding UTF8
+ 'Native custom presets: create, exact units, merged full curve/hidden fields, save/delete, blocked unsafe apply/startup and unchanged hardware passed.'
+}finally{
+ if($taskProcess){$taskProcess.Refresh();if(-not$taskProcess.HasExited){Stop-Process -Id $taskProcess.Id};$taskProcess.Dispose()}
+ if($taskFile-and(Test-Path -LiteralPath $taskFile)){if([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($taskFile))-cne$taskProfiles){throw 'Preset cleanup escaped its directory.'};Remove-Item -LiteralPath $taskFile}
+ if($taskOtherCreated-and(Test-Path -LiteralPath $taskOtherFile)){if([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($taskOtherFile))-cne$taskProfiles){throw 'Switch-test cleanup escaped profiles.'};Remove-Item -LiteralPath $taskOtherFile}
+ if($taskId){$taskArchiveRoot=[IO.Path]::GetFullPath((Join-Path $taskStore.directory 'deleted-profiles'));if(Test-Path -LiteralPath $taskArchiveRoot){Get-ChildItem -LiteralPath $taskArchiveRoot -Filter ($taskId+'-*.json')|ForEach-Object{if([IO.Path]::GetDirectoryName($_.FullName)-cne$taskArchiveRoot){throw 'Archive cleanup escaped its directory.'};Remove-Item -LiteralPath $_.FullName}}}
+}

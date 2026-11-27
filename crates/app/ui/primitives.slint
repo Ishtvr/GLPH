@@ -1,0 +1,195 @@
+import { Theme } from "theme.slint";
+
+export component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    out property <bool> keyboard-focus: focus.has-focus;
+    callback clicked();
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    in property <length> control-width: root.text == "+" || root.text == "−" || root.text == "i" ? Theme.control-height : Theme.action-width;
+    min-width: root.control-width;
+    preferred-width: root.control-width;
+    max-width: root.control-width;
+    min-height: Theme.control-height;
+    max-height: Theme.control-height;
+    vertical-stretch: 0;
+    horizontal-stretch: 0;
+    border-radius: 6px;
+    // Pressed text retains one of the validated foreground/background pairs.
+    background: !root.enabled ? Theme.surface : root.primary ? Theme.accent : area.pressed || area.has-hover ? Theme.hover : Theme.control;
+    border-width: 1px;
+    border-color: root.enabled && (area.pressed || focus.has-focus) ? root.primary ? Theme.on-accent : Theme.accent : transparent;
+    label := Text {
+        x: 8px;
+        y: 0px;
+        width: max(0px,parent.width - 16px);
+        height: parent.height;
+        text: root.text;
+        color: !root.enabled ? Theme.quiet : root.primary ? Theme.on-accent : Theme.ink;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: word-wrap;
+        accessible-role: none;
+    }
+
+    @children
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { focus.focus(); root.clicked(); }
+    }
+
+    focus := FocusScope {
+        x: 0px;
+        width: 0px;
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if (e.text == " " || e.text == Key.Return) { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+}
+
+// Round "i" that opens the explanation of a row. The circle is 20 px; the
+// pointer and keyboard target keeps the control height.
+export component InfoButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> active;
+    callback clicked();
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    min-width: Theme.info-width;
+    max-width: Theme.info-width;
+    min-height: Theme.control-height;
+    max-height: Theme.control-height;
+    vertical-stretch: 0;
+    horizontal-stretch: 0;
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 20px;
+        height: 20px;
+        border-radius: 10px;
+        border-width: focus.has-focus ? 2px : 1px;
+        border-color: !root.enabled ? Theme.line : focus.has-focus || root.active ? Theme.accent : area.has-hover ? Theme.ink : Theme.muted;
+        background: area.pressed || area.has-hover || root.active ? Theme.hover : transparent;
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "i";
+            color: root.enabled ? Theme.ink : Theme.quiet;
+            font-size: 12px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { focus.focus(); root.clicked(); }
+    }
+
+    focus := FocusScope {
+        x: 0px;
+        width: 0px;
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if (e.text == " " || e.text == Key.Return) { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+}
+
+export component SegmentedTabs inherits Rectangle {
+    in property <[string]> labels;
+    in property <bool> enabled: true;
+    in-out property <int> selected;
+    callback changed(int);
+    height: Theme.control-height;
+    background: transparent;
+    border-radius: 6px;
+    // Selection and keyboard outline belong to the same equal-sized control.
+    // An independent moving background used to disagree with intrinsic widths.
+    for title[index] in root.labels: tab := ActionButton {
+        enabled: root.enabled;
+        x: index * root.width / max(1, root.labels.length);
+        width: root.width / max(1, root.labels.length);
+        control-width: root.width / max(1, root.labels.length);
+        text: title;
+        background: index == root.selected ? Theme.hover : transparent;
+        accessible-item-selectable: true;
+        accessible-item-selected: index == root.selected;
+        clicked => { root.changed(index); }
+    }
+}
+
+export component Hairline inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
+}
+
+export component SectionTitle inherits Text {
+    color: Theme.ink;
+    font-size: 15px;
+    font-weight: 600;
+    vertical-alignment: center;
+    height: 32px;
+}
+
+export component SectionHeader inherits Rectangle {
+    in property <string> text;
+    in property <bool> expanded;
+    callback clicked();
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+    height: Theme.control-height;
+    background: Theme.surface;
+    border-radius: 6px;
+    border-width: focus.has-focus ? 1px : 0px;
+    border-color: Theme.accent;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        Text {
+            text: root.text;
+            color: Theme.ink;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        Path {
+            y: 14px;
+            width: 12px;
+            height: 8px;
+            stroke: Theme.muted;
+            stroke-width: 1.5px;
+            commands: root.expanded ? "M 1 6 L 6 1 L 11 6" : "M 1 1 L 6 6 L 11 1";
+        }
+    }
+
+    TouchArea {
+        clicked => { focus.focus(); root.clicked(); }
+    }
+
+    focus := FocusScope {
+        x: 0px;
+        width: 0px;
+        key-pressed(e) => {
+            if e.text == " " || e.text == Key.Return { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+}

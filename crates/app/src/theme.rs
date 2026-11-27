@@ -1,0 +1,769 @@
+//! Shared dark native surfaces. Windows retains control roles and keyboard
+//! behavior. GDI objects have bounded lifetimes; no continuous render timer.
+use std::ptr;
+use windows_sys::Win32::{
+    Foundation::*,
+    Graphics::{Dwm::*, Gdi::*},
+    UI::{
+        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+        Controls::{
+            COMBOBOXINFO, DRAWITEMSTRUCT, EM_SETSEL, GetComboBoxInfo, ODS_DISABLED, ODS_FOCUS,
+            ODS_SELECTED, SetWindowTheme, WM_MOUSELEAVE,
+        },
+        Input::KeyboardAndMouse::{GetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
+        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+        WindowsAndMessaging::*,
+    },
+};
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+pub const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+}
+pub const BACKGROUND: COLORREF = rgb(16, 18, 21);
+pub const PANEL: COLORREF = rgb(25, 29, 34);
+pub const FIELD: COLORREF = rgb(36, 43, 51);
+pub const BORDER: COLORREF = rgb(101, 120, 136);
+pub const FOREGROUND: COLORREF = rgb(237, 242, 247);
+pub const MUTED: COLORREF = rgb(166, 177, 188);
+pub const ACCENT: COLORREF = rgb(104, 219, 191);
+pub const ACCENT_INK: COLORREF = rgb(11, 28, 23);
+pub const ERROR: COLORREF = rgb(247, 167, 167);
+const HOVER: &str = "OmenHubPP.Hover";
+const SURFACE: &str = "OmenHubPP.Surface";
+const MUTED_PROP: &str = "OmenHubPP.Muted";
+const ERROR_PROP: &str = "OmenHubPP.Error";
+pub struct Theme {
+    pub background: HBRUSH,
+    pub panel: HBRUSH,
+    pub field: HBRUSH,
+    pub body: HFONT,
+    pub small: HFONT,
+    pub heading: HFONT,
+    pub title: HFONT,
+    pub metric: HFONT,
+    pub high_contrast: bool,
+}
+impl Theme {
+    pub fn new() -> Self {
+        unsafe {
+            let mut hc: HIGHCONTRASTW = std::mem::zeroed();
+            hc.cbSize = size_of::<HIGHCONTRASTW>() as u32;
+            let high_contrast = SystemParametersInfoW(
+                SPI_GETHIGHCONTRAST,
+                hc.cbSize,
+                (&mut hc as *mut HIGHCONTRASTW).cast(),
+                0,
+            ) != 0
+                && hc.dwFlags & HCF_HIGHCONTRASTON != 0;
+            Self {
+                background: CreateSolidBrush(if high_contrast {
+                    GetSysColor(COLOR_WINDOW)
+                } else {
+                    BACKGROUND
+                }),
+                panel: CreateSolidBrush(if high_contrast {
+                    GetSysColor(COLOR_WINDOW)
+                } else {
+                    PANEL
+                }),
+                field: CreateSolidBrush(if high_contrast {
+                    GetSysColor(COLOR_WINDOW)
+                } else {
+                    FIELD
+                }),
+                body: font(16, 400),
+                small: font(14, 400),
+                heading: font(20, 600),
+                title: font(28, 600),
+                metric: font(36, 600),
+                high_contrast,
+            }
+        }
+    }
+    pub fn text(&self) -> COLORREF {
+        unsafe {
+            if self.high_contrast {
+                GetSysColor(COLOR_WINDOWTEXT)
+            } else {
+                FOREGROUND
+            }
+        }
+    }
+    pub fn muted(&self) -> COLORREF {
+        if self.high_contrast {
+            self.text()
+        } else {
+            MUTED
+        }
+    }
+    pub fn bg(&self) -> COLORREF {
+        unsafe {
+            if self.high_contrast {
+                GetSysColor(COLOR_WINDOW)
+            } else {
+                BACKGROUND
+            }
+        }
+    }
+    pub fn panel_color(&self) -> COLORREF {
+        if self.high_contrast { self.bg() } else { PANEL }
+    }
+    pub fn field_color(&self) -> COLORREF {
+        if self.high_contrast { self.bg() } else { FIELD }
+    }
+    pub unsafe fn frame(&self, hwnd: HWND) {
+        unsafe {
+            if !self.high_contrast {
+                let dark = 1i32;
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                    (&dark as *const i32).cast(),
+                    4,
+                );
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CAPTION_COLOR as u32,
+                    (&BACKGROUND as *const u32).cast(),
+                    4,
+                );
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_TEXT_COLOR as u32,
+                    (&FOREGROUND as *const u32).cast(),
+                    4,
+                );
+            }
+        }
+    }
+    pub unsafe fn color(&self, m: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+        if !matches!(
+            m,
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX
+        ) {
+            return None;
+        }
+        unsafe {
+            let dc = w as HDC;
+            let mut class = [0u16; 32];
+            let n = GetClassNameW(l as HWND, class.as_mut_ptr(), 32);
+            let edit =
+                String::from_utf16_lossy(&class[..n.max(0) as usize]).eq_ignore_ascii_case("edit");
+            let input = edit || m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
+            let panel = !GetPropW(l as HWND, wide(SURFACE).as_ptr()).is_null();
+            let muted = !GetPropW(l as HWND, wide(MUTED_PROP).as_ptr()).is_null();
+            let error = !GetPropW(l as HWND, wide(ERROR_PROP).as_ptr()).is_null();
+            SetTextColor(
+                dc,
+                if error && !self.high_contrast {
+                    ERROR
+                } else if muted {
+                    self.muted()
+                } else {
+                    self.text()
+                },
+            );
+            SetBkColor(
+                dc,
+                if input {
+                    self.field_color()
+                } else if panel {
+                    self.panel_color()
+                } else {
+                    self.bg()
+                },
+            );
+            Some(if input {
+                self.field
+            } else if panel {
+                self.panel
+            } else {
+                self.background
+            } as isize)
+        }
+    }
+    pub unsafe fn fill(&self, hwnd: HWND, dc: HDC) {
+        unsafe {
+            let mut r: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut r);
+            FillRect(dc, &r, self.background);
+        }
+    }
+    /// Round outlined "i" in the muted text colour; brighter when focused or
+    /// pressed. Every setting carries one that explains what it does.
+    pub unsafe fn info(&self, item: &DRAWITEMSTRUCT) {
+        unsafe {
+            let r = item.rcItem;
+            let fill = CreateSolidBrush(self.bg());
+            FillRect(item.hDC, &r, fill);
+            DeleteObject(fill);
+            let size = (r.right - r.left).min(r.bottom - r.top) - 4;
+            let left = r.left + (r.right - r.left - size) / 2;
+            let top = r.top + (r.bottom - r.top - size) / 2;
+            let color = if item.itemState & (ODS_SELECTED | ODS_FOCUS) != 0 {
+                self.text()
+            } else {
+                self.muted()
+            };
+            let pen = CreatePen(PS_SOLID, 2, color);
+            let old_pen = SelectObject(item.hDC, pen);
+            let old_brush = SelectObject(item.hDC, GetStockObject(NULL_BRUSH));
+            Ellipse(item.hDC, left, top, left + size, top + size);
+            SelectObject(item.hDC, old_brush);
+            SelectObject(item.hDC, old_pen);
+            DeleteObject(pen);
+            let mut label = r;
+            let old_font = SelectObject(item.hDC, self.small);
+            SetBkMode(item.hDC, TRANSPARENT as i32);
+            SetTextColor(item.hDC, color);
+            DrawTextW(
+                item.hDC,
+                wide("i").as_ptr(),
+                -1,
+                &mut label,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            );
+            SelectObject(item.hDC, old_font);
+        }
+    }
+    pub unsafe fn button(&self, item: &DRAWITEMSTRUCT, font: HFONT, primary: bool) {
+        unsafe {
+            let disabled = item.itemState & ODS_DISABLED != 0;
+            let pressed = item.itemState & ODS_SELECTED != 0;
+            let hot = !GetPropW(item.hwndItem, wide(HOVER).as_ptr()).is_null();
+            let color = if self.high_contrast {
+                GetSysColor(COLOR_BTNFACE)
+            } else if disabled {
+                PANEL
+            } else if primary {
+                if pressed {
+                    rgb(76, 182, 153)
+                } else if hot {
+                    rgb(133, 233, 208)
+                } else {
+                    ACCENT
+                }
+            } else if pressed {
+                PANEL
+            } else if hot {
+                rgb(48, 57, 67)
+            } else {
+                FIELD
+            };
+            let fill = CreateSolidBrush(color);
+            FillRect(item.hDC, &item.rcItem, fill);
+            DeleteObject(fill);
+            let pen = CreatePen(
+                PS_SOLID,
+                1,
+                if self.high_contrast {
+                    self.text()
+                } else if primary && !disabled {
+                    color
+                } else {
+                    BORDER
+                },
+            );
+            let old = SelectObject(item.hDC, pen);
+            let brush = SelectObject(item.hDC, GetStockObject(HOLLOW_BRUSH));
+            Rectangle(
+                item.hDC,
+                item.rcItem.left,
+                item.rcItem.top,
+                item.rcItem.right,
+                item.rcItem.bottom,
+            );
+            SelectObject(item.hDC, brush);
+            SelectObject(item.hDC, old);
+            DeleteObject(pen);
+            let old = SelectObject(item.hDC, font);
+            SetBkMode(item.hDC, TRANSPARENT as i32);
+            SetTextColor(
+                item.hDC,
+                if self.high_contrast {
+                    GetSysColor(if disabled {
+                        COLOR_GRAYTEXT
+                    } else {
+                        COLOR_BTNTEXT
+                    })
+                } else if disabled {
+                    MUTED
+                } else if primary {
+                    ACCENT_INK
+                } else {
+                    FOREGROUND
+                },
+            );
+            let mut title = [0u16; 256];
+            let n = GetWindowTextW(item.hwndItem, title.as_mut_ptr(), 256);
+            let mut r = item.rcItem;
+            DrawTextW(
+                item.hDC,
+                title.as_ptr(),
+                n,
+                &mut r,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            SelectObject(item.hDC, old);
+            if item.itemState & ODS_FOCUS != 0 {
+                r.left += 3;
+                r.top += 3;
+                r.right -= 3;
+                r.bottom -= 3;
+                let fill = CreateSolidBrush(if self.high_contrast {
+                    self.text()
+                } else if primary {
+                    ACCENT_INK
+                } else {
+                    ACCENT
+                });
+                FrameRect(item.hDC, &r, fill);
+                r.left += 1;
+                r.top += 1;
+                r.right -= 1;
+                r.bottom -= 1;
+                FrameRect(item.hDC, &r, fill);
+                DeleteObject(fill);
+            }
+        }
+    }
+}
+impl Drop for Theme {
+    fn drop(&mut self) {
+        unsafe {
+            for o in [
+                self.background as HGDIOBJ,
+                self.panel as HGDIOBJ,
+                self.field as HGDIOBJ,
+                self.body,
+                self.small,
+                self.heading,
+                self.title,
+                self.metric,
+            ] {
+                if !o.is_null() {
+                    DeleteObject(o);
+                }
+            }
+        }
+    }
+}
+unsafe fn font(height: i32, weight: i32) -> HFONT {
+    unsafe {
+        let mut f: LOGFONTW = std::mem::zeroed();
+        f.lfHeight = -height;
+        f.lfWeight = weight;
+        f.lfQuality = CLEARTYPE_QUALITY;
+        for (a, b) in f.lfFaceName.iter_mut().zip(wide("Segoe UI")) {
+            *a = b;
+        }
+        CreateFontIndirectW(&f)
+    }
+}
+pub unsafe fn surface(hwnd: HWND) {
+    unsafe {
+        SetPropW(hwnd, wide(SURFACE).as_ptr(), 1usize as HANDLE);
+    }
+}
+pub unsafe fn muted(hwnd: HWND) {
+    unsafe {
+        SetPropW(hwnd, wide(MUTED_PROP).as_ptr(), 1usize as HANDLE);
+    }
+}
+pub unsafe fn error(hwnd: HWND, active: bool) {
+    unsafe {
+        if active {
+            SetPropW(hwnd, wide(ERROR_PROP).as_ptr(), 1usize as HANDLE);
+        } else {
+            RemovePropW(hwnd, wide(ERROR_PROP).as_ptr());
+        }
+    }
+}
+pub unsafe fn prepare(hwnd: HWND, class: &str, style: u32) {
+    unsafe {
+        if matches!(class, "BUTTON" | "EDIT" | "COMBOBOX") {
+            SetWindowTheme(hwnd, wide("").as_ptr(), wide("").as_ptr());
+            if class == "BUTTON" && style & BS_TYPEMASK as u32 <= BS_DEFPUSHBUTTON as u32 {
+                SetWindowLongPtrW(
+                    hwnd,
+                    GWL_STYLE,
+                    ((GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & !(BS_TYPEMASK as u32))
+                        | BS_OWNERDRAW as u32) as isize,
+                );
+            }
+            SetWindowSubclass(hwnd, Some(control_proc), 1, 0);
+        }
+    }
+}
+unsafe extern "system" fn control_proc(
+    hwnd: HWND,
+    m: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    _data: usize,
+) -> LRESULT {
+    unsafe {
+        // Classic EDIT does not consistently implement Ctrl+A. Handle its
+        // translated character, leaving native selection, caret and Undo intact.
+        if m == WM_CHAR && w == 1 {
+            let mut class = [0u16; 16];
+            let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+            if String::from_utf16_lossy(&class[..n.max(0) as usize]).eq_ignore_ascii_case("edit") {
+                SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                return 0;
+            }
+        }
+        // Preserve native checkbox roles, automatic toggling and keyboard input;
+        // replace only classic painting (including embossed disabled lettering).
+        // Custom pixels are produced only in a paint/print DC. GetDC after a
+        // native paint ignores its update region and can leave stale fragments
+        // when scrolling moves or clips the control between messages.
+        let custom_combo = matches!(
+            m,
+            WM_PAINT
+                | WM_PRINT
+                | WM_PRINTCLIENT
+                | CB_SETCURSEL
+                | CB_ADDSTRING
+                | CB_INSERTSTRING
+                | CB_DELETESTRING
+                | CB_RESETCONTENT
+                | WM_ENABLE
+                | WM_SETFOCUS
+                | WM_KILLFOCUS
+                | WM_SETTEXT
+        ) && is_dark_combo(hwnd);
+        if matches!(m, WM_PAINT | WM_PRINT | WM_PRINTCLIENT) && (is_checkbox(hwnd) || custom_combo)
+        {
+            let mut paint: PAINTSTRUCT = std::mem::zeroed();
+            let dc = if m == WM_PAINT {
+                BeginPaint(hwnd, &mut paint)
+            } else {
+                w as HDC
+            };
+            if !dc.is_null() {
+                if custom_combo {
+                    combo(hwnd, dc);
+                } else {
+                    checkbox(hwnd, dc);
+                }
+            }
+            if m == WM_PAINT {
+                EndPaint(hwnd, &paint);
+            }
+            return 0;
+        }
+        if m == WM_MOUSEMOVE && GetPropW(hwnd, wide(HOVER).as_ptr()).is_null() {
+            SetPropW(hwnd, wide(HOVER).as_ptr(), 1usize as HANDLE);
+            let mut t = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut t);
+            InvalidateRect(hwnd, ptr::null(), 0);
+        }
+        if m == WM_MOUSELEAVE {
+            RemovePropW(hwnd, wide(HOVER).as_ptr());
+            InvalidateRect(hwnd, ptr::null(), 0);
+        }
+        if m == WM_NCDESTROY {
+            RemovePropW(hwnd, wide(HOVER).as_ptr());
+            RemovePropW(hwnd, wide(SURFACE).as_ptr());
+            RemovePropW(hwnd, wide(MUTED_PROP).as_ptr());
+            RemoveWindowSubclass(hwnd, Some(control_proc), id);
+        }
+        let result = DefSubclassProc(hwnd, m, w, l);
+        // Native state changes still run normally. Queue one clipped repaint;
+        // never draw into hidden/offscreen children through an unbounded DC.
+        if matches!(
+            m,
+            BM_SETCHECK
+                | BM_SETSTATE
+                | BM_CLICK
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_LBUTTONDBLCLK
+                | WM_MOUSEMOVE
+                | WM_CAPTURECHANGED
+                | WM_KEYDOWN
+                | WM_KEYUP
+                | WM_SETFOCUS
+                | WM_KILLFOCUS
+                | WM_ENABLE
+                | WM_UPDATEUISTATE
+                | WM_SETTEXT
+                | BM_SETSTYLE
+        ) && is_checkbox(hwnd)
+        {
+            InvalidateRect(hwnd, ptr::null(), 0);
+        }
+        if matches!(m, WM_SETFOCUS | WM_KILLFOCUS) {
+            InvalidateRect(hwnd, ptr::null(), 0);
+        }
+        if custom_combo
+            && matches!(
+                m,
+                CB_SETCURSEL
+                    | CB_ADDSTRING
+                    | CB_INSERTSTRING
+                    | CB_DELETESTRING
+                    | CB_RESETCONTENT
+                    | WM_ENABLE
+                    | WM_SETFOCUS
+                    | WM_KILLFOCUS
+                    | WM_SETTEXT
+            )
+        {
+            InvalidateRect(hwnd, ptr::null(), 0);
+        }
+        result
+    }
+}
+
+unsafe fn is_dark_combo(hwnd: HWND) -> bool {
+    unsafe {
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(hwnd, class.as_mut_ptr(), 32);
+        if !String::from_utf16_lossy(&class[..n.max(0) as usize]).eq_ignore_ascii_case("combobox") {
+            return false;
+        }
+        let mut hc: HIGHCONTRASTW = std::mem::zeroed();
+        hc.cbSize = size_of::<HIGHCONTRASTW>() as u32;
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            (&mut hc as *mut HIGHCONTRASTW).cast(),
+            0,
+        );
+        hc.dwFlags & HCF_HIGHCONTRASTON == 0
+    }
+}
+unsafe fn combo(hwnd: HWND, dc: HDC) {
+    unsafe {
+        let saved = SaveDC(dc);
+        let mut r: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut r);
+        let fill = CreateSolidBrush(FIELD);
+        FillRect(dc, &r, fill);
+        DeleteObject(fill);
+        let mut info: COMBOBOXINFO = std::mem::zeroed();
+        info.cbSize = size_of::<COMBOBOXINFO>() as u32;
+        if GetComboBoxInfo(hwnd, &mut info) != 0 {
+            let index = SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
+            let length = SendMessageW(hwnd, CB_GETLBTEXTLEN, index as usize, 0);
+            if (0..4096).contains(&length) {
+                let mut value = vec![0u16; length as usize + 1];
+                SendMessageW(
+                    hwnd,
+                    CB_GETLBTEXT,
+                    index as usize,
+                    value.as_mut_ptr() as isize,
+                );
+                let f = SendMessageW(hwnd, WM_GETFONT, 0, 0);
+                if f != 0 {
+                    SelectObject(dc, f as HFONT);
+                }
+                SetBkMode(dc, TRANSPARENT as i32);
+                SetTextColor(dc, FOREGROUND);
+                let mut text = info.rcItem;
+                text.left += 8;
+                DrawTextW(
+                    dc,
+                    value.as_ptr(),
+                    length as i32,
+                    &mut text,
+                    DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+                );
+            }
+            let x = (info.rcButton.left + info.rcButton.right) / 2;
+            let y = (info.rcButton.top + info.rcButton.bottom) / 2;
+            let pen = CreatePen(PS_SOLID, 2, FOREGROUND);
+            let old = SelectObject(dc, pen);
+            MoveToEx(dc, x - 4, y - 2, ptr::null_mut());
+            LineTo(dc, x, y + 2);
+            LineTo(dc, x + 4, y - 2);
+            SelectObject(dc, old);
+            DeleteObject(pen);
+        }
+        let border = CreateSolidBrush(if GetFocus() == hwnd { ACCENT } else { BORDER });
+        FrameRect(dc, &r, border);
+        DeleteObject(border);
+        RestoreDC(dc, saved);
+    }
+}
+
+unsafe fn is_checkbox(hwnd: HWND) -> bool {
+    unsafe {
+        let kind = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & BS_TYPEMASK as u32;
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(hwnd, class.as_mut_ptr(), 32);
+        matches!(kind, k if k == BS_AUTOCHECKBOX as u32 || k == BS_CHECKBOX as u32)
+            && String::from_utf16_lossy(&class[..n.max(0) as usize]).eq_ignore_ascii_case("button")
+    }
+}
+// Keyboard focus shows as the accent box border, not a dotted rectangle.
+unsafe fn checkbox(hwnd: HWND, dc: HDC) {
+    unsafe {
+        let saved = SaveDC(dc);
+        let mut rect: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut rect);
+        let background =
+            SendMessageW(GetParent(hwnd), WM_CTLCOLORBTN, dc as usize, hwnd as isize) as HBRUSH;
+        FillRect(dc, &rect, background);
+        let mut hc: HIGHCONTRASTW = std::mem::zeroed();
+        hc.cbSize = size_of::<HIGHCONTRASTW>() as u32;
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            (&mut hc as *mut HIGHCONTRASTW).cast(),
+            0,
+        );
+        let contrast = hc.dwFlags & HCF_HIGHCONTRASTON != 0;
+        let enabled = windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd) != 0;
+        let checked = SendMessageW(hwnd, BM_GETCHECK, 0, 0) == 1;
+        let accent = if contrast {
+            GetSysColor(COLOR_HIGHLIGHT)
+        } else {
+            ACCENT
+        };
+        let foreground = if contrast {
+            GetSysColor(if enabled {
+                COLOR_WINDOWTEXT
+            } else {
+                COLOR_GRAYTEXT
+            })
+        } else if enabled {
+            FOREGROUND
+        } else {
+            MUTED
+        };
+        let top = (rect.bottom - 16) / 2;
+        let box_rect = RECT {
+            left: 2,
+            top,
+            right: 18,
+            bottom: top + 16,
+        };
+        let fill = CreateSolidBrush(if checked && enabled {
+            accent
+        } else if contrast {
+            GetSysColor(COLOR_WINDOW)
+        } else {
+            FIELD
+        });
+        FillRect(dc, &box_rect, fill);
+        DeleteObject(fill);
+        let border = CreateSolidBrush(
+            if enabled && (GetFocus() == hwnd || !GetPropW(hwnd, wide(HOVER).as_ptr()).is_null()) {
+                accent
+            } else if contrast {
+                foreground
+            } else {
+                BORDER
+            },
+        );
+        FrameRect(dc, &box_rect, border);
+        DeleteObject(border);
+        if checked {
+            let pen = CreatePen(
+                PS_SOLID,
+                2,
+                if enabled {
+                    if contrast {
+                        GetSysColor(COLOR_HIGHLIGHTTEXT)
+                    } else {
+                        ACCENT_INK
+                    }
+                } else {
+                    foreground
+                },
+            );
+            let old = SelectObject(dc, pen);
+            MoveToEx(dc, 5, top + 8, ptr::null_mut());
+            LineTo(dc, 9, top + 12);
+            LineTo(dc, 15, top + 4);
+            SelectObject(dc, old);
+            DeleteObject(pen);
+        }
+        let font = SendMessageW(hwnd, WM_GETFONT, 0, 0);
+        if font != 0 {
+            SelectObject(dc, font as HFONT);
+        }
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, foreground);
+        let mut label = [0u16; 512];
+        let n = GetWindowTextW(hwnd, label.as_mut_ptr(), 512);
+        let mut label_rect = RECT {
+            left: 26,
+            top: 0,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        let multiline = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & BS_MULTILINE as u32 != 0;
+        let flags = if multiline {
+            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX
+        } else {
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX
+        };
+        if multiline {
+            let mut measured = label_rect;
+            DrawTextW(dc, label.as_ptr(), n, &mut measured, flags | DT_CALCRECT);
+            label_rect.top = ((rect.bottom - (measured.bottom - measured.top)) / 2).max(0);
+        }
+        DrawTextW(dc, label.as_ptr(), n, &mut label_rect, flags);
+        RestoreDC(dc, saved);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::{
+        System::LibraryLoader::GetModuleHandleW,
+        UI::Controls::{EM_GETSEL, EM_UNDO},
+    };
+
+    #[test]
+    fn ctrl_a_replaces_all_unicode_text_and_keeps_native_undo() {
+        unsafe {
+            let parent = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                ptr::null(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                400,
+                200,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                GetModuleHandleW(ptr::null()),
+                ptr::null(),
+            );
+            assert!(!parent.is_null());
+            let initial = "ÄÖ – Test 85 °C";
+            let edit = crate::native_ui::control(
+                parent,
+                ptr::null_mut(),
+                1,
+                "EDIT",
+                initial,
+                ES_AUTOHSCROLL as u32,
+            );
+            SendMessageW(edit, WM_CHAR, 1, 0);
+            let selection = SendMessageW(edit, EM_GETSEL, 0, 0) as u32;
+            assert_eq!(selection & 0xffff, 0);
+            assert_eq!(selection >> 16, initial.encode_utf16().count() as u32);
+            SendMessageW(edit, WM_CHAR, 'X' as usize, 0);
+            assert_eq!(crate::native_ui::value(edit), "X");
+            assert_ne!(SendMessageW(edit, EM_UNDO, 0, 0), 0);
+            assert_eq!(crate::native_ui::value(edit), initial);
+            DestroyWindow(parent);
+        }
+    }
+}

@@ -1,0 +1,2310 @@
+//! One controller owns typed adapters. Capabilities gate writes again at dispatch.
+mod public_power;
+use super::{
+    GpuControlsReport, NvidiaIdentity, OffsetState, gpu::NvidiaControl, inventory, power_status,
+};
+use omen_core::{
+    Inventory,
+    features::Feature,
+    keyboard::KeyboardState,
+    profiles::{Choice, DeviceBinding, PROFILE_SCHEMA, PerformanceProfile, Setting, Value},
+    transaction::{
+        self, Access, Applied, Backend, Capability, Captured, Context, Journal, PendingTransaction,
+    },
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+// Clock/curve evidence is per exact driver in gpu_support, including the loaded
+// private implementation hash. A new read contract does not enable writes.
+// 2026-10-14 02:35 CEST, build98F3B089...: zone1 red +/-1 byte,
+// complete 128-byte color/brightness/capability readback and original restore;
+// existing programmed GPU controls and prior journal/startup retained.
+// This qualifies classic RGB only, not animation or logon/lifecycle ownership.
+// 2026-10-14 02:48 CEST, build5E5926A8...: coupled RGB plus64->E4,
+// exact complete readback,64/original RGB restore, GPU controls unchanged.
+// 2026-10-15 fixed ON/held-readback/OFF restore, build063CF16D...;
+// full flag restored, GPU controls/power and production metadata unchanged.
+// Startup is permitted; physical lifecycle and embedded software curves remain unqualified.
+// 2026-10-22 05:17 CEST, build6FF1F7A1...: fixed RSMU 0xCB,
+// 55 -> 54 -> 55 W, PM-table 0x540208 cell4; all seven independent
+// CPU-control images and complete GPU controls preserved after restore.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RestoreState {
+    HpMaxFan {
+        state: super::cooling::MaxFanImage,
+    },
+    HpKeyboardColors {
+        state: KeyboardState,
+    },
+    NvidiaOffset {
+        identity: NvidiaIdentity,
+        state: OffsetState,
+        #[serde(default)]
+        gfx_curve: Option<omen_core::vf::VfState>,
+        #[serde(default)]
+        related_core: Option<OffsetState>,
+    },
+    NvidiaVfCurve {
+        identity: NvidiaIdentity,
+        state: omen_core::vf::VfState,
+        core_offset: OffsetState,
+    },
+    NvidiaPowerLimit {
+        identity: NvidiaIdentity,
+        state: omen_core::gpu_power::PowerLimitState,
+    },
+    Windows {
+        image: super::windows_settings::WindowsImage,
+    },
+    /// HP cTGP/PPAB flags (0x21 GET, 0x22 SET); PPAB is Dynamic Boost.
+    HpGpuPower {
+        custom_tgp: bool,
+        ppab: bool,
+    },
+    /// Curve Optimizer margins or PBO scalar read through the SMU.
+    AmdSmu {
+        image: super::cpu_tuning::SmuImage,
+    },
+    /// BIOS graphics (MUX) mode byte; effective after a restart.
+    HpGraphicsMode {
+        mode: u8,
+    },
+}
+
+pub struct Controller {
+    inventory: Inventory,
+    nvidia: Option<NvidiaControl>,
+    calibration: bool,
+    curve_calibration: Option<omen_core::vf::CurveTrial>,
+    vf: Option<super::vf::VfControl>,
+    captured: BTreeMap<Feature, Captured<RestoreState>>,
+    curve_target: Option<(Value, omen_core::vf::VfState)>,
+    memory_last_trial: bool,
+    keyboard: Option<super::hp::KeyboardControl>,
+    keyboard_calibration: Option<Vec<[u8; 3]>>,
+    keyboard_target: Option<KeyboardState>,
+    keyboard_mode_calibration: Option<Choice>,
+    fan: Option<super::cooling::FanControl>,
+    fan_target: Option<omen_core::cooling::MaxFanState>,
+    fan_calibration: bool,
+    fan_observations: Vec<super::cooling::FanReport>,
+    /// Windows targets written in this transaction (accepted by later checks).
+    windows_targets: BTreeMap<Feature, Value>,
+    planned_power_scheme: Option<u128>,
+    /// The preset runs the HP mode Unleashed: the firmware keeps the fast
+    /// limit (PPT) at its own value there unless NVPCF Sub-function #9 is
+    /// unlocked for this session.
+    firmware_ppt: bool,
+    nvpcf_ppt_unlocked: bool,
+    smu: Option<super::smu::Smu>,
+    cpu_readback_trace: Option<Vec<super::cpu_tuning::CpuReadbackTrace>>,
+}
+
+fn uses_nvidia(feature: Feature) -> bool {
+    feature.needs_nvidia()
+}
+fn mux_choice(mode: u8) -> Choice {
+    match mode {
+        0 => Choice::Hybrid,
+        1 => Choice::DiscreteOnly,
+        3 => Choice::IntegratedOnly,
+        _ => Choice::Manual,
+    }
+}
+fn mux_mode(choice: Choice) -> Result<u8, String> {
+    match choice {
+        Choice::Hybrid => Ok(0),
+        Choice::DiscreteOnly => Ok(1),
+        Choice::IntegratedOnly => Ok(3),
+        _ => Err(omen_core::message::msg("support.err.graphics_mode", &[])),
+    }
+}
+/// The HP `0x22` flags: cTGP (byte 0) and PPAB/Dynamic Boost (byte 1). Each
+/// is its own preset field; a write keeps the other flag as read.
+fn uses_hp_gpu_power(feature: Feature) -> bool {
+    matches!(
+        feature,
+        Feature::GpuUnleashed | Feature::GpuDynamicBoost | Feature::GpuCustomTgp
+    )
+}
+
+/// The flag `feature` controls, out of the pair (cTGP, PPAB).
+fn gpu_flag(feature: Feature, custom_tgp: bool, ppab: bool) -> bool {
+    if feature == Feature::GpuCustomTgp {
+        custom_tgp
+    } else {
+        ppab
+    }
+}
+
+/// Read-modify-write pair for one field: its own flag set to `on`.
+fn gpu_flags_with(feature: Feature, custom_tgp: bool, ppab: bool, on: bool) -> (bool, bool) {
+    if feature == Feature::GpuCustomTgp {
+        (on, ppab)
+    } else {
+        (custom_tgp, on)
+    }
+}
+fn uses_keyboard(feature: Feature) -> bool {
+    matches!(feature, Feature::KeyboardColors | Feature::KeyboardEffect)
+}
+fn keyboard_value(feature: Feature, state: &KeyboardState) -> Result<Value, String> {
+    match feature {
+        Feature::KeyboardColors => state.colors().map(Value::Colors),
+        Feature::KeyboardEffect => Ok(Value::Choice(if state.custom_colors_enabled()? {
+            Choice::Static
+        } else {
+            Choice::FirmwareDefault
+        })),
+        _ => Err("Not a classic keyboard feature".into()),
+    }
+}
+fn lighting_target(state: &KeyboardState, settings: &[Setting]) -> Result<KeyboardState, String> {
+    let mut target = state.clone();
+    for s in settings {
+        match (&s.feature, &s.value) {
+            (Feature::KeyboardColors, Value::Colors(colors)) => {
+                target = target.with_colors(colors)?
+            }
+            (Feature::KeyboardEffect, Value::Choice(Choice::Static)) => {
+                target = target.with_classic_mode(true)?
+            }
+            (Feature::KeyboardEffect, Value::Choice(Choice::FirmwareDefault | Choice::Off)) => {
+                target = target.with_classic_mode(false)?
+            }
+            (Feature::KeyboardEffect, _) => {
+                return Err("Only static lighting and Off are qualified".into());
+            }
+            _ => {}
+        }
+    }
+    Ok(target)
+}
+
+impl Controller {
+    pub fn new(needs_nvidia: bool, uuid: Option<&str>) -> Result<Self, String> {
+        Ok(Self {
+            inventory: inventory(),
+            nvidia: if needs_nvidia {
+                Some(NvidiaControl::new(uuid)?)
+            } else {
+                None
+            },
+            calibration: false,
+            curve_calibration: None,
+            vf: None,
+            captured: BTreeMap::new(),
+            curve_target: None,
+            memory_last_trial: false,
+            keyboard: None,
+            keyboard_calibration: None,
+            keyboard_target: None,
+            keyboard_mode_calibration: None,
+            fan: None,
+            fan_target: None,
+            fan_calibration: false,
+            fan_observations: vec![],
+            windows_targets: BTreeMap::new(),
+            planned_power_scheme: None,
+            firmware_ppt: false,
+            nvpcf_ppt_unlocked: false,
+            smu: None,
+            cpu_readback_trace: None,
+        })
+    }
+    pub fn trace_cpu_readbacks(&mut self) {
+        self.cpu_readback_trace = Some(Vec::new());
+    }
+    pub fn set_nvpcf_ppt_unlocked(&mut self, unlocked: bool) {
+        self.nvpcf_ppt_unlocked = unlocked;
+    }
+    pub fn cpu_readback_observations(&self) -> &[super::cpu_tuning::CpuReadbackTrace] {
+        self.cpu_readback_trace.as_deref().unwrap_or(&[])
+    }
+    pub fn for_profile(profile: &PerformanceProfile) -> Result<Self, String> {
+        Self::new(
+            profile.settings.iter().any(|s| uses_nvidia(s.feature)),
+            profile.binding.nvidia_uuid.as_deref(),
+        )
+    }
+    /// Fresh identity captured for this controller; reuse it within the same
+    /// serialized command instead of repeating the full WMI inventory.
+    pub fn inventory(&self) -> &Inventory {
+        &self.inventory
+    }
+    pub fn for_recovery(saved: &PendingTransaction<RestoreState>) -> Result<Self, String> {
+        Self::new(
+            saved.requested.iter().any(|s| uses_nvidia(s.feature)),
+            saved.binding.nvidia_uuid.as_deref(),
+        )
+    }
+    fn keyboard(&mut self) -> Result<&super::hp::KeyboardControl, String> {
+        if self.keyboard.is_none() {
+            self.keyboard = Some(super::hp::KeyboardControl::new(&self.inventory)?);
+        }
+        self.keyboard
+            .as_ref()
+            .ok_or("HP keyboard connection is missing".into())
+    }
+    pub fn keyboard_state(&mut self) -> Result<KeyboardState, String> {
+        let state = self.keyboard()?.read()?;
+        if state.capability.raw != [1, 0, 0, 0] {
+            return Err("Keyboard capability differs from the measured four-zone layout".into());
+        }
+        Ok(state)
+    }
+    fn smu(&mut self) -> Result<&super::smu::Smu, String> {
+        if self.smu.is_none() {
+            self.smu = Some(super::smu::Smu::new(&self.inventory)?);
+        }
+        self.smu.as_ref().ok_or("Missing SMU connection".into())
+    }
+    fn fan(&mut self) -> Result<&super::cooling::FanControl, String> {
+        if self.fan.is_none() {
+            self.fan = Some(super::cooling::FanControl::new(&self.inventory)?);
+        }
+        self.fan.as_ref().ok_or("Missing fan connection".into())
+    }
+    pub fn fan_report(&mut self) -> Result<super::cooling::FanReport, String> {
+        self.fan()?.report()
+    }
+    pub fn fan_validation_observations(&self) -> &[super::cooling::FanReport] {
+        &self.fan_observations
+    }
+    pub fn validate_max_fan(
+        &mut self,
+        journal: &mut impl Journal<RestoreState>,
+    ) -> Result<Applied, String> {
+        let before = self.fan()?.capture()?;
+        if before.state.enabled {
+            return Err("Fixed qualification requires Max-Fan OFF; it never lowers existing maximum cooling".into());
+        }
+        let profile = PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "max-fan-validation".into(),
+            name: "Fixed max-fan ON/restore qualification".into(),
+            binding: self.context()?.binding.for_settings(&[]),
+            settings: vec![Setting {
+                feature: Feature::MaxFan,
+                value: Value::Boolean(true),
+            }],
+        };
+        let digest = crate::profile_store::profile_digest(&profile)?;
+        self.fan_calibration = true;
+        self.fan_observations.clear();
+        let result = transaction::trial(&profile, &digest, self, journal);
+        self.fan_calibration = false;
+        let result = result.map_err(|e| serde_json::to_string_pretty(&e).unwrap_or(e.error))?;
+        if self.fan()?.capture()? != before {
+            return Err("Complete original Max-Fan flag did not restore".into());
+        }
+        Ok(result)
+    }
+    pub fn validate_keyboard_lighting(
+        &mut self,
+        journal: &mut impl Journal<RestoreState>,
+    ) -> Result<Applied, String> {
+        let before = self.keyboard_state()?;
+        if ![0x64, 0xe4].contains(
+            &before
+                .legacy
+                .as_ref()
+                .ok_or("Missing classic state")?
+                .brightness_raw_byte,
+        ) {
+            return Err("Fixed mode trial requires64/E4 raw brightness".into());
+        }
+        let mode = if before.custom_colors_enabled()? {
+            Choice::FirmwareDefault
+        } else {
+            Choice::Static
+        };
+        let mut colors = before.colors()?;
+        colors[0][0] = if colors[0][0] == 255 {
+            254
+        } else {
+            colors[0][0] + 1
+        };
+        let profile = PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "keyboard-lighting-validation".into(),
+            name: "Fixed coupled RGB/mode qualification".into(),
+            binding: self.context()?.binding.for_settings(&[]),
+            settings: vec![
+                Setting {
+                    feature: Feature::KeyboardColors,
+                    value: Value::Colors(colors.clone()),
+                },
+                Setting {
+                    feature: Feature::KeyboardEffect,
+                    value: Value::Choice(mode),
+                },
+            ],
+        };
+        let digest = crate::profile_store::profile_digest(&profile)?;
+        self.keyboard_calibration = Some(colors);
+        self.keyboard_mode_calibration = Some(mode);
+        let result = transaction::trial(&profile, &digest, self, journal);
+        self.keyboard_calibration = None;
+        self.keyboard_mode_calibration = None;
+        let result = result.map_err(|e| serde_json::to_string_pretty(&e).unwrap_or(e.error))?;
+        if self.keyboard_state()? != before {
+            return Err("The coupled lighting trial did not fully restore".into());
+        }
+        Ok(result)
+    }
+    /// Fixed color-only qualification: change one component in zone 1 by one
+    /// byte, verify the entire state and restore through the durable journal.
+    pub fn validate_keyboard_colors(
+        &mut self,
+        journal: &mut impl Journal<RestoreState>,
+    ) -> Result<Applied, String> {
+        let before = self.keyboard_state()?;
+        let mut colors = before.colors()?;
+        colors[0][0] = if colors[0][0] == 255 {
+            254
+        } else {
+            colors[0][0] + 1
+        };
+        let profile = PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "keyboard-color-validation".into(),
+            name: "Fixed keyboard color qualification".into(),
+            binding: self.context()?.binding.for_settings(&[]),
+            settings: vec![Setting {
+                feature: Feature::KeyboardColors,
+                value: Value::Colors(colors.clone()),
+            }],
+        };
+        let digest = crate::profile_store::profile_digest(&profile)?;
+        self.keyboard_calibration = Some(colors);
+        let result = transaction::trial(&profile, &digest, self, journal);
+        self.keyboard_calibration = None;
+        let result = result.map_err(|e| serde_json::to_string_pretty(&e).unwrap_or(e.error))?;
+        if self.keyboard_state()? != before {
+            return Err("Keyboard trial did not restore the complete original".into());
+        }
+        Ok(result)
+    }
+    fn gpu(&self) -> Result<&NvidiaControl, String> {
+        self.nvidia
+            .as_ref()
+            .ok_or("Profile has no NVIDIA driver session".into())
+    }
+
+    fn qualifies(&self) -> Result<(), String> {
+        let identity = self.gpu()?.identity()?;
+        super::gpu_support::model_evidence(&self.inventory, &identity)?;
+        Ok(())
+    }
+
+    fn gpu_writes_verified(&self) -> bool {
+        self.qualifies().is_ok()
+    }
+
+    pub fn gpu_report(&self) -> Result<GpuControlsReport, String> {
+        self.gpu()?.report()
+    }
+    fn curve(&mut self) -> Result<&super::vf::VfControl, String> {
+        self.qualifies()?;
+        if self.vf.is_none() {
+            self.vf = Some(super::vf::VfControl::new(&self.gpu()?.identity()?)?);
+        }
+        self.vf.as_ref().ok_or("V/F session unavailable".into())
+    }
+    pub fn gpu_curve(&mut self) -> Result<omen_core::vf::VfState, String> {
+        self.curve()?.snapshot()
+    }
+    fn restore_graphics(
+        &mut self,
+        original: &omen_core::vf::VfState,
+        core: Option<&OffsetState>,
+    ) -> Result<(), String> {
+        if let Some(core) = core {
+            if core.feature != Feature::GpuCoreOffsetMhz {
+                return Err("Related offset has another clock domain".into());
+            }
+            if self.gpu()?.offset(Feature::GpuCoreOffsetMhz)?.current_mhz != core.current_mhz {
+                self.gpu()?.set_offset(&Setting {
+                    feature: Feature::GpuCoreOffsetMhz,
+                    value: Value::Integer(i64::from(core.current_mhz)),
+                })?;
+            }
+        }
+        let current = self.gpu_curve()?;
+        if !original.domain_matches(&current)? {
+            return Err("Graphics restore domain/grid changed".into());
+        }
+        if !original.controls_match(&current)? {
+            let deltas: Vec<_> = original
+                .nodes
+                .iter()
+                .map(|p| (p.index, p.delta_khz))
+                .collect();
+            self.curve()?.set_deltas(&current, &deltas)?;
+        }
+        if !original.controls_match(&self.gpu_curve()?)? {
+            return Err("Full Graphics control restore differs".into());
+        }
+        if let Some(core) = core {
+            if self.gpu()?.offset(Feature::GpuCoreOffsetMhz)? != *core {
+                return Err("Related global core restore differs".into());
+            }
+        }
+        Ok(())
+    }
+    /// "Keep preset": the live value when it no longer matches `setting`,
+    /// `None` when it does. Only the CPU SMU limits and HP GPU flags.
+    pub fn hold_check(&mut self, setting: &Setting) -> Result<Option<Value>, String> {
+        if super::cpu_tuning::handles(setting.feature) {
+            let image = super::cpu_tuning::capture(self.smu()?, setting.feature)?;
+            return Ok(
+                if super::cpu_tuning::image_matches(setting.feature, &image, &setting.value)? {
+                    None
+                } else {
+                    Some(super::cpu_tuning::value(setting.feature, &image)?)
+                },
+            );
+        }
+        if uses_hp_gpu_power(setting.feature) {
+            let live = self.read(setting.feature)?;
+            return Ok((live != setting.value).then_some(live));
+        }
+        Err(format!("{:?} is not kept", setting.feature))
+    }
+    /// Writes one drifted value of the applied preset again and verifies it.
+    /// The journal keeps the preset's first originals, so Restore still
+    /// returns to the state before the preset, not to a firmware rewrite.
+    pub fn reassert(&mut self, setting: &Setting) -> Result<(), String> {
+        if super::cpu_tuning::handles(setting.feature) {
+            super::cpu_tuning::validate(setting.feature, &setting.value)?;
+            let smu = self.smu()?;
+            super::cpu_tuning::write(smu, setting.feature, &setting.value)?;
+            return super::cpu_tuning::verify_target(
+                smu,
+                setting.feature,
+                &setting.value,
+                |_, _| {},
+            )
+            .map(|_| ());
+        }
+        if uses_hp_gpu_power(setting.feature) {
+            let Value::Boolean(on) = setting.value else {
+                return Err("cTGP and Dynamic Boost need on/off".into());
+            };
+            let live = super::read_hp_gpu_status(&self.inventory)?;
+            let (custom_tgp, ppab) = gpu_flags_with(
+                setting.feature,
+                live.custom_tgp_enabled,
+                live.ppab_enabled,
+                on,
+            );
+            return super::write_hp_gpu_power(&self.inventory, custom_tgp, ppab).map(|_| ());
+        }
+        Err(format!("{:?} is not kept", setting.feature))
+    }
+    /// Read-only verification of a completed revision before protected startup
+    /// approval. The caller first proves the exact journal/profile revision.
+    pub fn verify_applied(
+        &mut self,
+        saved: &PendingTransaction<RestoreState>,
+    ) -> Result<Vec<Setting>, String> {
+        self.prepare_recovery(saved)?;
+        self.curve_target = None;
+        for (original, requested) in saved.original.iter().zip(&saved.requested) {
+            if let RestoreState::NvidiaVfCurve { state, .. } = &original.restore {
+                let Value::VfCurve(points) = &requested.value else {
+                    return Err("Missing applied curve target".into());
+                };
+                self.curve_target = Some((requested.value.clone(), state.target_state(points)?));
+            } else if requested.feature == Feature::GpuCoreOffsetMhz {
+                let Value::Integer(wanted) = requested.value else {
+                    return Err("Missing global core target".into());
+                };
+                // A curve someone else set no longer blocks (user rule, 30
+                // October 2026); the offset itself is still verified below.
+                let _ = wanted;
+                let live = self.gpu_curve()?;
+                self.curve_target = Some((requested.value.clone(), live));
+            }
+        }
+        // A normal Apply leaves a value that did not stick at its captured
+        // original and applies the rest (user rule, 30 October 2026). Such a
+        // value no longer blocks sign-in approval, but only while it still
+        // reads back as exactly that original; any other drift fails, and at
+        // least one requested value must be confirmed.
+        let mut verified = vec![];
+        let mut first_error = None;
+        for (original, requested) in saved.original.iter().zip(&saved.requested) {
+            match self.verify_target(requested) {
+                Ok(value) => verified.push(Setting {
+                    feature: requested.feature,
+                    value,
+                }),
+                Err(error) => {
+                    self.verify_captured(original).map_err(|_| error.clone())?;
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) if verified.is_empty() => Err(error),
+            _ => Ok(verified),
+        }
+    }
+    pub fn validate_gpu_curve(
+        &mut self,
+        journal: &mut impl Journal<RestoreState>,
+    ) -> Result<Applied, String> {
+        self.qualifies()?;
+        self.gpu()?.thermal_guard(87)?;
+        if self.gpu()?.offset(Feature::GpuCoreOffsetMhz)?.current_mhz != 0
+            || self.gpu()?.offset(Feature::GpuMemoryOffsetMhz)?.current_mhz != 0
+        {
+            return Err("Curve validation requires existing zero global offsets".into());
+        }
+        let state = self.gpu_curve()?;
+        let operation = omen_core::vf::CurveTrial::AllPointsMinus15;
+        let target = operation.target(&state)?;
+        let profile = PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "vf-driver-validation".into(),
+            name: "Fixed Graphics curve frequency trial".into(),
+            binding: self.context()?.binding,
+            settings: vec![Setting {
+                feature: Feature::GpuVfCurve,
+                value: target,
+            }],
+        };
+        self.curve_calibration = Some(operation);
+        let result = transaction::trial(&profile, "fixed-vf-frequency-trial-v1", self, journal);
+        self.curve_calibration = None;
+        let result =
+            result.map_err(|e| format!("{}; rollback errors: {:?}", e.error, e.rollback_errors))?;
+        if !state.controls_match(&self.gpu_curve()?)? {
+            return Err("Complete Graphics V/F restore image differs".into());
+        }
+        if self.gpu()?.offset(Feature::GpuCoreOffsetMhz)?.current_mhz != 0
+            || self.gpu()?.offset(Feature::GpuMemoryOffsetMhz)?.current_mhz != 0
+        {
+            return Err("Global offsets changed during private curve trial".into());
+        }
+        Ok(result)
+    }
+
+    /// A fixed durable trial exercises Memory SET after an already programmed
+    /// nonuniform Graphics curve. It leaves every captured control restored.
+    pub fn validate_memory_curve_preservation(
+        &mut self,
+        journal: &mut impl Journal<RestoreState>,
+    ) -> Result<Applied, String> {
+        self.qualifies()?;
+        self.gpu()?.thermal_guard(87)?;
+        let state = self.gpu_curve()?;
+        if self.gpu()?.offset(Feature::GpuCoreOffsetMhz)?.current_mhz != 0
+            || self.gpu()?.offset(Feature::GpuMemoryOffsetMhz)?.current_mhz != 0
+        {
+            return Err(
+                "Preservation trial requires zero global offsets; existing curve is retained"
+                    .into(),
+            );
+        }
+        let operation = omen_core::vf::CurveTrial::FirstPointMinus15;
+        let target = operation.target(&state)?;
+        let profile = PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "memory-curve-validation".into(),
+            name: "Fixed Graphics preservation trial".into(),
+            binding: self.context()?.binding,
+            settings: vec![
+                Setting {
+                    feature: Feature::GpuVfCurve,
+                    value: target,
+                },
+                Setting {
+                    feature: Feature::GpuMemoryOffsetMhz,
+                    value: Value::Integer(-24),
+                },
+            ],
+        };
+        self.memory_last_trial = true;
+        self.calibration = true;
+        self.curve_calibration = Some(operation);
+        let result = transaction::trial(
+            &profile,
+            "fixed-memory-curve-preservation-v1",
+            self,
+            journal,
+        );
+        self.memory_last_trial = false;
+        self.calibration = false;
+        self.curve_calibration = None;
+        result.map_err(|e| format!("{}; rollback errors: {:?}", e.error, e.rollback_errors))
+    }
+
+    /// Fixed, minimal underclock probe only; no user values or voltage/power writes.
+    /// Durable journaling is required and the core always restores before return.
+    pub fn validate_gpu_offsets(
+        &mut self,
+        journal: &mut impl Journal<RestoreState>,
+    ) -> Result<Vec<Applied>, String> {
+        self.qualifies()?;
+        // A fixed global-offset probe can temporarily replace a custom curve.
+        // Capture/restore includes every Graphics point for both domains. This
+        // does not relax the normal profile's global-offset/curve conflict.
+        self.gpu_curve()?.validate()?;
+        let gpu = self.gpu()?;
+        gpu.thermal_guard(87)?;
+        let core = gpu.offset(Feature::GpuCoreOffsetMhz)?;
+        let memory = gpu.offset(Feature::GpuMemoryOffsetMhz)?;
+        if core.current_mhz != 0 || memory.current_mhz != 0 {
+            return Err(
+                "Validation requires unchanged zero offsets; existing user tuning was not reset"
+                    .into(),
+            );
+        }
+        let mut profile = PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "driver-validation".into(),
+            name: "Fixed NVIDIA driver validation".into(),
+            binding: self.context()?.binding,
+            settings: vec![
+                Setting {
+                    feature: Feature::GpuCoreOffsetMhz,
+                    value: Value::Integer(-15),
+                },
+                Setting {
+                    feature: Feature::GpuMemoryOffsetMhz,
+                    value: Value::Integer(-24),
+                },
+            ],
+        };
+        self.calibration = true;
+        let result = (|| {
+            let negative = transaction::trial(
+                &profile,
+                "fixed-driver-validation-v3-negative",
+                self,
+                journal,
+            )?;
+            profile.settings[0].value = Value::Integer(15);
+            profile.settings[1].value = Value::Integer(24);
+            let positive = transaction::trial(
+                &profile,
+                "fixed-driver-validation-v3-positive",
+                self,
+                journal,
+            )?;
+            Ok(vec![negative, positive])
+        })();
+        self.calibration = false;
+        result.map_err(|error: transaction::ApplyFailure| {
+            format!(
+                "{}; rollback errors: {:?}",
+                error.error, error.rollback_errors
+            )
+        })
+    }
+}
+
+impl Backend for Controller {
+    type RestoreState = RestoreState;
+    fn prepare_settings(&mut self, settings: &[Setting]) -> Result<(), String> {
+        // A running HP service no longer blocks the whole preset (user rule,
+        // 30 October 2026); each PPT/Slow write checks it and is skipped alone.
+        self.planned_power_scheme = super::windows_settings::requested_scheme(settings)?;
+        self.firmware_ppt = !self.nvpcf_ppt_unlocked
+            && omen_core::hp_mode::HpMode::of_settings(
+                settings,
+                super::power_status().ac_connected == Some(true),
+            ) == Some(omen_core::hp_mode::HpMode::Unleashed);
+        Ok(())
+    }
+    fn write_order(&self, settings: &[Setting]) -> Vec<usize> {
+        let mut order: Vec<_> = (0..settings.len()).collect();
+        if self.memory_last_trial {
+            return order;
+        }
+        // Measured 617.14 behavior: the NVML memory setter resets a custom
+        // Graphics curve. Preserve it, then apply the final Graphics target.
+        // After the HP mode prelude: Windows plan and its policies, then the
+        // internal panel's refresh rate, then the SMU limits (battery-switch
+        // order of 20 November 2026).
+        order.sort_by_key(|i| match settings[*i].feature {
+            Feature::WindowsPowerPlan => 0,
+            Feature::DisplayRefreshRateHz => 2,
+            Feature::CpuCcdAffinity => 3,
+            f if super::windows_settings::handles(f) => 1,
+            Feature::GpuMemoryOffsetMhz => 3,
+            // Apply a sustained ceiling before the final short-term ceiling.
+            Feature::CpuSlowPptLimitMw => 4,
+            Feature::KeyboardEffect => 6,
+            _ => 5,
+        });
+        order
+    }
+    fn context(&mut self) -> Result<Context, String> {
+        let identity = self.nvidia.as_ref().map(|gpu| gpu.identity()).transpose()?;
+        Ok(Context {
+            binding: DeviceBinding {
+                manufacturer: self.inventory.manufacturer.clone(),
+                board: self.inventory.board.clone(),
+                bios: self.inventory.bios.clone(),
+                cpu_names: self.inventory.cpus.clone(),
+                nvidia_uuid: identity.as_ref().map(|id| id.uuid.clone()),
+                nvidia_driver: identity.as_ref().map(|id| id.driver.clone()),
+                nvidia_vbios: identity.map(|id| id.vbios),
+            },
+            ac_connected: power_status().ac_connected,
+        })
+    }
+
+    fn capability(&mut self, feature: Feature) -> Capability {
+        if feature == Feature::GpuPowerLimitMw {
+            return self.public_power_capability();
+        }
+        if feature == Feature::GraphicsMode {
+            return if self.inventory.manufacturer == "HP"
+                && self.inventory.board == "8E35"
+                && self.inventory.bios == "F.13"
+            {
+                Capability {
+                    feature,
+                    access: Access::ReadWrite,
+                    reason: "HP BIOS graphics mode; takes effect after a restart".into(),
+                    integer_range: None,
+                    requires_ac: false,
+                    startup_safe: true,
+                }
+            } else {
+                Capability::unsupported(
+                    feature,
+                    omen_core::message::msg("support.err.graphics_board", &[]),
+                )
+            };
+        }
+        if super::cpu_tuning::handles(feature) {
+            return match super::cpu_tuning::qualified(&self.inventory) {
+                Ok(()) => Capability {
+                    feature,
+                    access: Access::ReadWrite,
+                    reason: "AMD SMU message with exact per-core/scalar/limit readback".into(),
+                    integer_range: Some(super::cpu_tuning::range(feature)),
+                    requires_ac: false,
+                    startup_safe: super::hp_control::cpu_power_startup_safe(feature),
+                },
+                Err(reason) => Capability::unsupported(feature, reason),
+            };
+        }
+        if uses_hp_gpu_power(feature) {
+            // Board-qualified only; the live flags need elevation and are read at capture.
+            return if self.inventory.manufacturer == "HP"
+                && self.inventory.board == "8E35"
+                && self.inventory.bios == "F.13"
+            {
+                Capability {
+                    feature,
+                    access: Access::ReadWrite,
+                    reason: "HP 0x22 flag (cTGP or Dynamic Boost/PPAB) with read-modify-write, readback and restore of both flags"
+                        .into(),
+                    integer_range: None,
+                    requires_ac: false,
+                    startup_safe: true,
+                }
+            } else {
+                Capability::unsupported(
+                    feature,
+                    omen_core::message::msg("support.err.boost_board", &[]),
+                )
+            };
+        }
+        if super::windows_settings::handles(feature) {
+            // Documented Windows GETs give exact readback and restore; the
+            // settings are harmless at logon, so startup may apply them.
+            return match super::windows_settings::range(feature)
+                .and_then(|range| super::windows_settings::read(feature).map(|_| range))
+            {
+                Ok(integer_range) => Capability {
+                    feature,
+                    access: Access::ReadWrite,
+                    reason: if feature == Feature::CpuCcdAffinity {
+                        "Saved for the Omen Hub++ background service, which pins the foreground program to the selected CCDs and restores it at all CCDs"
+                    } else {
+                        "Windows setting with exact readback and restore"
+                    }
+                    .into(),
+                    integer_range,
+                    requires_ac: false,
+                    startup_safe: true,
+                },
+                Err(reason) => Capability::unsupported(feature, reason),
+            };
+        }
+        if feature == Feature::MaxFan {
+            // Capabilities describe qualified board support. Permission, live
+            // table/opaque state and durable originals are checked at capture,
+            // for every setting before the transaction dispatches its first SET.
+            if self.inventory.manufacturer != "HP"
+                || self.inventory.board != "8E35"
+                || self.inventory.bios != "F.13"
+            {
+                return Capability::unsupported(
+                    feature,
+                    omen_core::message::msg("support.err.fan_board", &[]),
+                );
+            }
+            return Capability{feature,access:Access::ReadWrite,reason:"Validated maximum-cooling override; live elevated capture checks exact fan table/state before any write. OFF releases only the override. Embedded software curves and physical lifecycle remain unqualified".into(),integer_range:None,requires_ac: false,startup_safe: true};
+        }
+        if matches!(feature, Feature::KeyboardEffect | Feature::KeyboardColors) {
+            // The unelevated editor may offer a qualified board function.
+            // Permission, exact live capability/opaque bytes and restorable
+            // mode are checked at capture for ALL settings before any SET.
+            if self.inventory.manufacturer != "HP"
+                || self.inventory.board != "8E35"
+                || self.inventory.bios != "F.13"
+            {
+                return Capability::unsupported(
+                    feature,
+                    omen_core::message::msg("support.err.keyboard_board", &[]),
+                );
+            }
+            return Capability {feature,access:Access::ReadWrite,reason:"Qualified classic four-zone RGB/static mode; elevated capture verifies the complete live layout and original before any write".into(),integer_range:None,requires_ac:false,startup_safe:true};
+        }
+        if feature == Feature::GpuVfCurve {
+            let verified = self.gpu_writes_verified();
+            let state: Result<omen_core::vf::VfState, String> = (|| {
+                let state = self.gpu_curve()?;
+                state.value()?;
+                Ok(state)
+            })();
+            return match state {Ok(_)=>Capability{feature,access:if verified||self.curve_calibration.is_some(){Access::ReadWrite}else{Access::NeedsValidation},reason:if verified||self.curve_calibration.is_some() {"Exact private Graphics frequency-at-voltage contract; voltage anchors are immutable, physical voltage ceiling and load stability are not certified"}else{"Curve GET is verified; SET/readback/restore validation is pending"}.into(),integer_range:None,requires_ac: false,startup_safe:verified&&self.curve_calibration.is_none()},Err(reason)=>Capability::unsupported(feature,reason)};
+        }
+        if matches!(
+            feature,
+            Feature::GpuCoreOffsetMhz | Feature::GpuMemoryOffsetMhz
+        ) {
+            if feature == Feature::GpuMemoryOffsetMhz {
+                if let Err(reason) = self.gpu_curve() {
+                    return Capability::unsupported(feature, reason);
+                }
+            }
+            // A live individual curve no longer blocks a global core offset
+            // (user decision, 30 October 2026): the write first clears its
+            // deltas; the captured curve returns with Restore.
+            if feature == Feature::GpuCoreOffsetMhz && !self.calibration {
+                if let Err(reason) = self.gpu_curve() {
+                    return Capability::unsupported(feature, reason);
+                }
+            }
+            let state = self.qualifies().and_then(|()| self.gpu()?.offset(feature));
+            return match state {
+                Ok(state) => {
+                    let setter = self
+                        .gpu()
+                        .and_then(|g| g.report())
+                        .is_ok_and(|r| r.clock_setter_export);
+                    let verified = self.gpu_writes_verified();
+                    let ready = setter && (verified || self.calibration);
+                    let range = if self.calibration {
+                        (
+                            if feature == Feature::GpuCoreOffsetMhz {
+                                -15
+                            } else {
+                                -24
+                            },
+                            if feature == Feature::GpuCoreOffsetMhz {
+                                15
+                            } else {
+                                24
+                            },
+                        )
+                    } else {
+                        (i64::from(state.minimum_mhz), i64::from(state.maximum_mhz))
+                    };
+                    Capability {
+                        feature,
+                        access: if ready {
+                            Access::ReadWrite
+                        } else {
+                            Access::NeedsValidation
+                        },
+                        reason: if ready {
+                            "Public NVML MHz offsets; driver ranges are not a stability guarantee"
+                                .into()
+                        } else {
+                            "Clock GET is verified; SET/readback/restore validation is pending"
+                                .into()
+                        },
+                        integer_range: Some(range),
+                        requires_ac: false,
+                        startup_safe: verified && !self.calibration,
+                    }
+                }
+                Err(reason) => Capability::unsupported(feature, reason),
+            };
+        }
+        if feature == Feature::HpSharedPowerMw {
+            // Written after the HP mode and before the transaction, like the
+            // Hub's SetConcurrentTdp. No TPP readback exists on this firmware.
+            if self.inventory.manufacturer != "HP"
+                || self.inventory.board != "8E35"
+                || self.inventory.bios != "F.13"
+            {
+                return Capability::unsupported(
+                    feature,
+                    omen_core::message::msg("support.err.board", &[]),
+                );
+            }
+            return Capability {
+                feature,
+                access: Access::ReadWrite,
+                reason:
+                    "Shared CPU+GPU budget written before the preset; no readback or restore exists"
+                        .into(),
+                integer_range: Some((1_000, 254_000)),
+                requires_ac: false,
+                startup_safe: true,
+            };
+        }
+        if feature == Feature::GpuDynamicBoostLimitMw {
+            if self.inventory.manufacturer != "HP"
+                || self.inventory.board != "8E35"
+                || self.inventory.bios != "F.13"
+                || !self
+                    .inventory
+                    .gpus
+                    .iter()
+                    .any(|g| g.to_ascii_lowercase().contains("rtx 5070 laptop"))
+            {
+                return Capability::unsupported(
+                    feature,
+                    omen_core::message::msg("vbios_tgp.err.unsupported", &[]),
+                );
+            }
+            return Capability {
+                feature,
+                access: Access::ReadWrite,
+                reason: "Flashless VBIOS Policy[2] Dynamic Boost TGP ceiling (115-175 W, verified via NVML)".into(),
+                integer_range: Some((
+                    i64::from(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W) * 1_000,
+                    i64::from(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W) * 1_000,
+                )),
+                requires_ac: true,
+                startup_safe: false,
+            };
+        }
+        let reason = match feature {
+            Feature::CpuFanCurve | Feature::GpuFanCurve => {
+                omen_core::message::msg("support.err.fan_profile", &[])
+            }
+            // The HP mode is the dashboard's switch, not a preset field.
+            Feature::OmenPerformanceMode => omen_core::message::msg("support.err.coupled_hp", &[]),
+            Feature::GpuVoltageOffsetMv | Feature::GpuVoltageLimitMv => {
+                omen_core::message::msg("support.err.gpu_voltage", &[])
+            }
+            Feature::GpuMemoryVoltageOffsetMv => {
+                omen_core::message::msg("support.err.vram_voltage", &[])
+            }
+            Feature::GpuCoreClockLimitMhz | Feature::GpuMemoryClockLimitMhz => {
+                omen_core::message::msg("support.err.locked_clocks", &[])
+            }
+            Feature::AmdCpuClockMhz | Feature::AmdCpuVoltageMv => {
+                omen_core::message::msg("support.err.cpu_fixed", &[])
+            }
+            Feature::CpuBoostProfile | Feature::CpuAllCoreVoltageOffsetMv => {
+                omen_core::message::msg("support.err.cpu_offset", &[])
+            }
+            _ => omen_core::message::msg("support.err.adapter_missing", &[]),
+        };
+        Capability::unsupported(feature, reason)
+    }
+
+    fn read(&mut self, feature: Feature) -> Result<Value, String> {
+        if feature == Feature::GpuPowerLimitMw {
+            return self
+                .gpu()?
+                .power_limit()
+                .map(|s| Value::Integer(i64::from(s.current_mw)));
+        }
+        if feature == Feature::GraphicsMode {
+            return Ok(Value::Choice(mux_choice(super::read_hp_graphics_mode(
+                &self.inventory,
+            )?)));
+        }
+        if super::cpu_tuning::handles(feature) {
+            let image = super::cpu_tuning::capture(self.smu()?, feature)?;
+            return super::cpu_tuning::value(feature, &image);
+        }
+        if uses_hp_gpu_power(feature) {
+            let status = super::read_hp_gpu_status(&self.inventory)?;
+            return Ok(Value::Boolean(gpu_flag(
+                feature,
+                status.custom_tgp_enabled,
+                status.ppab_enabled,
+            )));
+        }
+        if super::windows_settings::handles(feature) {
+            return super::windows_settings::read(feature);
+        }
+        if feature == Feature::MaxFan {
+            return Ok(Value::Boolean(self.fan()?.capture()?.state.enabled));
+        }
+        if uses_keyboard(feature) {
+            return keyboard_value(feature, &self.keyboard_state()?);
+        }
+        if feature == Feature::GpuVfCurve {
+            return self.gpu_curve()?.value();
+        }
+        self.gpu()?
+            .offset(feature)
+            .map(|s| Value::Integer(i64::from(s.current_mhz)))
+    }
+
+    fn capture(&mut self, feature: Feature) -> Result<Captured<RestoreState>, String> {
+        if feature == Feature::GpuPowerLimitMw {
+            return self.capture_public_power();
+        }
+        if feature == Feature::GraphicsMode {
+            let mode = super::read_hp_graphics_mode(&self.inventory)?;
+            let saved = Captured {
+                feature,
+                value: Value::Choice(mux_choice(mode)),
+                restore: RestoreState::HpGraphicsMode { mode },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if super::cpu_tuning::handles(feature) {
+            let image = super::cpu_tuning::capture(self.smu()?, feature)?;
+            // Restorability is a precondition, not something to discover only
+            // after a setter ran (e.g. a PBO pattern its setter cannot restore).
+            super::cpu_tuning::validate_original(feature, &image)?;
+            let saved = Captured {
+                feature,
+                value: super::cpu_tuning::value(feature, &image)?,
+                restore: RestoreState::AmdSmu { image },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if uses_hp_gpu_power(feature) {
+            let status = super::read_hp_gpu_status(&self.inventory)?;
+            let saved = Captured {
+                feature,
+                value: Value::Boolean(gpu_flag(
+                    feature,
+                    status.custom_tgp_enabled,
+                    status.ppab_enabled,
+                )),
+                restore: RestoreState::HpGpuPower {
+                    custom_tgp: status.custom_tgp_enabled,
+                    ppab: status.ppab_enabled,
+                },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if super::windows_settings::handles(feature) {
+            let image =
+                super::windows_settings::capture_for_scheme(feature, self.planned_power_scheme)?;
+            let saved = Captured {
+                feature,
+                value: super::windows_settings::value(feature, &image)?,
+                restore: RestoreState::Windows { image },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if feature == Feature::MaxFan {
+            let state = self.fan()?.capture()?;
+            let saved = Captured {
+                feature,
+                value: Value::Boolean(state.state.enabled),
+                restore: RestoreState::HpMaxFan { state },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if uses_keyboard(feature) {
+            let state = self.keyboard_state()?;
+            if feature == Feature::KeyboardEffect
+                && !state
+                    .legacy
+                    .as_ref()
+                    .is_some_and(|s| [0x64, 0xe4].contains(&s.brightness_raw_byte))
+            {
+                return Err(
+                    "Keyboard mode original is not an exactly restorable 64/E4 state".into(),
+                );
+            }
+            // A setting equal to its original is never written; the captured
+            // complete state is then this transaction's verified target.
+            self.keyboard_target = Some(state.clone());
+            let saved = Captured {
+                feature,
+                value: keyboard_value(feature, &state)?,
+                restore: RestoreState::HpKeyboardColors { state },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if feature == Feature::GpuVfCurve {
+            let state = self.gpu_curve()?;
+            self.curve_target = Some((state.value()?, state.clone()));
+            let saved = Captured {
+                feature,
+                value: state.value()?,
+                restore: RestoreState::NvidiaVfCurve {
+                    identity: self.gpu()?.identity()?,
+                    state,
+                    core_offset: self.gpu()?.offset(Feature::GpuCoreOffsetMhz)?,
+                },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        let gfx_curve = if matches!(
+            feature,
+            Feature::GpuCoreOffsetMhz | Feature::GpuMemoryOffsetMhz
+        ) {
+            Some(self.gpu_curve()?)
+        } else {
+            None
+        };
+        let gpu = self.gpu()?;
+        let state = gpu.offset(feature)?;
+        let identity = gpu.identity()?;
+        let related_core = if feature == Feature::GpuMemoryOffsetMhz {
+            Some(gpu.offset(Feature::GpuCoreOffsetMhz)?)
+        } else {
+            None
+        };
+        if feature == Feature::GpuCoreOffsetMhz {
+            self.curve_target = Some((
+                Value::Integer(i64::from(state.current_mhz)),
+                gfx_curve.clone().ok_or("No complete Graphics capture")?,
+            ));
+        }
+        let captured = Captured {
+            feature,
+            value: Value::Integer(i64::from(state.current_mhz)),
+            restore: RestoreState::NvidiaOffset {
+                identity,
+                state,
+                gfx_curve,
+                related_core,
+            },
+        };
+        self.captured.insert(feature, captured.clone());
+        Ok(captured)
+    }
+
+    fn restore(&mut self, saved: &Captured<RestoreState>) -> Result<(), String> {
+        if self.captured.get(&saved.feature) != Some(saved) {
+            return Err("Restore state was not captured by this controller session".into());
+        }
+        if matches!(saved.restore, RestoreState::NvidiaPowerLimit { .. }) {
+            return self.restore_public_power(saved);
+        }
+        if let RestoreState::Windows { image } = &saved.restore {
+            self.verify_captured(saved)?;
+            return super::windows_settings::restore(saved.feature, image);
+        }
+        if let RestoreState::HpGpuPower { custom_tgp, ppab } = &saved.restore {
+            super::write_hp_gpu_power(&self.inventory, *custom_tgp, *ppab)?;
+            return Ok(());
+        }
+        if let RestoreState::AmdSmu { image } = &saved.restore {
+            let feature = saved.feature;
+            // A firmware-kept PPT was never written: verify, do not write.
+            if self.firmware_ppt
+                && feature == Feature::CpuPptLimitMw
+                && super::cpu_tuning::capture(self.smu()?, feature)? == *image
+            {
+                return Ok(());
+            }
+            let tracing = self.cpu_readback_trace.is_some();
+            let mut samples = Vec::new();
+            let result =
+                super::cpu_tuning::restore(self.smu()?, feature, image, |elapsed_ms, live| {
+                    if tracing {
+                        samples.push(super::cpu_tuning::ReadbackSample {
+                            elapsed_ms,
+                            image: live.clone(),
+                        });
+                    }
+                });
+            if let Some(trace) = self.cpu_readback_trace.as_mut() {
+                trace.push(super::cpu_tuning::CpuReadbackTrace {
+                    feature,
+                    purpose: "restore",
+                    target: None,
+                    original: Some(image.clone()),
+                    samples,
+                    result: result.clone(),
+                });
+            }
+            return result;
+        }
+        if let RestoreState::HpGraphicsMode { mode } = &saved.restore {
+            super::write_hp_graphics_mode(&self.inventory, *mode)?;
+            if super::read_hp_graphics_mode(&self.inventory)? != *mode {
+                return Err("BIOS graphics mode did not return to its original".into());
+            }
+            return Ok(());
+        }
+        if let RestoreState::HpMaxFan { state } = &saved.restore {
+            if saved.feature != Feature::MaxFan
+                || saved.value != Value::Boolean(state.state.enabled)
+            {
+                return Err("Max-fan restore feature/value differs".into());
+            }
+            state.state.validate_restore()?;
+            let current = self.fan()?.capture()?;
+            let mut owned = state.clone();
+            owned.state = self
+                .fan_target
+                .clone()
+                .unwrap_or_else(|| state.state.clone());
+            if current != *state && current != owned {
+                return Err("Fan state changed outside the captured transaction".into());
+            }
+            self.fan()?.program(&current, state.state.enabled)?;
+            if self.fan()?.capture()? != *state {
+                return Err("Complete max-fan original differs after restore".into());
+            }
+            self.fan_target = Some(state.state.clone());
+            return Ok(());
+        }
+        if let RestoreState::HpKeyboardColors { state } = &saved.restore {
+            if !uses_keyboard(saved.feature) || saved.value != keyboard_value(saved.feature, state)?
+            {
+                return Err("Keyboard restore image/value differs".into());
+            }
+            let current = self.keyboard_state()?;
+            if state.board != current.board
+                || state.bios != current.bios
+                || state.capability != current.capability
+            {
+                return Err(
+                    "Keyboard identity changed; restore will not address another device".into(),
+                );
+            }
+            // Best-effort rollback of the bounded RGB fields uses a fresh wire
+            // image. Never send opaque bytes from the saved image. A concurrent
+            // brightness/mode change remains untouched and fails full verification.
+            self.keyboard()?.set(&current, &state.colors()?)?;
+            if self.captured.contains_key(&Feature::KeyboardEffect) {
+                let live = self.keyboard_state()?;
+                self.keyboard()?
+                    .set_mode(&live, state.custom_colors_enabled()?)?;
+            }
+            if self.keyboard_state()? != *state {
+                return Err("Complete keyboard original did not restore".into());
+            }
+            return Ok(());
+        }
+        self.qualifies()?;
+        if let RestoreState::NvidiaVfCurve {
+            identity,
+            state,
+            core_offset,
+        } = &saved.restore
+        {
+            if saved.feature != Feature::GpuVfCurve
+                || identity != &self.gpu()?.identity()?
+                || saved.value != state.value()?
+            {
+                return Err("V/F restore image identity/value differs".into());
+            }
+            return self.restore_graphics(state, Some(core_offset));
+        }
+        let RestoreState::NvidiaOffset {
+            identity,
+            state,
+            gfx_curve,
+            related_core,
+        } = &saved.restore
+        else {
+            unreachable!()
+        };
+        let gpu = self.gpu()?;
+        if identity != &gpu.identity()?
+            || state.feature != saved.feature
+            || saved.value != Value::Integer(i64::from(state.current_mhz))
+        {
+            return Err("Restore image does not match this GPU/driver/domain".into());
+        }
+        let current = gpu.offset(saved.feature)?;
+        if current.current_mhz != state.current_mhz {
+            // Returning to a captured original must remain possible near a thermal guard.
+            gpu.set_offset(&Setting {
+                feature: saved.feature,
+                value: saved.value.clone(),
+            })?;
+        }
+        if let Some(original) = gfx_curve {
+            self.restore_graphics(original, related_core.as_ref())?;
+        }
+        if self.gpu()?.offset(saved.feature)? != *state {
+            return Err("Full clock-offset restore readback differs".into());
+        }
+        Ok(())
+    }
+
+    fn verify_captured(&mut self, saved: &Captured<RestoreState>) -> Result<(), String> {
+        if matches!(saved.restore, RestoreState::NvidiaPowerLimit { .. }) {
+            return self.verify_public_power(saved);
+        }
+        if self.captured.get(&saved.feature) != Some(saved) {
+            return Err("Control verification image is not owned by this session".into());
+        }
+        if let RestoreState::Windows { image } = &saved.restore {
+            let live = super::windows_settings::capture_like(saved.feature, image)?;
+            let owned = self
+                .windows_targets
+                .get(&saved.feature)
+                .map(|value| {
+                    super::windows_settings::image_owned(saved.feature, image, &live, value)
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if live != *image && !owned {
+                return Err("Windows setting differs from its original and target".into());
+            }
+            return Ok(());
+        }
+        if let RestoreState::HpGraphicsMode { mode } = &saved.restore {
+            let live = super::read_hp_graphics_mode(&self.inventory)?;
+            if live != *mode
+                && self.windows_targets.get(&saved.feature)
+                    != Some(&Value::Choice(mux_choice(live)))
+            {
+                return Err("BIOS graphics mode differs from its original and target".into());
+            }
+            return Ok(());
+        }
+        if let RestoreState::AmdSmu { image } = &saved.restore {
+            let feature = saved.feature;
+            let live = super::cpu_tuning::capture(self.smu()?, feature)?;
+            let owned = match self.windows_targets.get(&feature).cloned() {
+                Some(target) => super::cpu_tuning::image_owned(feature, image, &live, &target)?,
+                None => false,
+            };
+            if live != *image && !owned {
+                return Err(omen_core::message::msg(
+                    "cpu.err.changed_externally",
+                    &[&format!("@field.{feature:?}")],
+                ));
+            }
+            return Ok(());
+        }
+        if let RestoreState::HpGpuPower { custom_tgp, ppab } = &saved.restore {
+            let live = super::read_hp_gpu_status(&self.inventory)?;
+            // A flag differing from its original is ours only if this
+            // transaction wrote that flag's own field to the live value.
+            let owned = |tgp: bool, live: bool| {
+                self.windows_targets.iter().any(|(feature, target)| {
+                    uses_hp_gpu_power(*feature)
+                        && (*feature == Feature::GpuCustomTgp) == tgp
+                        && target == &Value::Boolean(live)
+                })
+            };
+            if (live.custom_tgp_enabled != *custom_tgp && !owned(true, live.custom_tgp_enabled))
+                || (live.ppab_enabled != *ppab && !owned(false, live.ppab_enabled))
+            {
+                return Err("HP GPU-power flags differ from original and target".into());
+            }
+            return Ok(());
+        }
+        if let RestoreState::HpMaxFan { state } = &saved.restore {
+            if saved.feature != Feature::MaxFan
+                || saved.value != Value::Boolean(state.state.enabled)
+            {
+                return Err("Max-fan capture differs".into());
+            }
+            let current = self.fan()?.capture()?;
+            let mut owned = state.clone();
+            owned.state = self
+                .fan_target
+                .clone()
+                .unwrap_or_else(|| state.state.clone());
+            if current != *state && current != owned {
+                return Err("Max-fan controls differ from original/owned target".into());
+            }
+            return Ok(());
+        }
+        if let RestoreState::HpKeyboardColors { state } = &saved.restore {
+            let actual = self.keyboard_state()?;
+            if actual != *state && self.keyboard_target.as_ref() != Some(&actual) {
+                return Err("Keyboard controls differ from the captured complete state".into());
+            }
+            return Ok(());
+        }
+        let (offset, curve, related) = match &saved.restore {
+            RestoreState::NvidiaOffset {
+                state,
+                gfx_curve,
+                related_core,
+                ..
+            } => (state, gfx_curve.as_ref(), related_core.as_ref()),
+            RestoreState::NvidiaVfCurve {
+                state, core_offset, ..
+            } => (core_offset, Some(state), None),
+            RestoreState::HpKeyboardColors { .. }
+            | RestoreState::NvidiaPowerLimit { .. }
+            | RestoreState::HpMaxFan { .. }
+            | RestoreState::Windows { .. }
+            | RestoreState::HpGpuPower { .. }
+            | RestoreState::AmdSmu { .. }
+            | RestoreState::HpGraphicsMode { .. } => unreachable!(),
+        };
+        if self.gpu()?.offset(offset.feature)? != *offset {
+            return Err("Captured global offset controls differ".into());
+        }
+        let curve_matches = curve
+            .map(|curve| curve.controls_match(&self.gpu_curve()?))
+            .transpose()?;
+        if curve_matches == Some(false) {
+            // A preceding setting in this same transaction may intentionally
+            // change a Memory adapter's captured Graphics alias. Accept only
+            // the exact independently read-back control image we programmed.
+            let owned = if saved.feature == Feature::GpuMemoryOffsetMhz {
+                self.curve_target
+                    .clone()
+                    .map(|(_, target)| target.controls_match(&self.gpu_curve()?))
+                    .transpose()?
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if !owned {
+                return Err("Captured full Graphics curve controls differ".into());
+            }
+        }
+        if let Some(related) = related {
+            let live = self.gpu()?.offset(related.feature)?;
+            let owned_core =
+                self.curve_target.as_ref().is_some_and(|(value, _)| {
+                    *value == Value::Integer(i64::from(live.current_mhz))
+                }) && live.feature == related.feature
+                    && live.minimum_mhz == related.minimum_mhz
+                    && live.maximum_mhz == related.maximum_mhz;
+            let owned_curve = if let Some((Value::VfCurve(_), target)) = self.curve_target.clone() {
+                target.controls_match(&self.gpu_curve()?)?
+                    && live.feature == related.feature
+                    && live.minimum_mhz == related.minimum_mhz
+                    && live.maximum_mhz == related.maximum_mhz
+                    && (live.minimum_mhz..=live.maximum_mhz).contains(&live.current_mhz)
+            } else {
+                false
+            };
+            if live != *related && !owned_core && !owned_curve {
+                return Err("Captured related core controls differ".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_target(&mut self, setting: &Setting) -> Result<Value, String> {
+        if setting.feature == Feature::GpuPowerLimitMw {
+            return self.verify_public_power_target(setting);
+        }
+        if setting.feature == Feature::GraphicsMode {
+            let actual = self.read(setting.feature)?;
+            return if actual == setting.value {
+                Ok(actual)
+            } else {
+                Err("BIOS graphics mode readback differs".into())
+            };
+        }
+        if super::cpu_tuning::handles(setting.feature) {
+            let tracing = self.cpu_readback_trace.is_some();
+            let mut samples = Vec::new();
+            let result = super::cpu_tuning::verify_target(
+                self.smu()?,
+                setting.feature,
+                &setting.value,
+                |elapsed_ms, live| {
+                    if tracing {
+                        samples.push(super::cpu_tuning::ReadbackSample {
+                            elapsed_ms,
+                            image: live.clone(),
+                        });
+                    }
+                },
+            );
+            if let Some(trace) = self.cpu_readback_trace.as_mut() {
+                trace.push(super::cpu_tuning::CpuReadbackTrace {
+                    feature: setting.feature,
+                    purpose: "target",
+                    target: Some(setting.value.clone()),
+                    original: None,
+                    samples,
+                    result: result.as_ref().map(|_| ()).map_err(Clone::clone),
+                });
+            }
+            return result.map(|_| setting.value.clone());
+        }
+        if uses_hp_gpu_power(setting.feature) {
+            let actual = self.read(setting.feature)?;
+            return if actual == setting.value {
+                Ok(actual)
+            } else {
+                Err(format!("{:?} readback differs", setting.feature))
+            };
+        }
+        if super::windows_settings::handles(setting.feature) {
+            let RestoreState::Windows { image } = &self
+                .captured
+                .get(&setting.feature)
+                .ok_or("No captured Windows target")?
+                .restore
+            else {
+                return Err("Wrong Windows adapter".into());
+            };
+            return if super::windows_settings::verify_target(
+                setting.feature,
+                image,
+                &setting.value,
+            )? {
+                Ok(setting.value.clone())
+            } else {
+                Err(format!(
+                    "Readback mismatch for {:?}: full Windows target differs",
+                    setting.feature
+                ))
+            };
+        }
+        if setting.feature == Feature::MaxFan {
+            let Value::Boolean(enabled) = setting.value else {
+                return Err("Max-fan target is not boolean".into());
+            };
+            let saved = self
+                .captured
+                .get(&Feature::MaxFan)
+                .ok_or("No max-fan capture")?;
+            let RestoreState::HpMaxFan { state } = &saved.restore else {
+                return Err("Wrong max-fan adapter".into());
+            };
+            let mut target = state.clone();
+            target.state = state.state.target(enabled)?;
+            if self.fan()?.capture()? != target {
+                return Err("Complete max-fan target readback differs".into());
+            }
+            if self.fan_calibration {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let report = self.fan_report()?;
+                if report.max_fan != target.state {
+                    return Err("Max-fan flag did not remain set during the fixed trial".into());
+                }
+                self.fan_observations.push(report);
+            }
+            return Ok(setting.value.clone());
+        }
+        if uses_keyboard(setting.feature) {
+            let expected = self
+                .keyboard_target
+                .as_ref()
+                .ok_or("No complete keyboard target proof")?
+                .clone();
+            let actual = self.keyboard_state()?;
+            let actual_value = if setting.feature == Feature::KeyboardEffect
+                && setting.value == Value::Choice(Choice::Off)
+                && !actual.custom_colors_enabled()?
+            {
+                Value::Choice(Choice::Off)
+            } else {
+                keyboard_value(setting.feature, &actual)?
+            };
+            if actual != expected || setting.value != actual_value {
+                return Err("Keyboard target, opaque fields or brightness readback differs".into());
+            }
+            return Ok(setting.value.clone());
+        }
+        if matches!(
+            setting.feature,
+            Feature::GpuVfCurve | Feature::GpuCoreOffsetMhz
+        ) {
+            let (wanted_value, wanted_state) = self
+                .curve_target
+                .clone()
+                .ok_or("No complete programmed curve proof")?;
+            let actual = self.gpu_curve()?;
+            if setting.value != wanted_value || !wanted_state.controls_match(&actual)? {
+                return Err(format!(
+                    "Programmed V/F control image differs: expected deltas {:?}, actual {:?}",
+                    wanted_state
+                        .nodes
+                        .iter()
+                        .map(|p| p.delta_khz)
+                        .collect::<Vec<_>>(),
+                    actual.nodes.iter().map(|p| p.delta_khz).collect::<Vec<_>>()
+                ));
+            }
+            if setting.feature == Feature::GpuVfCurve {
+                return actual.value();
+            }
+        }
+        let actual = self.read(setting.feature)?;
+        if setting.feature == Feature::GpuMemoryOffsetMhz
+            && !self.captured.contains_key(&Feature::GpuVfCurve)
+            && !self.captured.contains_key(&Feature::GpuCoreOffsetMhz)
+        {
+            let saved = self
+                .captured
+                .get(&setting.feature)
+                .cloned()
+                .ok_or("No complete memory capture")?;
+            if let RestoreState::NvidiaOffset {
+                gfx_curve: Some(original),
+                related_core: Some(core),
+                ..
+            } = &saved.restore
+            {
+                if !original.controls_match(&self.gpu_curve()?)?
+                    || self.gpu()?.offset(Feature::GpuCoreOffsetMhz)? != *core
+                {
+                    return Err("Memory-only tuning changed the captured Graphics controls".into());
+                }
+            } else {
+                return Err("No coupled Graphics restore image for memory tuning".into());
+            }
+        }
+        if actual == setting.value {
+            Ok(actual)
+        } else {
+            Err(format!(
+                "Readback mismatch for {:?}: requested {:?}, obtained {:?}",
+                setting.feature, setting.value, actual
+            ))
+        }
+    }
+
+    fn captured_matches_target(
+        &mut self,
+        saved: &Captured<RestoreState>,
+        target: &Setting,
+    ) -> Result<bool, String> {
+        match &saved.restore {
+            RestoreState::AmdSmu { image } => {
+                super::cpu_tuning::image_matches(target.feature, image, &target.value)
+            }
+            RestoreState::Windows { image } => {
+                super::windows_settings::image_matches(target.feature, image, &target.value)
+            }
+            RestoreState::HpGpuPower { custom_tgp, ppab } => {
+                Ok(target.value == Value::Boolean(gpu_flag(target.feature, *custom_tgp, *ppab)))
+            }
+            _ => Ok(saved.value == target.value),
+        }
+    }
+
+    fn prepare_recovery(
+        &mut self,
+        transaction: &PendingTransaction<RestoreState>,
+    ) -> Result<(), String> {
+        transaction.validate()?;
+        if transaction.requested.iter().any(|s| {
+            matches!(
+                s.feature,
+                Feature::GpuCoreOffsetMhz | Feature::GpuMemoryOffsetMhz | Feature::GpuVfCurve
+            )
+        }) {
+            self.qualifies()?;
+        }
+        // Same rule as plan/apply/recover: an incidental NVIDIA identity in a
+        // non-GPU transaction is not checked (and the GPU is not opened).
+        if !transaction
+            .binding
+            .for_settings(&transaction.requested)
+            .matches(&self.context()?.binding)
+        {
+            return Err("Recovery device binding differs".into());
+        }
+        // Validate every image/current value before arming any restore. A user or
+        // other controller's unrelated tuning must never be overwritten silently.
+        for (saved, requested) in transaction.original.iter().zip(&transaction.requested) {
+            if matches!(saved.restore, RestoreState::NvidiaPowerLimit { .. }) {
+                self.prepare_public_power_recovery(saved, requested)?;
+                continue;
+            }
+            if let RestoreState::HpGraphicsMode { mode } = &saved.restore {
+                // A changed live value no longer blocks Restore (user rule,
+                // 30 October 2026); the original is written back.
+                let _ = mode;
+                if requested.feature != saved.feature {
+                    return Err("Persisted graphics-mode feature differs".into());
+                }
+                self.windows_targets
+                    .insert(saved.feature, requested.value.clone());
+                continue;
+            }
+            if let RestoreState::AmdSmu { image } = &saved.restore {
+                let feature = saved.feature;
+                super::cpu_tuning::validate_original(feature, image)?;
+                if requested.feature != feature {
+                    return Err("Persisted SMU feature differs".into());
+                }
+                self.windows_targets
+                    .insert(feature, requested.value.clone());
+                continue;
+            }
+            if let RestoreState::HpGpuPower { custom_tgp, ppab } = &saved.restore {
+                let _ = (custom_tgp, ppab);
+                if requested.feature != saved.feature {
+                    return Err("Persisted HP GPU-power feature differs".into());
+                }
+                self.windows_targets
+                    .insert(saved.feature, requested.value.clone());
+                continue;
+            }
+            if let RestoreState::Windows { image } = &saved.restore {
+                let _ = image;
+                if requested.feature != saved.feature {
+                    return Err("Persisted Windows feature differs".into());
+                }
+                self.windows_targets
+                    .insert(saved.feature, requested.value.clone());
+                continue;
+            }
+            if let RestoreState::HpMaxFan { state } = &saved.restore {
+                if saved.feature != Feature::MaxFan
+                    || requested.feature != Feature::MaxFan
+                    || saved.value != Value::Boolean(state.state.enabled)
+                {
+                    return Err("Persisted max-fan feature/value differs".into());
+                }
+                state.state.validate_restore()?;
+                let Value::Boolean(enabled) = requested.value else {
+                    return Err("Persisted max-fan target is not boolean".into());
+                };
+                let mut target = state.clone();
+                target.state = state.state.target(enabled)?;
+
+                self.fan_target = Some(target.state);
+                continue;
+            }
+            if let RestoreState::HpKeyboardColors { state } = &saved.restore {
+                if !uses_keyboard(saved.feature)
+                    || requested.feature != saved.feature
+                    || saved.value != keyboard_value(saved.feature, state)?
+                {
+                    return Err("Persisted keyboard restore image/value differs".into());
+                }
+                let target = lighting_target(state, &transaction.requested)?;
+                let allow_mode = transaction
+                    .requested
+                    .iter()
+                    .any(|s| s.feature == Feature::KeyboardEffect);
+                let current = self.keyboard_state()?;
+                if !state.same_invariant_controls(&current, allow_mode)? {
+                    return Err("Keyboard opaque fields differ; no recovery SET is allowed".into());
+                }
+
+                self.keyboard_target = Some(target);
+                continue;
+            }
+            if let RestoreState::NvidiaVfCurve {
+                identity,
+                state,
+                core_offset,
+            } = &saved.restore
+            {
+                if identity != &self.gpu()?.identity()?
+                    || saved.feature != Feature::GpuVfCurve
+                    || saved.value != state.value()?
+                {
+                    return Err("Persisted V/F restore image differs".into());
+                }
+                let live_offset = self.gpu()?.offset(Feature::GpuCoreOffsetMhz)?;
+                if core_offset.feature != Feature::GpuCoreOffsetMhz
+                    || core_offset.minimum_mhz != live_offset.minimum_mhz
+                    || core_offset.maximum_mhz != live_offset.maximum_mhz
+                    || !(core_offset.minimum_mhz..=core_offset.maximum_mhz)
+                        .contains(&core_offset.current_mhz)
+                {
+                    return Err("Persisted V/F offset domain or driver bounds differ".into());
+                }
+                let Value::VfCurve(target) = &requested.value else {
+                    return Err("Persisted V/F target is invalid".into());
+                };
+                let deltas = state.target_deltas(target)?;
+                let current = self.gpu_curve()?;
+                if state.first_index != current.first_index
+                    || state.last_index != current.last_index
+                    || state.nodes.len() != current.nodes.len()
+                    || state.minimum_delta_khz != current.minimum_delta_khz
+                    || state.maximum_delta_khz != current.maximum_delta_khz
+                    || state.nodes.iter().zip(&current.nodes).zip(&deltas).any(
+                        |((before, actual), _)| {
+                            before.index != actual.index || before.voltage_uv != actual.voltage_uv
+                        },
+                    )
+                {
+                    // Only the curve's structure must match; changed deltas
+                    // are written back to the original.
+                    return Err("V/F curve structure differs from the recorded image".into());
+                }
+                continue;
+            }
+            let RestoreState::NvidiaOffset {
+                identity,
+                state,
+                gfx_curve,
+                related_core,
+            } = &saved.restore
+            else {
+                unreachable!()
+            };
+            let gpu = self.gpu()?;
+            let current = gpu.offset(saved.feature)?;
+            if identity != &gpu.identity()?
+                || state.feature != saved.feature
+                || saved.value != Value::Integer(i64::from(state.current_mhz))
+                || current.minimum_mhz != state.minimum_mhz
+                || current.maximum_mhz != state.maximum_mhz
+                || !(state.minimum_mhz..=state.maximum_mhz).contains(&state.current_mhz)
+            {
+                return Err("Recovery image identity/domain/limits differ from the driver".into());
+            }
+
+            if let Some(before) = gfx_curve {
+                if saved.feature == Feature::GpuMemoryOffsetMhz
+                    && related_core.is_none()
+                    && current.current_mhz != state.current_mhz
+                {
+                    return Err("Memory recovery is missing its related global core image".into());
+                }
+                before.validate()?;
+                // Only the structure must match; changed deltas are written back.
+                let current = self.gpu_curve()?;
+                if !before.domain_matches(&current)? {
+                    return Err(
+                        "Recorded global-offset V/F image has a different curve structure".into(),
+                    );
+                }
+            } else if matches!(
+                saved.feature,
+                Feature::GpuCoreOffsetMhz | Feature::GpuMemoryOffsetMhz
+            ) {
+                let curve = self.gpu_curve()?;
+                if current.current_mhz != state.current_mhz
+                    || curve
+                        .nodes
+                        .iter()
+                        .any(|p| p.delta_khz != curve.nodes[0].delta_khz)
+                {
+                    return Err("Legacy offset recovery lacks a complete V/F original; no clock write is permitted".into());
+                }
+            }
+            if let Some(before) = related_core {
+                let actual = self.gpu()?.offset(Feature::GpuCoreOffsetMhz)?;
+                let requested_core = transaction.requested.iter().find_map(|s| {
+                    if s.feature == Feature::GpuCoreOffsetMhz {
+                        if let Value::Integer(v) = s.value {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                // A complete V/F SET can change the scalar NVML alias. Every
+                // original/target Graphics control was checked above; its
+                // summary must keep the same domain and hardware bounds.
+                let curve_alias = transaction
+                    .requested
+                    .iter()
+                    .any(|s| s.feature == Feature::GpuVfCurve)
+                    && (actual.minimum_mhz..=actual.maximum_mhz).contains(&actual.current_mhz);
+                if before.feature != Feature::GpuCoreOffsetMhz
+                    || before.minimum_mhz != actual.minimum_mhz
+                    || before.maximum_mhz != actual.maximum_mhz
+                    || !(before.minimum_mhz..=before.maximum_mhz).contains(&before.current_mhz)
+                    || (actual.current_mhz != before.current_mhz
+                        && Some(i64::from(actual.current_mhz)) != requested_core
+                        && !curve_alias)
+                {
+                    return Err(
+                        "Related core offset differs from the recorded original/target".into(),
+                    );
+                }
+            }
+        }
+        self.captured = transaction
+            .original
+            .iter()
+            .map(|s| (s.feature, s.clone()))
+            .collect();
+        Ok(())
+    }
+
+    fn write(&mut self, setting: &Setting) -> Result<(), String> {
+        let context = self.context()?;
+        let capability = self.capability(setting.feature);
+        if capability.access != Access::ReadWrite
+            || (capability.requires_ac && context.ac_connected != Some(true))
+        {
+            return Err(capability.reason);
+        }
+        if setting.feature == Feature::GpuPowerLimitMw {
+            return self.write_public_power(setting);
+        }
+        if setting.feature == Feature::GraphicsMode {
+            let Value::Choice(choice) = setting.value else {
+                return Err("Graphics mode needs a choice".into());
+            };
+            if !self.captured.contains_key(&setting.feature) {
+                return Err("No captured graphics mode".into());
+            }
+            super::write_hp_graphics_mode(&self.inventory, mux_mode(choice)?)?;
+            self.windows_targets
+                .insert(setting.feature, setting.value.clone());
+            return Ok(());
+        }
+        if super::cpu_tuning::handles(setting.feature) {
+            let Some(saved) = self.captured.get(&setting.feature) else {
+                return Err("No captured SMU original".into());
+            };
+            if self.firmware_ppt && setting.feature == Feature::CpuPptLimitMw {
+                // Nothing is written; the value is skipped and named.
+                let held = match &saved.value {
+                    Value::Integer(mw) => format!("{} W", mw / 1000),
+                    other => format!("{other:?}"),
+                };
+                return Err(omen_core::message::msg("cpu.err.firmware_ppt", &[&held]));
+            }
+            super::cpu_tuning::write(self.smu()?, setting.feature, &setting.value)?;
+            self.windows_targets
+                .insert(setting.feature, setting.value.clone());
+            return Ok(());
+        }
+        if uses_hp_gpu_power(setting.feature) {
+            let Value::Boolean(on) = setting.value else {
+                return Err("cTGP and Dynamic Boost need on/off".into());
+            };
+            // Read-modify-write: the field's own flag changes, the other keeps
+            // its live value. Restore returns both captured flags.
+            let live = super::read_hp_gpu_status(&self.inventory)?;
+            let (custom_tgp, ppab) = gpu_flags_with(
+                setting.feature,
+                live.custom_tgp_enabled,
+                live.ppab_enabled,
+                on,
+            );
+            super::write_hp_gpu_power(&self.inventory, custom_tgp, ppab)?;
+            self.windows_targets
+                .insert(setting.feature, setting.value.clone());
+            return Ok(());
+        }
+        if super::windows_settings::handles(setting.feature) {
+            let saved = self
+                .captured
+                .get(&setting.feature)
+                .ok_or("No captured Windows original")?
+                .clone();
+            let RestoreState::Windows { image } = &saved.restore else {
+                return Err("Windows capture has another adapter".into());
+            };
+            self.windows_targets
+                .insert(setting.feature, setting.value.clone());
+            super::windows_settings::write(setting.feature, image, &setting.value)?;
+            return Ok(());
+        }
+        if setting.feature == Feature::MaxFan {
+            let Value::Boolean(enabled) = setting.value else {
+                return Err("Max-fan target requires a boolean".into());
+            };
+            if self.fan_calibration && !enabled {
+                return Err("Qualification only enables maximum cooling".into());
+            }
+            let saved = self
+                .captured
+                .get(&Feature::MaxFan)
+                .ok_or("Missing durable max-fan original")?
+                .clone();
+            let RestoreState::HpMaxFan { state } = &saved.restore else {
+                return Err("Wrong max-fan adapter".into());
+            };
+            let current = self.fan()?.capture()?;
+            let mut owned = state.clone();
+            owned.state = self
+                .fan_target
+                .clone()
+                .unwrap_or_else(|| state.state.clone());
+            if current != *state && current != owned {
+                return Err("Max-fan controls changed outside this transaction".into());
+            }
+            self.fan_target = Some(state.state.target(enabled)?);
+            self.fan()?.program(&current, enabled)?;
+            return Ok(());
+        }
+        if setting.feature == Feature::KeyboardEffect {
+            let Value::Choice(mode) = setting.value else {
+                return Err("Missing classic keyboard mode".into());
+            };
+            if !matches!(mode, Choice::Static | Choice::FirmwareDefault | Choice::Off)
+                || self
+                    .keyboard_mode_calibration
+                    .is_some_and(|allowed| allowed != mode)
+            {
+                return Err("Keyboard mode is outside the qualified operation".into());
+            }
+            let saved = self
+                .captured
+                .get(&setting.feature)
+                .ok_or("No durable mode capture")?
+                .clone();
+            let RestoreState::HpKeyboardColors { state } = saved.restore else {
+                return Err("Wrong keyboard mode adapter".into());
+            };
+            let live = self.keyboard_state()?;
+            if live != state && self.keyboard_target.as_ref() != Some(&live) {
+                return Err("Mode controls changed outside this transaction".into());
+            }
+            self.keyboard_target = Some(self.keyboard()?.set_mode(&live, mode == Choice::Static)?);
+            return Ok(());
+        }
+        if setting.feature == Feature::KeyboardColors {
+            let Value::Colors(colors) = &setting.value else {
+                return Err("Keyboard color target is not typed RGB".into());
+            };
+            if self
+                .keyboard_calibration
+                .as_ref()
+                .is_some_and(|allowed| allowed != colors)
+            {
+                return Err(
+                    "Keyboard calibration permits only its fixed one-component delta".into(),
+                );
+            }
+            let saved = self
+                .captured
+                .get(&setting.feature)
+                .ok_or("No durable keyboard capture")?
+                .clone();
+            let RestoreState::HpKeyboardColors { state } = saved.restore else {
+                return Err("Keyboard capture has another adapter".into());
+            };
+            let live = self.keyboard_state()?;
+            if live != state && self.keyboard_target.as_ref() != Some(&live) {
+                return Err("RGB controls changed outside this transaction".into());
+            }
+            self.keyboard_target = Some(self.keyboard()?.set(&live, colors)?);
+            return Ok(());
+        }
+        if setting.feature == Feature::GpuVfCurve {
+            self.validate_setting(setting)?;
+            self.gpu()?.thermal_guard(87)?;
+            let Value::VfCurve(target) = &setting.value else {
+                return Err("V/F target must be a complete typed curve".into());
+            };
+            let state = match &self
+                .captured
+                .get(&setting.feature)
+                .ok_or("No durable curve capture")?
+                .restore
+            {
+                RestoreState::NvidiaVfCurve { state, .. } => state.clone(),
+                _ => return Err("Curve capture has another adapter".into()),
+            };
+            let proof = state.target_state(target)?;
+            let deltas: Vec<_> = proof.nodes.iter().map(|p| (p.index, p.delta_khz)).collect();
+            self.curve()?.set_deltas(&state, &deltas)?;
+            self.curve_target = Some((setting.value.clone(), proof));
+            return Ok(());
+        }
+        let Value::Integer(value) = setting.value else {
+            return Err("Clock offset needs an integer".into());
+        };
+        let (minimum, maximum) = capability.integer_range.ok_or("No driver bounds")?;
+        if !(minimum..=maximum).contains(&value) {
+            return Err("Value outside validated operation bounds".into());
+        }
+        let gpu = self.gpu()?;
+        // The measured HP threshold is 87 C; keep three degrees of headroom
+        // below the stricter of that threshold and the driver's slowdown limit.
+        gpu.thermal_guard(87)?;
+        let memory_graphics = if setting.feature == Feature::GpuMemoryOffsetMhz {
+            Some((
+                self.gpu_curve()?,
+                self.gpu()?.offset(Feature::GpuCoreOffsetMhz)?,
+            ))
+        } else {
+            None
+        };
+        if setting.feature == Feature::GpuCoreOffsetMhz && !self.calibration {
+            // A global offset replaces an individual curve: clear its deltas
+            // first (verified by the curve readback); Restore brings it back.
+            let live = self.gpu_curve()?;
+            if live
+                .nodes
+                .iter()
+                .any(|p| p.delta_khz != live.nodes[0].delta_khz)
+            {
+                let zero: Vec<_> = live.nodes.iter().map(|p| (p.index, 0)).collect();
+                self.curve()?.set_deltas(&live, &zero)?;
+            }
+        }
+        self.gpu()?.set_offset(setting)?;
+        if setting.feature == Feature::GpuMemoryOffsetMhz {
+            if let Some((curve, core)) = memory_graphics {
+                self.restore_graphics(&curve, Some(&core))?;
+            } else {
+                return Err("Memory write requires a complete Graphics restore image".into());
+            }
+        } else if setting.feature == Feature::GpuCoreOffsetMhz {
+            self.curve_target = Some((setting.value.clone(), self.gpu_curve()?));
+        }
+        Ok(())
+    }
+    fn validate_setting(&mut self, setting: &Setting) -> Result<(), String> {
+        setting.validate()?;
+        if setting.feature == Feature::GpuPowerLimitMw {
+            let Value::Integer(value) = setting.value else {
+                return Err("GPU power needs milliwatts".into());
+            };
+            return self.gpu()?.power_limit()?.target(value).map(|_| ());
+        }
+        if super::windows_settings::handles(setting.feature) {
+            return super::windows_settings::validate(setting.feature, &setting.value);
+        }
+        if super::cpu_tuning::handles(setting.feature) {
+            return super::cpu_tuning::validate(setting.feature, &setting.value);
+        }
+        if setting.feature == Feature::GraphicsMode {
+            let Value::Choice(choice) = setting.value else {
+                return Err("Graphics mode needs a choice".into());
+            };
+            return mux_mode(choice).map(|_| ());
+        }
+        if setting.feature == Feature::KeyboardEffect {
+            let Value::Choice(mode) = setting.value else {
+                return Err("Typed keyboard mode missing".into());
+            };
+            if !matches!(mode, Choice::Static | Choice::FirmwareDefault | Choice::Off)
+                || self
+                    .keyboard_mode_calibration
+                    .is_some_and(|allowed| allowed != mode)
+            {
+                return Err("Only the measured classic mode choices are supported".into());
+            }
+        }
+        if setting.feature == Feature::KeyboardColors {
+            let Value::Colors(colors) = &setting.value else {
+                return Err("Typed RGB colors are required".into());
+            };
+            if colors.len() != 4 {
+                return Err("The qualified keyboard needs exactly four RGB zones".into());
+            }
+            if self
+                .keyboard_calibration
+                .as_ref()
+                .is_some_and(|allowed| allowed != colors)
+            {
+                return Err("The fixed RGB trial does not allow other targets".into());
+            }
+        }
+        if setting.feature == Feature::GpuVfCurve {
+            let Value::VfCurve(points) = &setting.value else {
+                return Err("V/F curve value missing".into());
+            };
+            let state = self.gpu_curve()?;
+            state.target_deltas(points)?;
+            if let Some(operation) = self.curve_calibration {
+                operation.validate(&state, points)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mux_choice_and_mode_bidirectional() {
+        assert_eq!(mux_choice(0), Choice::Hybrid);
+        assert_eq!(mux_choice(1), Choice::DiscreteOnly);
+        assert_eq!(mux_choice(3), Choice::IntegratedOnly);
+        assert_eq!(mux_choice(2), Choice::Manual);
+        assert_eq!(mux_choice(255), Choice::Manual);
+
+        assert_eq!(mux_mode(Choice::Hybrid).unwrap(), 0);
+        assert_eq!(mux_mode(Choice::DiscreteOnly).unwrap(), 1);
+        assert_eq!(mux_mode(Choice::IntegratedOnly).unwrap(), 3);
+        assert!(mux_mode(Choice::Manual).is_err());
+        assert!(mux_mode(Choice::Balanced).is_err());
+    }
+
+    #[test]
+    fn uses_nvidia_feature_categorization() {
+        assert!(uses_nvidia(Feature::GpuCoreOffsetMhz));
+        assert!(uses_nvidia(Feature::GpuMemoryOffsetMhz));
+        assert!(uses_nvidia(Feature::GpuVfCurve));
+
+        assert!(!uses_nvidia(Feature::WindowsPowerPlan));
+        assert!(!uses_nvidia(Feature::WindowsBoostMode));
+        assert!(!uses_nvidia(Feature::CpuCurveOptimizerAllCore));
+        assert!(!uses_nvidia(Feature::CpuPptLimitMw));
+        assert!(!uses_nvidia(Feature::KeyboardColors));
+        assert!(!uses_nvidia(Feature::CpuFanCurve));
+    }
+
+    #[test]
+    fn ctgp_and_dynamic_boost_are_separate_fields_of_one_hp_register() {
+        for feature in [
+            Feature::GpuCustomTgp,
+            Feature::GpuDynamicBoost,
+            Feature::GpuUnleashed,
+        ] {
+            assert!(uses_hp_gpu_power(feature));
+        }
+        assert!(gpu_flag(Feature::GpuCustomTgp, true, false));
+        assert!(!gpu_flag(Feature::GpuCustomTgp, false, true));
+        assert!(gpu_flag(Feature::GpuDynamicBoost, false, true));
+        assert!(!gpu_flag(Feature::GpuUnleashed, true, false));
+        // Read-modify-write keeps the other flag as read.
+        assert_eq!(
+            gpu_flags_with(Feature::GpuCustomTgp, false, true, true),
+            (true, true)
+        );
+        assert_eq!(
+            gpu_flags_with(Feature::GpuDynamicBoost, true, true, false),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn restore_state_round_trip() {
+        let states = [
+            RestoreState::HpGpuPower {
+                custom_tgp: true,
+                ppab: true,
+            },
+            RestoreState::HpGraphicsMode { mode: 1 },
+            RestoreState::AmdSmu {
+                image: crate::windows::cpu_tuning::SmuImage::Limit {
+                    value: 65_000,
+                    hp_pair: None,
+                },
+            },
+            RestoreState::Windows {
+                image: crate::windows::windows_settings::WindowsImage::ActiveScheme {
+                    scheme: 0x1234_5678,
+                },
+            },
+        ];
+        for state in states {
+            let text = serde_json::to_string(&state).unwrap();
+            let parsed: RestoreState = serde_json::from_str(&text).unwrap();
+            assert_eq!(parsed, state);
+        }
+    }
+}

@@ -7,7 +7,7 @@ pub const ARGUMENTS: [&str; 2] = ["", "--tray"];
 
 /// Task name for the signed-in user.
 pub fn task_name(sid: &str) -> String {
-    format!("PerformanceHub-Tray-{sid}")
+    format!("GLPH-Tray-{sid}")
 }
 
 fn escape(text: &str) -> String {
@@ -86,7 +86,7 @@ mod tests {
     fn logon_task_starts_the_tray_elevated_on_battery_without_time_limit() {
         let xml = task_xml(
             "S-1-5-21-1",
-            r"D:\PerformanceHub\target\release\performance-hub.exe",
+            r"D:\PerformanceHub\target\release\glph.exe",
             "--tray",
         );
         for expected in [
@@ -100,13 +100,13 @@ mod tests {
             "<RestartOnFailure>",
             "<Interval>PT1M</Interval>",
             "<Count>3</Count>",
-            r#"<Command>"D:\PerformanceHub\target\release\performance-hub.exe"</Command>"#,
+            r#"<Command>"D:\PerformanceHub\target\release\glph.exe"</Command>"#,
             "<Arguments>--tray</Arguments>",
         ] {
             assert!(xml.contains(expected), "{expected}");
         }
         assert_eq!(xml.matches("<UserId>").count(), 2);
-        assert_eq!(task_name("S-1-5-21-1"), "PerformanceHub-Tray-S-1-5-21-1");
+        assert_eq!(task_name("S-1-5-21-1"), "GLPH-Tray-S-1-5-21-1");
     }
 
     #[test]

@@ -1,0 +1,665 @@
+import { Theme } from "theme.slint";
+
+export struct TelemetryTick {
+    position: float,
+    label: string,
+}
+
+export global TelemetryState {
+    in property <string> hardware-summary;
+    // 0 = 60 s, 1 = 5 min
+    in-out property <int> window-index: 1;
+
+    // Temperature chart paths in 0..1000 viewbox coordinates.
+    in property <string> cpu-path;
+    in property <string> cpu-area-path;
+    in property <string> gpu-path;
+    in property <string> gpu-area-path;
+
+    // Live rightmost endpoint coordinates in 0..1 (x: left->right, y: bottom->top).
+    in property <bool> cpu-has-point;
+    in property <float> cpu-last-x;
+    in property <float> cpu-last-y;
+    in property <bool> gpu-has-point;
+    in property <float> gpu-last-x;
+    in property <float> gpu-last-y;
+
+    in property <[TelemetryTick]> y-ticks;
+    in property <[TelemetryTick]> x-ticks;
+
+    // Hero live temperature readouts on the right of the chart.
+    in property <string> cpu-temp-value: "—";
+    in property <bool> cpu-temp-valid: false;
+    in property <string> cpu-peak-text: "—";
+    in property <string> gpu-temp-value: "—";
+    in property <bool> gpu-temp-valid: false;
+    in property <string> gpu-peak-text: "—";
+
+    // Clean 2-row x 3-column sensor comparison table values.
+    in property <string> cpu-power: "—";
+    in property <string> cpu-clock: "—";
+    in property <string> cpu-util: "—";
+    in property <string> gpu-power: "—";
+    in property <string> gpu-clock: "—";
+    in property <string> gpu-util: "—";
+
+    callback select-window(int);
+}
+
+component WindowPill inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.active;
+    accessible-action-default => { root.clicked(); }
+    width: max(50px, label.preferred-width + 18px);
+    height: 24px;
+    border-radius: 5px;
+    background: root.active ? Theme.accent-fill : area.has-hover ? Theme.hover : transparent;
+    border-width: focus.has-focus ? 1px : 0px;
+    border-color: root.active ? Theme.on-accent : Theme.accent;
+
+    label := Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        color: root.active ? Theme.on-accent : area.has-hover ? Theme.ink : Theme.muted;
+        font-size: 12px;
+        font-weight: root.active ? 600 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+
+    area := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { focus.focus(); root.clicked(); }
+    }
+
+    focus := FocusScope {
+        x: 0px;
+        width: 0px;
+        key-pressed(e) => {
+            if e.text == " " || e.text == Key.Return {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
+component LiveTempBlock inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> valid;
+    in property <string> peak;
+    in property <color> tone;
+    spacing: 2px;
+
+    HorizontalLayout {
+        spacing: 7px;
+        alignment: start;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 12px;
+                height: 3px;
+                border-radius: 1.5px;
+                background: root.tone;
+            }
+        }
+        Text {
+            text: root.label;
+            color: Theme.muted;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.6px;
+            vertical-alignment: center;
+        }
+    }
+
+    HorizontalLayout {
+        height: 34px;
+        spacing: 3px;
+        alignment: start;
+        Text {
+            text: root.value;
+            color: root.valid ? root.tone : Theme.quiet;
+            font-family: "Consolas";
+            font-size: 30px;
+            font-weight: 700;
+            vertical-alignment: bottom;
+        }
+        if root.valid: VerticalLayout {
+            alignment: end;
+            padding-bottom: 5px;
+            Text {
+                text: "°C";
+                color: root.tone.with-alpha(0.84);
+                font-family: "Consolas";
+                font-size: 14px;
+                font-weight: 600;
+                vertical-alignment: bottom;
+            }
+        }
+    }
+
+    Text {
+        text: root.peak;
+        color: Theme.muted;
+        font-family: "Consolas";
+        font-size: 11px;
+        overflow: elide;
+    }
+}
+
+component SensorRow inherits Rectangle {
+    in property <string> name;
+    in property <color> tone;
+    in property <string> power;
+    in property <string> clock;
+    in property <string> util;
+    in property <bool> last;
+    height: 38px;
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 12px;
+
+        Rectangle {
+            horizontal-stretch: 2;
+            min-width: 110px;
+            preferred-width: 0px;
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: root.tone;
+                    }
+                }
+                Text {
+                    text: root.name;
+                    color: Theme.ink;
+                    font-size: 13px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            min-width: 84px;
+            preferred-width: 0px;
+            Text {
+                width: parent.width;
+                height: parent.height;
+                text: root.power;
+                color: Theme.ink;
+                font-family: "Consolas";
+                font-size: 13px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            min-width: 112px;
+            preferred-width: 0px;
+            Text {
+                width: parent.width;
+                height: parent.height;
+                text: root.clock;
+                color: Theme.ink;
+                font-family: "Consolas";
+                font-size: 13px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            min-width: 84px;
+            preferred-width: 0px;
+            Text {
+                width: parent.width;
+                height: parent.height;
+                text: root.util;
+                color: Theme.ink;
+                font-family: "Consolas";
+                font-size: 13px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    if !root.last: Rectangle {
+        x: 16px;
+        y: parent.height - 1px;
+        width: max(0px, parent.width - 32px);
+        height: 1px;
+        background: Theme.line.with-alpha(0.65);
+    }
+}
+
+export component TelemetryPanel inherits VerticalLayout {
+    spacing: 12px;
+
+    if TelemetryState.hardware-summary != "": Text {
+        text: TelemetryState.hardware-summary;
+        color: Theme.muted;
+        font-size: 12px;
+        overflow: elide;
+    }
+
+    // 1. Temperature History Graph Card (Temperaturverlauf)
+    temp-card := Rectangle {
+        background: Theme.surface-fill;
+        border-radius: 10px;
+        border-width: Theme.card-border-width;
+        border-color: Theme.surface-border;
+        clip: true;
+
+        if Theme.has-surface-texture: Image {
+            x: 1px;
+            y: 1px;
+            width: max(0px, parent.width - 2px);
+            height: max(0px, parent.height - 2px);
+            source: Theme.surface-texture;
+            image-fit: fill;
+            accessible-role: none;
+        }
+
+        // Top 1px specular sheen rim for Glass / Glossy / Metallic depth.
+        Rectangle {
+            x: 10px;
+            y: 1px;
+            width: max(0px, parent.width - 20px);
+            height: 1px;
+            background: Theme.surface-top-sheen;
+        }
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            HorizontalLayout {
+                spacing: 12px;
+                Text {
+                    text: Theme.tr("telemetry.temp_history");
+                    color: Theme.ink;
+                    font-size: 15px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+
+                // Segmented timeframe pill (60 s | 5 min)
+                Rectangle {
+                    height: 30px;
+                    border-radius: 7px;
+                    background: Theme.control-fill;
+                    border-width: 1px;
+                    border-color: Theme.control-border;
+                    HorizontalLayout {
+                        padding: 2px;
+                        spacing: 2px;
+                        WindowPill {
+                            text: Theme.tr("telemetry.window_60s");
+                            active: TelemetryState.window-index == 0;
+                            clicked => {
+                                TelemetryState.window-index = 0;
+                                TelemetryState.select-window(0);
+                            }
+                        }
+                        WindowPill {
+                            text: Theme.tr("telemetry.window_5m");
+                            active: TelemetryState.window-index == 1;
+                            clicked => {
+                                TelemetryState.window-index = 1;
+                                TelemetryState.select-window(1);
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 16px;
+
+                // Left: Plot canvas + right-side Y-axis ticks + bottom m:ss X-axis ticks
+                plot-container := Rectangle {
+                    horizontal-stretch: 1;
+                    min-width: 280px;
+                    height: 184px;
+                    private property <length> y-axis-width: 34px;
+                    private property <length> x-axis-height: 20px;
+                    private property <length> plot-top: 6px;
+                    private property <length> plot-height: max(1px, self.height - self.x-axis-height - self.plot-top);
+                    private property <length> plot-width: max(1px, self.width - self.y-axis-width - 6px);
+
+                    plot := Rectangle {
+                        x: 0px;
+                        y: plot-container.plot-top;
+                        width: plot-container.plot-width;
+                        height: plot-container.plot-height;
+                        border-radius: 6px;
+                        background: Theme.chart-plot-fill;
+                        border-width: 1px;
+                        border-color: Theme.chart-grid;
+                        clip: true;
+
+                        // Horizontal temperature gridlines
+                        for tick in TelemetryState.y-ticks: Rectangle {
+                            visible: tick.position > 0.01 && tick.position < 0.99;
+                            x: 0px;
+                            y: floor((1 - tick.position) * parent.height / 1phx) * 1phx;
+                            width: parent.width;
+                            height: 1phx;
+                            background: Theme.chart-grid;
+                        }
+
+                        // Vertical duration gridlines
+                        for tick in TelemetryState.x-ticks: Rectangle {
+                            visible: tick.position > 0.01 && tick.position < 0.99;
+                            x: floor(tick.position * parent.width / 1phx) * 1phx;
+                            y: 0px;
+                            width: 1phx;
+                            height: parent.height;
+                            background: Theme.chart-grid.with-alpha(0.55);
+                        }
+
+                        // Subtle vertical-gradient area fills (180deg only for clean software rendering)
+                        if TelemetryState.gpu-area-path != "": Path {
+                            viewbox-width: 1000;
+                            viewbox-height: 1000;
+                            fit: fill;
+                            commands: TelemetryState.gpu-area-path;
+                            fill: @linear-gradient(180deg, Theme.chart-gpu.with-alpha(0.14) 0%, Theme.chart-gpu.with-alpha(0.0) 100%);
+                            stroke: transparent;
+                        }
+
+                        if TelemetryState.cpu-area-path != "": Path {
+                            viewbox-width: 1000;
+                            viewbox-height: 1000;
+                            fit: fill;
+                            commands: TelemetryState.cpu-area-path;
+                            fill: @linear-gradient(180deg, Theme.chart-cpu.with-alpha(0.18) 0%, Theme.chart-cpu.with-alpha(0.0) 100%);
+                            stroke: transparent;
+                        }
+
+                        // GPU Chip curve
+                        if TelemetryState.gpu-path != "": Path {
+                            viewbox-width: 1000;
+                            viewbox-height: 1000;
+                            fit: fill;
+                            commands: TelemetryState.gpu-path;
+                            stroke: Theme.chart-gpu;
+                            stroke-width: 2px;
+                            fill: transparent;
+                        }
+
+                        // CPU Tctl curve
+                        if TelemetryState.cpu-path != "": Path {
+                            viewbox-width: 1000;
+                            viewbox-height: 1000;
+                            fit: fill;
+                            commands: TelemetryState.cpu-path;
+                            stroke: Theme.chart-cpu;
+                            stroke-width: 2px;
+                            fill: transparent;
+                        }
+
+                        // Live endpoint dots (solid color so circles stay crisp)
+                        if TelemetryState.gpu-has-point: Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            border-radius: 3.5px;
+                            x: clamp(TelemetryState.gpu-last-x * parent.width - 3.5px, 3px, max(3px, parent.width - 10px));
+                            y: clamp((1 - TelemetryState.gpu-last-y) * parent.height - 3.5px, 3px, max(3px, parent.height - 10px));
+                            background: Theme.chart-gpu;
+                        }
+
+                        if TelemetryState.cpu-has-point: Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            border-radius: 3.5px;
+                            x: clamp(TelemetryState.cpu-last-x * parent.width - 3.5px, 3px, max(3px, parent.width - 10px));
+                            y: clamp((1 - TelemetryState.cpu-last-y) * parent.height - 3.5px, 3px, max(3px, parent.height - 10px));
+                            background: Theme.chart-cpu;
+                        }
+
+                        if !TelemetryState.cpu-has-point && !TelemetryState.gpu-has-point: Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: Theme.tr("dash.measuring");
+                            color: Theme.quiet;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Right-side Y-axis °C labels
+                    for tick in TelemetryState.y-ticks: Text {
+                        x: plot-container.plot-width + 7px;
+                        y: clamp(plot-container.plot-top + (1 - tick.position) * plot-container.plot-height - 7px, 0px, max(0px, plot-container.plot-top + plot-container.plot-height - 12px));
+                        width: plot-container.y-axis-width;
+                        height: 14px;
+                        text: tick.label;
+                        color: Theme.muted;
+                        font-family: "Consolas";
+                        font-size: 11px;
+                        horizontal-alignment: left;
+                        vertical-alignment: center;
+                    }
+
+                    // Bottom m:ss duration X-axis labels
+                    for tick in TelemetryState.x-ticks: Text {
+                        property <bool> first: tick.position < 0.01;
+                        property <bool> last: tick.position > 0.99;
+                        width: 44px;
+                        height: 14px;
+                        x: self.first ? 0px
+                         : self.last ? max(0px, plot-container.plot-width - self.width)
+                         : clamp(tick.position * plot-container.plot-width - self.width / 2, 0px, max(0px, plot-container.plot-width - self.width));
+                        y: plot-container.plot-top + plot-container.plot-height + 5px;
+                        text: tick.label;
+                        color: Theme.muted;
+                        font-family: "Consolas";
+                        font-size: 11px;
+                        horizontal-alignment: self.first ? TextHorizontalAlignment.left : self.last ? TextHorizontalAlignment.right : TextHorizontalAlignment.center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Subtle vertical separator
+                Rectangle {
+                    width: 1px;
+                    background: Theme.line.with-alpha(0.55);
+                }
+
+                // Right-side live readouts + peak temperatures
+                VerticalLayout {
+                    width: 146px;
+                    horizontal-stretch: 0;
+                    alignment: center;
+                    spacing: 12px;
+
+                    LiveTempBlock {
+                        label: Theme.tr("telemetry.cpu_tctl");
+                        value: TelemetryState.cpu-temp-value;
+                        valid: TelemetryState.cpu-temp-valid;
+                        peak: TelemetryState.cpu-peak-text;
+                        tone: Theme.chart-cpu;
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: Theme.line.with-alpha(0.55);
+                    }
+
+                    LiveTempBlock {
+                        label: Theme.tr("telemetry.gpu_chip");
+                        value: TelemetryState.gpu-temp-value;
+                        valid: TelemetryState.gpu-temp-valid;
+                        peak: TelemetryState.gpu-peak-text;
+                        tone: Theme.chart-gpu;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Clean Sensor Table Card (Sensorvergleich — CPU & GPU rows only, 3 metric columns)
+    sensor-card := Rectangle {
+        background: Theme.surface-fill;
+        border-radius: 10px;
+        border-width: Theme.card-border-width;
+        border-color: Theme.surface-border;
+        clip: true;
+
+        if Theme.has-surface-texture: Image {
+            x: 1px;
+            y: 1px;
+            width: max(0px, parent.width - 2px);
+            height: max(0px, parent.height - 2px);
+            source: Theme.surface-texture;
+            image-fit: fill;
+            accessible-role: none;
+        }
+
+        Rectangle {
+            x: 10px;
+            y: 1px;
+            width: max(0px, parent.width - 20px);
+            height: 1px;
+            background: Theme.surface-top-sheen;
+        }
+
+        VerticalLayout {
+            padding: 1px;
+            spacing: 0px;
+
+            // Table column headers (rounded top corners prevent software-renderer corner bleed)
+            Rectangle {
+                height: 32px;
+                border-top-left-radius: 9px;
+                border-top-right-radius: 9px;
+                background: Theme.chart-plot-fill;
+
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    spacing: 12px;
+
+                    Rectangle {
+                        horizontal-stretch: 2;
+                        min-width: 110px;
+                        preferred-width: 0px;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: Theme.tr("telemetry.sensor_table");
+                            color: Theme.muted;
+                            font-size: 11px;
+                            font-weight: 600;
+                            letter-spacing: 0.4px;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        min-width: 84px;
+                        preferred-width: 0px;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: Theme.tr("telemetry.col_power");
+                            color: Theme.muted;
+                            font-size: 11px;
+                            font-weight: 600;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        min-width: 112px;
+                        preferred-width: 0px;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: Theme.tr("telemetry.col_clock");
+                            color: Theme.muted;
+                            font-size: 11px;
+                            font-weight: 600;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        min-width: 84px;
+                        preferred-width: 0px;
+                        Text {
+                            width: parent.width;
+                            height: parent.height;
+                            text: Theme.tr("telemetry.col_load");
+                            color: Theme.muted;
+                            font-size: 11px;
+                            font-weight: 600;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    x: 0px;
+                    y: parent.height - 1px;
+                    width: parent.width;
+                    height: 1px;
+                    background: Theme.line;
+                }
+            }
+
+            SensorRow {
+                name: Theme.tr("section.cpu");
+                tone: Theme.chart-cpu;
+                power: TelemetryState.cpu-power;
+                clock: TelemetryState.cpu-clock;
+                util: TelemetryState.cpu-util;
+                last: false;
+            }
+
+            SensorRow {
+                name: Theme.tr("section.gpu");
+                tone: Theme.chart-gpu;
+                power: TelemetryState.gpu-power;
+                clock: TelemetryState.gpu-clock;
+                util: TelemetryState.gpu-util;
+                last: true;
+            }
+        }
+    }
+}

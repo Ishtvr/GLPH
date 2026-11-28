@@ -18,6 +18,7 @@ mod lighting;
 mod nvidia;
 pub mod nvpcf_ppt;
 mod plugin_dialogs;
+pub mod service_client;
 mod smu;
 mod startup;
 mod thermal;
@@ -27,7 +28,7 @@ pub mod vbios_tgp;
 mod vf;
 mod windows_settings;
 pub use ccd::{WindowsProcesses, ccd_masks};
-pub use control_lease::ControlLease;
+pub use control_lease::{ControlLease, GpuPauseGuard, gpu_pause_active, signal_gpu_pause};
 pub use controller::{Controller, RestoreState};
 pub use cooling::{FanReport, MaxFanImage, read_hp_fans, read_hp_surface_temp_c};
 pub use cpu::Cpu;
@@ -38,19 +39,21 @@ pub use device_defaults::{
     discover_passive as discover_passive_defaults,
 };
 pub use dgpu::nvidia_gpu_awake;
-pub use fan_service::{FanServiceStatus, run as run_fan_service};
-pub use fan_service::{request_stop as stop_fan_service, run_until as run_fan_service_until};
+pub use fan_service::{
+    FanServiceStatus, ForegroundCcdPinner, request_stop as stop_fan_service,
+    run as run_fan_service, run_session0_cooling, run_until as run_fan_service_until,
+};
 pub use fan_task::keep_running as ensure_fan_service_running;
+use glph_core::{Inventory, PowerStatus};
 pub use gpu::{GpuControlsReport, NvidiaIdentity, OffsetState, read_gpu_controls};
 pub use hp::{
-    GraphicsModeReport, HpModeReport, apply_graphics_mode, apply_hp_mode, read_hp_gpu_status,
-    read_hp_graphics_mode, read_hp_keyboard_state, read_hp_system_design, write_hp_cpu_pl1,
-    write_hp_gpu_power, write_hp_gpu_temperature_limit, write_hp_graphics_mode,
+    GraphicsModeReport, HpModeReport, apply_graphics_mode, apply_hp_mode, apply_hp_unleashed,
+    read_hp_gpu_status, read_hp_graphics_mode, read_hp_keyboard_state, read_hp_system_design,
+    write_hp_cpu_pl1, write_hp_gpu_power, write_hp_gpu_temperature_limit, write_hp_graphics_mode,
     write_hp_performance_step, write_hp_shared_budget, write_hp_thermal_mode,
 };
 pub use lighting::DirectLighting;
 pub use nvidia::{GpuLimitProbe, Nvidia, read_nvml_power_limits};
-use omen_core::{Inventory, PowerStatus};
 pub use plugin_dialogs::{open_plugins_folder, pick_plugin_file};
 pub use smu::{
     LimitCalibration, SmuProbe, calibrate_limits as smu_calibrate_limits, probe as smu_probe,

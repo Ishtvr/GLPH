@@ -1,10 +1,10 @@
 //! Explicit CLI entry points. Profile persistence is separate from hardware apply.
-use omen_core::{
+use glph_core::{
     features::{Feature, ValueKind},
     profiles::{Choice, PROFILE_SCHEMA, PerformanceProfile, Setting, Value},
     transaction::{self, Backend},
 };
-use omen_platform::{
+use glph_platform::{
     ControlLease, Controller, RestoreState,
     profile_store::{ProfileStore, profile_digest},
 };
@@ -71,6 +71,7 @@ pub fn handles(command: &str) -> bool {
             | "profile-ui-replace"
             | "mode-ui-replace"
             | "mode-ui-apply"
+            | "mode-ui-unleashed"
             | "hp-performance-step"
             | "cpu-smu-probe"
             | "fan-service"
@@ -79,6 +80,7 @@ pub fn handles(command: &str) -> bool {
             | "hp-service-ui"
             | "hp-service-restore"
             | "fan-service-install"
+            | "service-ui"
             | "cpu-smu-calibrate-limits"
             | "profile-ui-restore"
             | "profile-ui-restore-keep"
@@ -96,6 +98,7 @@ pub fn handles(command: &str) -> bool {
             | "gpu-tgp-restore"
             | "device-defaults-detect"
             | "device-defaults-ui-detect"
+            | "keyboard-ui-direct-apply"
     )
 }
 
@@ -170,30 +173,30 @@ fn gpu_qualification(store: &mut ProfileStore, command: &str) -> Result<(), Stri
 /// or `HpSharedPowerMw`). Decoupled PerformanceHub presets (direct GPU TGP +
 /// direct SMU CPU limits + Windows settings) execute ZERO HP WMI calls.
 fn apply_hp_prelude(
-    profile: &omen_core::profiles::PerformanceProfile,
-    inventory: &omen_core::Inventory,
+    profile: &glph_core::profiles::PerformanceProfile,
+    inventory: &glph_core::Inventory,
 ) -> Result<Vec<String>, String> {
-    use omen_core::hp_mode::HpMode;
+    use glph_core::hp_mode::HpMode;
     let shared_budget = HpMode::shared_budget_of_profile(profile)?;
     if inventory.manufacturer != "HP" {
         return Ok(vec![]);
     }
-    let ac = omen_platform::power_status().ac_connected == Some(true);
+    let ac = glph_platform::power_status().ac_connected == Some(true);
     let mut failed = vec![];
     if let Some(mode) = HpMode::of_preset(profile, ac) {
-        if let Err(error) = omen_platform::apply_hp_mode(inventory, mode) {
+        if let Err(error) = glph_platform::apply_hp_mode(inventory, mode) {
             failed.push(error);
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
         if let Some(watts) = HpMode::effective_pl1_for_preset(profile, mode)
             && !(mode == HpMode::Unleashed && !(45..=80).contains(&watts))
-            && let Err(error) = omen_platform::write_hp_cpu_pl1(inventory, watts)
+            && let Err(error) = glph_platform::write_hp_cpu_pl1(inventory, watts)
         {
             failed.push(error);
         }
     }
     if let Some(watts) = shared_budget
-        && let Err(error) = omen_platform::write_hp_shared_budget(inventory, watts)
+        && let Err(error) = glph_platform::write_hp_shared_budget(inventory, watts)
     {
         failed.push(error);
     }
@@ -201,7 +204,7 @@ fn apply_hp_prelude(
 }
 
 fn prepare_apply(
-    profile: &omen_core::profiles::PerformanceProfile,
+    profile: &glph_core::profiles::PerformanceProfile,
     store: &mut ProfileStore,
     startup: bool,
     replace_pending: bool,
@@ -210,7 +213,7 @@ fn prepare_apply(
     if replace_pending {
         recover_pending(store)?;
     } else if store.pending()? || store.fan_policy_pending()? {
-        return Err(omen_core::message::msg("store.err.pending_checkpoint", &[]));
+        return Err(glph_core::message::msg("store.err.pending_checkpoint", &[]));
     }
     let mut controller = Controller::for_profile(profile)?;
     let checked = transaction::plan(profile, &mut controller, startup);
@@ -238,10 +241,70 @@ fn recover_pending(store: &mut ProfileStore) -> Result<(), String> {
     Ok(())
 }
 
+fn save_ui_result(
+    store: &ProfileStore,
+    nonce: Option<&str>,
+    operation: &str,
+    record: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some(n) = nonce {
+        store.save_nonce_control_result(n, record)?;
+    }
+    if matches!(operation, "apply" | "mode" | "restore") {
+        store.save_last_apply_result(record)?;
+    }
+    store.save_control_result(record)
+}
+
+fn profile_has_gpu_oc_or_vf(profile: &PerformanceProfile) -> bool {
+    profile.settings.iter().any(|s| {
+        matches!(
+            s.feature,
+            Feature::GpuVfCurve
+                | Feature::GpuCoreOffsetMhz
+                | Feature::GpuMemoryOffsetMhz
+                | Feature::GpuVoltageOffsetMv
+                | Feature::GpuMemoryVoltageOffsetMv
+                | Feature::GpuDynamicBoostLimitMw
+        )
+    })
+}
+
+/// Compensates pre-transaction GPU/NVPCF/PPAB writes if a subsequent step
+/// fails before or during `transaction::apply`.
+fn rollback_pre_transaction(
+    inventory: &glph_core::Inventory,
+    store: &ProfileStore,
+    tgp_applied_now: bool,
+    nvpcf_changed: bool,
+    ppab_prior: Option<(bool, bool)>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Some((prior_ctgp, prior_ppab)) = ppab_prior
+        && let Err(e) = glph_platform::write_hp_gpu_power(inventory, prior_ctgp, prior_ppab)
+    {
+        errors.push(format!("HP GPU power rollback failed: {e}"));
+    }
+    if nvpcf_changed && let Err(e) = glph_platform::nvpcf_ppt::restore_if_saved(inventory, store) {
+        errors.push(format!("NVPCF PPT rollback failed: {e}"));
+    }
+    if tgp_applied_now
+        && let Err(e) = glph_platform::vbios_tgp::restore_if_active(
+            inventory,
+            store,
+            glph_platform::read_nvml_power_limits,
+        )
+    {
+        errors.push(format!("VBIOS TGP rollback failed: {e}"));
+    }
+    errors
+}
+
 pub fn run(args: &[String]) -> Result<(), String> {
     let result = run_inner(args);
     // Return early errors (e.g. access/session/empty journal) to the matching UI
-    // request, without overwriting a more detailed transaction/rollback result.
+    // request, without overwriting a more detailed transaction/rollback result
+    // and without masking the original hardware error if result recording fails.
     if let Err(error) = &result {
         let ui = match args.first().map(String::as_str) {
             Some("keyboard-ui-read") if args.len() == 2 || args.len() == 3 => {
@@ -253,7 +316,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Some("mode-ui-apply" | "mode-ui-replace") if args.len() == 3 => {
                 Some(("mode", args[2].as_str()))
             }
+            Some("mode-ui-unleashed") if args.len() == 7 => Some(("mode", args[6].as_str())),
             Some("fan-service-install") if args.len() == 2 => Some(("fan", args[1].as_str())),
+            Some("service-ui") if args.len() == 3 => Some(("hardware_service", args[2].as_str())),
             Some("mux-ui-apply") if args.len() == 3 => Some(("mux", args[2].as_str())),
             Some("hp-service-ui") if args.len() == 3 => Some(("hp_service", args[2].as_str())),
             Some("profile-ui-restore") if args.len() == 2 => Some(("restore", args[1].as_str())),
@@ -266,16 +331,28 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Some("device-defaults-ui-detect") if args.len() == 2 => {
                 Some(("device_defaults", args[1].as_str()))
             }
+            Some("keyboard-ui-direct-apply") if args.len() == 7 => {
+                Some(("keyboard_apply", args[6].as_str()))
+            }
             _ => None,
         };
-        if let Some((operation, nonce)) = ui {
-            validate_nonce(Some(nonce))?;
-            let store = ProfileStore::user_data()?;
-            if !store
+        if let Some((operation, nonce)) = ui
+            && validate_nonce(Some(nonce)).is_ok()
+            && let Ok(store) = ProfileStore::user_data()
+        {
+            let already_recorded = store
                 .control_result()
-                .is_ok_and(|r| r["nonce"].as_str() == Some(nonce))
-            {
-                store.save_control_result(&serde_json::json!({"schema":1,"operation":operation,"nonce":nonce,"result":{"Err":{"error":error,"rollback_errors":[]}}}))?;
+                .is_ok_and(|r| r["nonce"].as_str() == Some(nonce));
+            let record = serde_json::json!({
+                "schema": 1,
+                "operation": operation,
+                "nonce": nonce,
+                "result": { "Err": { "error": error, "rollback_errors": [] } }
+            });
+            if !already_recorded {
+                let _ = save_ui_result(&store, Some(nonce), operation, &record);
+            } else {
+                let _ = store.save_nonce_control_result(nonce, &record);
             }
         }
     }
@@ -291,7 +368,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             // Fixed approved qualification: lower each limit once, find its
             // PM-table cell, write the previous value back.
             let _lease = ControlLease::acquire_foreground()?;
-            let report = omen_platform::smu_calibrate_limits(&omen_platform::inventory())?;
+            let report = glph_platform::smu_calibrate_limits(&glph_platform::inventory())?;
             let store = ProfileStore::user_data()?;
             std::fs::write(
                 store.root().join("smu-limit-calibration.json"),
@@ -302,24 +379,29 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
         Some("mux-ui-apply") if args.len() == 3 => {
             validate_nonce(Some(&args[2]))?;
-            let mode = omen_core::quick_switch::GraphicsMode::parse(&args[1])
+            let mode = glph_core::quick_switch::GraphicsMode::parse(&args[1])
                 .ok_or("Unknown graphics mode")?;
             let _lease = ControlLease::acquire_foreground()?;
-            let report = omen_platform::apply_graphics_mode(&omen_platform::inventory(), mode)?;
+            let report = glph_platform::apply_graphics_mode(&glph_platform::inventory(), mode)?;
             let store = ProfileStore::user_data()?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_secs();
-            let record = omen_core::quick_switch::GraphicsRecord::after_write(
+            let record = glph_core::quick_switch::GraphicsRecord::after_write(
                 store.graphics_mode(),
                 mode,
                 report.previous,
                 now,
-                omen_platform::boot_unix_s(),
+                glph_platform::boot_unix_s(),
             );
             store.save_graphics_mode(&record)?;
-            store.save_control_result(&serde_json::json!({"schema":1,"operation":"mux","nonce":args[2],"result":{"Ok":report}}))?;
+            save_ui_result(
+                &store,
+                Some(&args[2]),
+                "mux",
+                &serde_json::json!({"schema":1,"operation":"mux","nonce":args[2],"result":{"Ok":report}}),
+            )?;
             return print(&report);
         }
         Some("hp-service-ui") if args.len() == 3 => {
@@ -331,8 +413,13 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 _ => return Err("Unknown HP service action".into()),
             };
             let _lease = ControlLease::acquire_foreground()?;
-            let report = omen_platform::hp_control::set_oem_service_disabled(disable)?;
-            ProfileStore::user_data()?.save_control_result(&serde_json::json!({"schema":1,"operation":"hp_service","nonce":args[2],"result":{"Ok":report}}))?;
+            let report = glph_platform::hp_control::set_oem_service_disabled(disable)?;
+            save_ui_result(
+                &ProfileStore::user_data()?,
+                Some(&args[2]),
+                "hp_service",
+                &serde_json::json!({"schema":1,"operation":"hp_service","nonce":args[2],"result":{"Ok":report}}),
+            )?;
             return print(&report);
         }
         Some("hp-service-restore") if args.len() == 1 => {
@@ -341,20 +428,20 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 return print(&serde_json::json!({"restored":false}));
             }
             let _lease = ControlLease::acquire_foreground()?;
-            let report = omen_platform::hp_control::set_oem_service_disabled(false)?;
+            let report = glph_platform::hp_control::set_oem_service_disabled(false)?;
             return print(&serde_json::json!({"restored":true,"service":report}));
         }
         Some("fan-service-stop") if args.len() == 1 => {
             return print(
-                &serde_json::json!({"stop_requested":omen_platform::stop_fan_service()?}),
+                &serde_json::json!({"stop_requested":glph_platform::stop_fan_service()?}),
             );
         }
         Some("fan-service") if args.len() == 1 => {
             // Runs for the whole logon session from the protected task copy.
             let store = ProfileStore::user_data()?;
             let status = ProfileStore::user_data()?;
-            return omen_platform::run_fan_service(
-                &omen_platform::inventory(),
+            return glph_platform::run_fan_service(
+                &glph_platform::inventory(),
                 || store.fan_mode(),
                 || store.active_fan_curve(),
                 || store.ccd_selection(),
@@ -366,12 +453,47 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         Some("fan-service-install") if args.len() == 2 => {
             validate_nonce(Some(&args[1]))?;
             crate::startup_setup::ensure_fan_service()?;
-            ProfileStore::user_data()?.save_control_result(&serde_json::json!({"schema":1,"operation":"fan","nonce":args[1],"result":{"Ok":true}}))?;
+            save_ui_result(
+                &ProfileStore::user_data()?,
+                Some(&args[1]),
+                "fan",
+                &serde_json::json!({"schema":1,"operation":"fan","nonce":args[1],"result":{"Ok":true}}),
+            )?;
             return print(&serde_json::json!({"fan_service":"installed"}));
+        }
+        Some("service-ui") if args.len() == 3 => {
+            validate_nonce(Some(&args[2]))?;
+            let mode = match args[1].as_str() {
+                "install" => "Install",
+                "start" => "Start",
+                "stop" => "Stop",
+                "remove" => "Remove",
+                _ => return Err("Unknown hardware service action".into()),
+            };
+            crate::startup_setup::manage_windows_service(mode)?;
+            if matches!(mode, "Install" | "Start")
+                && let Ok(store) = ProfileStore::user_data()
+            {
+                let cfg = glph_core::service::ServiceConfig {
+                    schema: glph_core::service::SERVICE_CONFIG_SCHEMA,
+                    fan_mode: store.fan_mode(),
+                    fan_curve: store.active_fan_curve().ok().flatten(),
+                    chassis_max_temp_c: store.chassis_max_temp_c().ok().flatten(),
+                    paused: false,
+                };
+                let _ = glph_platform::service_client::sync_service_config_if_running(&cfg);
+            }
+            save_ui_result(
+                &ProfileStore::user_data()?,
+                Some(&args[2]),
+                "hardware_service",
+                &serde_json::json!({"schema":1,"operation":"hardware_service","nonce":args[2],"result":{"Ok":mode}}),
+            )?;
+            return print(&serde_json::json!({"hardware_service":mode}));
         }
         Some("cpu-smu-probe") if args.len() == 1 => {
             // Read-only: SMU version, PM table head, PBO scalar and CO margins.
-            let report = omen_platform::smu_probe(&omen_platform::inventory())?;
+            let report = glph_platform::smu_probe(&glph_platform::inventory())?;
             let store = ProfileStore::user_data()?;
             std::fs::write(
                 store.root().join("smu-probe.json"),
@@ -382,8 +504,8 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
         Some("nvpcf-ppt-status") if args.len() == 1 => {
             let store = ProfileStore::user_data()?;
-            return print(&omen_platform::nvpcf_ppt::inspect(
-                &omen_platform::inventory(),
+            return print(&glph_platform::nvpcf_ppt::inspect(
+                &glph_platform::inventory(),
                 &store,
             ));
         }
@@ -391,72 +513,125 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let _lease = ControlLease::acquire_foreground()?;
             let store = ProfileStore::user_data()?;
             let restored =
-                omen_platform::nvpcf_ppt::restore_if_saved(&omen_platform::inventory(), &store)?;
+                glph_platform::nvpcf_ppt::restore_if_saved(&glph_platform::inventory(), &store)?;
             return print(&serde_json::json!({"restored": restored}));
         }
         Some("gpu-tgp-status") if args.len() == 1 => {
             let store = ProfileStore::user_data()?;
-            return print(&omen_platform::vbios_tgp::inspect(
-                &omen_platform::inventory(),
+            return print(&glph_platform::vbios_tgp::inspect(
+                &glph_platform::inventory(),
                 &store,
             ));
         }
         Some("gpu-tgp-restore") if args.len() == 1 => {
             let _lease = ControlLease::acquire_foreground()?;
             let store = ProfileStore::user_data()?;
-            let restored = omen_platform::vbios_tgp::restore_if_active(
-                &omen_platform::inventory(),
+            let restored = glph_platform::vbios_tgp::restore_if_active(
+                &glph_platform::inventory(),
                 &store,
-                omen_platform::read_nvml_power_limits,
+                glph_platform::read_nvml_power_limits,
             )?;
             return print(&serde_json::json!({"restored": restored}));
         }
         Some("device-defaults-detect") if args.len() == 1 => {
             let store = ProfileStore::user_data()?;
             let record =
-                omen_platform::discover_device_defaults(&omen_platform::inventory(), &store)?;
+                glph_platform::discover_device_defaults(&glph_platform::inventory(), &store)?;
             return print(&record);
         }
         Some("device-defaults-ui-detect") if args.len() == 2 => {
             validate_nonce(Some(&args[1]))?;
             let store = ProfileStore::user_data()?;
             let record =
-                omen_platform::discover_device_defaults(&omen_platform::inventory(), &store)?;
-            store.save_control_result(&serde_json::json!({
-                "schema": 1,
-                "operation": "device_defaults",
-                "nonce": args[1],
-                "result": { "Ok": record }
-            }))?;
+                glph_platform::discover_device_defaults(&glph_platform::inventory(), &store)?;
+            save_ui_result(
+                &store,
+                Some(&args[1]),
+                "device_defaults",
+                &serde_json::json!({
+                    "schema": 1,
+                    "operation": "device_defaults",
+                    "nonce": args[1],
+                    "result": { "Ok": record }
+                }),
+            )?;
             return print(&record);
         }
         Some("mode-ui-apply" | "mode-ui-replace") if args.len() == 3 => {
             validate_nonce(Some(&args[2]))?;
-            let mode = omen_core::hp_mode::HpMode::parse(&args[1])?;
+            let mode = glph_core::hp_mode::HpMode::parse(&args[1])?;
             let _lease = ControlLease::acquire_foreground()?;
             let mut user_store = ProfileStore::user_data()?;
             if args[0] == "mode-ui-replace" {
                 recover_pending(&mut user_store)?;
             } else if user_store.pending()? || user_store.fan_policy_pending()? {
-                return Err(omen_core::message::msg("store.err.pending_checkpoint", &[]));
+                return Err(glph_core::message::msg("store.err.pending_checkpoint", &[]));
             }
-            let inventory = omen_platform::inventory();
-            let _ = omen_platform::nvpcf_ppt::restore_if_saved(&inventory, &user_store);
-            let _ = omen_platform::vbios_tgp::restore_if_active(
+            let inventory = glph_platform::inventory();
+            glph_platform::nvpcf_ppt::restore_if_saved(&inventory, &user_store)?;
+            glph_platform::vbios_tgp::restore_if_active(
                 &inventory,
                 &user_store,
-                omen_platform::read_nvml_power_limits,
-            );
-            let report = omen_platform::apply_hp_mode(&inventory, mode)?;
-            ProfileStore::user_data()?.save_control_result(&serde_json::json!({"schema":1,"operation":"mode","nonce":args[2],"result":{"Ok":report}}))?;
+                glph_platform::read_nvml_power_limits,
+            )?;
+            let report = glph_platform::apply_hp_mode(&inventory, mode)?;
+            save_ui_result(
+                &user_store,
+                Some(&args[2]),
+                "mode",
+                &serde_json::json!({"schema":1,"operation":"mode","nonce":args[2],"result":{"Ok":report}}),
+            )?;
+            return print(&report);
+        }
+        Some("mode-ui-unleashed") if args.len() == 7 => {
+            validate_nonce(Some(&args[6]))?;
+            let parse_u8 = |s: &str, name: &str| {
+                s.parse::<u8>()
+                    .map_err(|_| format!("Invalid Unleashed {name}: {s:?}"))
+            };
+            let parse_bool = |s: &str, name: &str| match s {
+                "0" => Ok(false),
+                "1" => Ok(true),
+                _ => Err(format!("Invalid Unleashed {name}: {s:?}")),
+            };
+            let opts = glph_core::hp_mode::HpUnleashedOptions {
+                cpu_pl1_w: parse_u8(&args[1], "cpu_pl1_w")?,
+                shared_budget_w: parse_u8(&args[2], "shared_budget_w")?,
+                custom_tgp: parse_bool(&args[3], "custom_tgp")?,
+                dynamic_boost: parse_bool(&args[4], "dynamic_boost")?,
+                gpu_max_temp_c: parse_u8(&args[5], "gpu_max_temp_c")?,
+            };
+            opts.validate()?;
+            let _lease = ControlLease::acquire_foreground()?;
+            let mut user_store = ProfileStore::user_data()?;
+            recover_pending(&mut user_store)?;
+            let inventory = glph_platform::inventory();
+            glph_platform::nvpcf_ppt::restore_if_saved(&inventory, &user_store)?;
+            glph_platform::vbios_tgp::restore_if_active(
+                &inventory,
+                &user_store,
+                glph_platform::read_nvml_power_limits,
+            )?;
+            let report = glph_platform::apply_hp_unleashed(&inventory, opts)?;
+            save_ui_result(
+                &user_store,
+                Some(&args[6]),
+                "mode",
+                &serde_json::json!({"schema":1,"operation":"mode","nonce":args[6],"result":{"Ok":report}}),
+            )?;
             return print(&report);
         }
         Some("hp-performance-step") if args.len() == 2 => {
             // Measurement only: the Hub's Performance slider step L5/L6 thermal
             // byte. Run `mode-ui-apply performance` first for flags, TPP and PL1.
             let _lease = ControlLease::acquire_foreground()?;
-            omen_platform::write_hp_performance_step(&omen_platform::inventory(), &args[1])?;
-            ProfileStore::user_data()?.save_control_result(&serde_json::json!({"schema":1,"operation":"mode","nonce":null,"result":{"Ok":{"performance_step":args[1]}}}))?;
+            glph_platform::write_hp_performance_step(&glph_platform::inventory(), &args[1])?;
+            save_ui_result(
+                &ProfileStore::user_data()?,
+                None,
+                "mode",
+                &serde_json::json!({"schema":1,"operation":"mode","nonce":null,"result":{"Ok":{"performance_step":args[1]}}}),
+            )?;
             return print(&serde_json::json!({"performance_step":args[1],"readback":false}));
         }
         Some("keyboard-ui-read") if args.len() == 2 || args.len() == 3 => {
@@ -477,8 +652,48 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 })
                 .transpose()?;
             let result = serde_json::json!({"state":state,"plan":plan,"binding":controller.context()?.binding});
-            store.save_control_result(&serde_json::json!({"schema":1,"operation":"keyboard_read","nonce":args[1],"result":{"Ok":result}}))?;
+            save_ui_result(
+                &store,
+                Some(&args[1]),
+                "keyboard_read",
+                &serde_json::json!({"schema":1,"operation":"keyboard_read","nonce":args[1],"result":{"Ok":result}}),
+            )?;
             return print(&result);
+        }
+        Some("keyboard-ui-direct-apply") if args.len() == 7 => {
+            validate_nonce(Some(&args[6]))?;
+            let parse_rgb = |hex: &str| -> Result<[u8; 3], String> {
+                if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("Invalid keyboard RGB hex: {hex:?}"));
+                }
+                Ok([
+                    u8::from_str_radix(&hex[0..2], 16).map_err(|e| e.to_string())?,
+                    u8::from_str_radix(&hex[2..4], 16).map_err(|e| e.to_string())?,
+                    u8::from_str_radix(&hex[4..6], 16).map_err(|e| e.to_string())?,
+                ])
+            };
+            let colors = [
+                parse_rgb(&args[1])?,
+                parse_rgb(&args[2])?,
+                parse_rgb(&args[3])?,
+                parse_rgb(&args[4])?,
+            ];
+            let enabled = match args[5].as_str() {
+                "0" => false,
+                "1" => true,
+                other => return Err(format!("Invalid keyboard power flag: {other:?}")),
+            };
+            let mut control = glph_platform::DirectLighting::new()?;
+            let current = control.read()?;
+            let after = control.apply(&current, &colors, enabled)?;
+            let store = ProfileStore::user_data()?;
+            save_ui_result(
+                &store,
+                Some(&args[6]),
+                "keyboard_apply",
+                &serde_json::json!({"schema":1,"operation":"keyboard_apply","nonce":args[6],"result":{"Ok":after}}),
+            )?;
+            return print(&after);
         }
         Some("gpu-curve-read") if args.len() == 1 => {
             let mut controller = Controller::new(true, None)?;
@@ -641,7 +856,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let frequency = args[3]
                 .parse::<u32>()
                 .map_err(|_| "Frequency target must be integer MHz")?;
-            let value = omen_core::vf::plateau(&controller.gpu_curve()?, voltage, frequency)?;
+            let value = glph_core::vf::plateau(&controller.gpu_curve()?, voltage, frequency)?;
             profile
                 .settings
                 .retain(|s| !matches!(s.feature, Feature::GpuCoreOffsetMhz | Feature::GpuVfCurve));
@@ -654,7 +869,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
         Some("profile-plan") if args.len() == 2 => {
             let profile = store.load(&args[1])?;
-            let parts = omen_core::fan_profile::split(&profile)?;
+            let parts = glph_core::fan_profile::split(&profile)?;
             let mut controller = Controller::for_profile(&parts.direct)?;
             let mut plan =
                 serde_json::to_value(transaction::plan(&parts.direct, &mut controller, false))
@@ -670,18 +885,18 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             // The journal must describe a completed application of this exact
             // revision. Verification only GETs current targets; it never applies
             // a profile, repairs a mismatch, or grants a startup approval.
-            let parts = omen_core::fan_profile::split(&profile)?;
+            let parts = glph_core::fan_profile::split(&profile)?;
             if store.pending()? || store.fan_policy_pending()? {
-                return Err(omen_core::message::msg("store.err.pending_checkpoint", &[]));
+                return Err(glph_core::message::msg("store.err.pending_checkpoint", &[]));
             }
             let Some((id, digest, requested)) = store.applied_settings()? else {
-                return Err(omen_core::message::msg("profile.err.other_profile", &[]));
+                return Err(glph_core::message::msg("profile.err.other_profile", &[]));
             };
             if id != profile.id
                 || digest != profile_digest(&profile)?
                 || requested != parts.direct.effective().settings
             {
-                return Err(omen_core::message::msg("profile.err.other_profile", &[]));
+                return Err(glph_core::message::msg("profile.err.other_profile", &[]));
             }
             let mut controller = Controller::for_profile(&parts.direct)?;
             controller.verify_applied(&store.last_transaction::<RestoreState>()?)?;
@@ -707,15 +922,17 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let max_tgp_w = store.gpu_tgp_max_w()?;
             let requested_tgp_w = profile.gpu_dynamic_boost_limit_w_max(max_tgp_w)?;
             let digest = profile_digest(&profile)?;
-            let parts = omen_core::fan_profile::split(&profile)?;
+            let parts = glph_core::fan_profile::split(&profile)?;
             if profile
                 .settings
                 .iter()
                 .any(|s| s.feature == Feature::CpuCcdAffinity)
                 && parts.shared.is_none()
+                && !glph_platform::service_client::is_service_running_fast()
             {
                 // The background service pins programs; install or update it
-                // first so the saved selection takes effect.
+                // first so the saved selection takes effect when Session-0
+                // PerformanceHubService is not running.
                 crate::startup_setup::ensure_fan_service()?;
             }
             let mut controller = prepare_apply(
@@ -724,29 +941,85 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 false,
                 args[0] == "profile-ui-replace",
             )?;
+            let inventory = controller.inventory().clone();
+            let armed_crash_guard = profile_has_gpu_oc_or_vf(&profile);
+            if armed_crash_guard {
+                let _ = crate::gpu_crash_guard::mark_in_flight(&profile.id);
+            }
             let tgp_outcome = if requested_tgp_w.is_some() || store.vbios_tgp_state().is_some() {
                 // Close any live NVML/NVAPI handles before a potential dGPU PnP restart.
-                let inventory = controller.inventory().clone();
                 drop(controller);
-                let outcome = omen_platform::vbios_tgp::apply_for_profile(
+                let outcome = match glph_platform::vbios_tgp::apply_for_profile(
                     &inventory,
                     &store,
                     &profile,
-                    omen_platform::read_nvml_power_limits,
-                )?;
-                controller = Controller::for_profile(&parts.direct)?;
+                    glph_platform::read_nvml_power_limits,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        if armed_crash_guard {
+                            crate::gpu_crash_guard::clear_in_flight();
+                        }
+                        return Err(err);
+                    }
+                };
+                controller = match Controller::for_profile(&parts.direct) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        let rb = rollback_pre_transaction(
+                            &inventory,
+                            &store,
+                            matches!(
+                                outcome,
+                                glph_platform::vbios_tgp::ApplyOutcome::AppliedNow(_)
+                            ),
+                            false,
+                            None,
+                        );
+                        if armed_crash_guard {
+                            crate::gpu_crash_guard::clear_in_flight();
+                        }
+                        return Err(if rb.is_empty() {
+                            err
+                        } else {
+                            format!("{err}; rollback: {}", rb.join("; "))
+                        });
+                    }
+                };
                 outcome
             } else {
-                omen_platform::vbios_tgp::ApplyOutcome::Unchanged
+                glph_platform::vbios_tgp::ApplyOutcome::Unchanged
             };
-            let ac = omen_platform::power_status().ac_connected == Some(true);
-            let nvpcf_mode = omen_platform::nvpcf_ppt::apply_for_profile(
-                controller.inventory(),
-                &store,
-                &profile,
-                ac,
-            )?;
-            if nvpcf_mode.is_some() {
+            let tgp_applied_now = matches!(
+                tgp_outcome,
+                glph_platform::vbios_tgp::ApplyOutcome::AppliedNow(_)
+            );
+            let ac = glph_platform::power_status().ac_connected == Some(true);
+            let nvpcf_mode =
+                match glph_platform::nvpcf_ppt::apply_for_profile(&inventory, &store, &profile, ac)
+                {
+                    Ok(mode) => mode,
+                    Err(err) => {
+                        drop(controller);
+                        let rb = rollback_pre_transaction(
+                            &inventory,
+                            &store,
+                            tgp_applied_now,
+                            false,
+                            None,
+                        );
+                        if armed_crash_guard {
+                            crate::gpu_crash_guard::clear_in_flight();
+                        }
+                        return Err(if rb.is_empty() {
+                            err
+                        } else {
+                            format!("{err}; rollback: {}", rb.join("; "))
+                        });
+                    }
+                };
+            let nvpcf_changed = nvpcf_mode.is_some();
+            if nvpcf_changed {
                 controller.set_nvpcf_ppt_unlocked(true);
             }
             // Empirically verified (27 Nov 2026): when using Direct Fixed GPU TGP
@@ -757,23 +1030,72 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 .settings
                 .iter()
                 .any(|s| matches!(s.feature, Feature::GpuUnleashed | Feature::GpuDynamicBoost));
-            if ac
-                && requested_tgp_w.is_some()
-                && !legacy_boost
-                && controller.inventory().manufacturer == "HP"
-            {
-                let _ = omen_platform::write_hp_gpu_power(controller.inventory(), true, false);
+            let mut ppab_prior = None;
+            if ac && requested_tgp_w.is_some() && !legacy_boost && inventory.manufacturer == "HP" {
+                ppab_prior = glph_platform::read_hp_gpu_status(&inventory)
+                    .ok()
+                    .map(|s| (s.custom_tgp_enabled, s.ppab_enabled));
+                if let Err(err) = glph_platform::write_hp_gpu_power(&inventory, true, false) {
+                    drop(controller);
+                    let rb = rollback_pre_transaction(
+                        &inventory,
+                        &store,
+                        tgp_applied_now,
+                        nvpcf_changed,
+                        ppab_prior,
+                    );
+                    if armed_crash_guard {
+                        crate::gpu_crash_guard::clear_in_flight();
+                    }
+                    return Err(if rb.is_empty() {
+                        err
+                    } else {
+                        format!("{err}; rollback: {}", rb.join("; "))
+                    });
+                }
             }
-            let cooling_request =
-                crate::profile_fan::prepare(&profile, &store, controller.inventory())?;
-            let prelude_failed = match apply_hp_prelude(&profile, controller.inventory()) {
+            let cooling_request = match crate::profile_fan::prepare(&profile, &store, &inventory) {
+                Ok(req) => req,
+                Err(err) => {
+                    drop(controller);
+                    let rb = rollback_pre_transaction(
+                        &inventory,
+                        &store,
+                        tgp_applied_now,
+                        nvpcf_changed,
+                        ppab_prior,
+                    );
+                    if armed_crash_guard {
+                        crate::gpu_crash_guard::clear_in_flight();
+                    }
+                    return Err(if rb.is_empty() {
+                        err
+                    } else {
+                        format!("{err}; rollback: {}", rb.join("; "))
+                    });
+                }
+            };
+            let prelude_failed = match apply_hp_prelude(&profile, &inventory) {
                 Ok(failed) => failed,
                 Err(error) => {
-                    return Err(crate::profile_fan::prelude_failed(
+                    drop(controller);
+                    let msg =
+                        crate::profile_fan::prelude_failed(&store, cooling_request.as_ref(), error);
+                    let rb = rollback_pre_transaction(
+                        &inventory,
                         &store,
-                        cooling_request.as_ref(),
-                        error,
-                    ));
+                        tgp_applied_now,
+                        nvpcf_changed,
+                        ppab_prior,
+                    );
+                    if armed_crash_guard {
+                        crate::gpu_crash_guard::clear_in_flight();
+                    }
+                    return Err(if rb.is_empty() {
+                        msg
+                    } else {
+                        format!("{msg}; rollback: {}", rb.join("; "))
+                    });
                 }
             };
             let tracing = args[0] == "profile-apply-trace";
@@ -782,19 +1104,46 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             }
             // Logged only: preset values overwrite the HP service's (user rule).
             let notes: Vec<String> =
-                omen_platform::hp_control::check_cpu_power_settings(&profile.effective().settings)
+                glph_platform::hp_control::check_cpu_power_settings(&profile.effective().settings)
                     .err()
                     .into_iter()
                     .collect();
             let result =
                 transaction::apply(&parts.direct, &digest, &mut controller, &mut store, false);
-            let (result, cooling) = crate::profile_fan::finish(
+            let (mut result, cooling) = crate::profile_fan::finish(
                 &mut store,
                 &mut controller,
                 &profile,
                 cooling_request.as_ref(),
                 result,
             );
+            let cpu_readbacks = if tracing {
+                Some(
+                    serde_json::to_value(controller.cpu_readback_observations())
+                        .map_err(|e| e.to_string())?,
+                )
+            } else {
+                None
+            };
+            if let Err(ref mut failure) = result {
+                // Close NVML/NVAPI handles before rolling back VBIOS-TGP / NVPCF / PPAB.
+                drop(controller);
+                let rb = rollback_pre_transaction(
+                    &inventory,
+                    &store,
+                    tgp_applied_now,
+                    nvpcf_changed,
+                    ppab_prior,
+                );
+                failure.rollback_errors.extend(rb);
+                if armed_crash_guard {
+                    crate::gpu_crash_guard::clear_in_flight();
+                }
+            } else if armed_crash_guard && nonce.is_none() {
+                // Headless CLI applies have no long-lived UI process to clear
+                // the marker after 15 s; UI applies schedule the 15 s timer in elevation.rs.
+                crate::gpu_crash_guard::clear_in_flight();
+            }
             // TPP has a SET contract but no exact GET. Do not include it in
             // the verified transaction or imply a fully confirmed firmware state.
             let unconfirmed: Vec<_> = profile
@@ -803,9 +1152,9 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 .filter(|s| s.feature == Feature::HpSharedPowerMw)
                 .collect();
             // The HP thermal mode (0x1A) has no GET either: requested only.
-            let mode = omen_core::hp_mode::HpMode::of_settings(
+            let mode = glph_core::hp_mode::HpMode::of_settings(
                 &profile.settings,
-                omen_platform::power_status().ac_connected == Some(true),
+                glph_platform::power_status().ac_connected == Some(true),
             )
             .map(|mode| mode.name());
             // Settings a documented precedence rule replaced (never written).
@@ -822,16 +1171,19 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 .map(|s| s.feature)
                 .collect();
             // Keep preset holds only an Apply made since the current boot.
-            let boot = omen_platform::boot_unix_s();
+            let boot = glph_platform::boot_unix_s();
             let gpu_tgp_w = tgp_outcome.active_watts();
             let gpu_tgp_restored =
-                tgp_outcome == omen_platform::vbios_tgp::ApplyOutcome::RestoredToStock;
+                tgp_outcome == glph_platform::vbios_tgp::ApplyOutcome::RestoredToStock;
             let gpu_restarted = tgp_outcome.gpu_restarted();
-            store.save_control_result(&serde_json::json!({"schema":1,"operation":"apply","nonce":nonce,"profile_id":profile.id,"profile_digest":digest,"notes":notes,"unconfirmed":unconfirmed,"mode_requested":mode,"overridden":overridden,"prelude_failed":prelude_failed,"gpu_tgp_w":gpu_tgp_w,"gpu_tgp_restored":gpu_tgp_restored,"gpu_restarted":gpu_restarted,"boot_unix_s":boot,"cooling":cooling,"result":result}))?;
-            if tracing {
-                print(
-                    &serde_json::json!({"result":result,"cpu_readbacks":controller.cpu_readback_observations()}),
-                )?;
+            save_ui_result(
+                &store,
+                nonce,
+                "apply",
+                &serde_json::json!({"schema":1,"operation":"apply","nonce":nonce,"profile_id":profile.id,"profile_digest":digest,"notes":notes,"unconfirmed":unconfirmed,"mode_requested":mode,"overridden":overridden,"prelude_failed":prelude_failed,"gpu_tgp_w":gpu_tgp_w,"gpu_tgp_restored":gpu_tgp_restored,"gpu_restarted":gpu_restarted,"boot_unix_s":boot,"cooling":cooling,"result":result}),
+            )?;
+            if let Some(readbacks) = cpu_readbacks {
+                print(&serde_json::json!({"result":result,"cpu_readbacks":readbacks}))?;
             } else {
                 print(&result)?;
             }
@@ -856,19 +1208,25 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 && store.fan_policy_pending()?
                 && !store.fan_pending_direct_applied()?
             {
-                if args.len()==3 && !store.fan_policy_request()?.is_some_and(|r|matches!(&r.owner,omen_platform::profile_store::FanPolicyOwner::Profile{id,..} if id==&args[1])) {
-                    return Err(omen_core::message::msg("profile.err.other_profile",&[]));
+                if args.len()==3 && !store.fan_policy_request()?.is_some_and(|r|matches!(&r.owner,glph_platform::profile_store::FanPolicyOwner::Profile{id,..} if id==&args[1])) {
+                    return Err(glph_core::message::msg("profile.err.other_profile",&[]));
                 }
                 crate::profile_fan::recover_pending(&store)?;
-                store.save_control_result(&serde_json::json!({"schema":1,"operation":"restore","nonce":nonce,"result":{"Ok":null},"cooling_preferences_restored":true,"direct_restored":false}))?;
+                save_ui_result(
+                    &store,
+                    nonce,
+                    "restore",
+                    &serde_json::json!({"schema":1,"operation":"restore","nonce":nonce,"result":{"Ok":null},"cooling_preferences_restored":true,"direct_restored":false}),
+                )?;
                 return print(
                     &serde_json::json!({"cooling_preferences_restored":true,"hardware_handover_confirmed":false}),
                 );
             }
             let saved = store.last_transaction::<RestoreState>()?;
             if args.len() == 3 && saved.profile_id != args[1] {
-                return Err(omen_core::message::msg("profile.err.other_profile", &[]));
+                return Err(glph_core::message::msg("profile.err.other_profile", &[]));
             }
+            crate::gpu_crash_guard::clear_in_flight();
             // Disable further automatic application before explicit recovery.
             // The automatic battery return only undoes its own battery preset
             // and keeps the user's sign-in approval.
@@ -882,44 +1240,70 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let mut nvpcf_restored = false;
             let mut gpu_tgp_restored = false;
             let keep_startup = args[0] == "profile-ui-restore-keep";
-            let result = transaction::recover(&saved, &mut controller, &mut store).and_then(|()| {
-                direct_restored = true;
-                crate::profile_fan::restore_for(&store, &saved.profile_id, &saved.profile_digest)
+            let mut result =
+                transaction::recover(&saved, &mut controller, &mut store).and_then(|()| {
+                    direct_restored = true;
+                    crate::profile_fan::restore_for(
+                        &store,
+                        &saved.profile_id,
+                        &saved.profile_digest,
+                    )
                     .map(|value| {
                         cooling_restored = value;
                     })
                     .map_err(|error| transaction::ApplyFailure {
-                        error: omen_core::message::msg(
+                        error: glph_core::message::msg(
                             "fan_profile.err.restore_after_direct",
                             &[&error],
                         ),
                         rollback_errors: vec![],
                     })
-            });
+                });
             drop(controller);
-            let result = result.and_then(|()| {
-                if !keep_startup {
-                    nvpcf_restored = omen_platform::nvpcf_ppt::restore_if_saved(&inventory, &store)
-                        .map_err(|error| transaction::ApplyFailure {
-                            error,
-                            rollback_errors: vec![],
-                        })?;
-                    gpu_tgp_restored = omen_platform::vbios_tgp::restore_if_active(
-                        &inventory,
-                        &store,
-                        omen_platform::read_nvml_power_limits,
-                    )
-                    .map_err(|error| transaction::ApplyFailure {
-                        error,
-                        rollback_errors: vec![],
-                    })?;
-                    if gpu_tgp_restored && inventory.manufacturer == "HP" {
-                        let _ = omen_platform::write_hp_gpu_power(&inventory, true, true);
+            if !keep_startup {
+                // Always attempt NVPCF & VBIOS-TGP restore even if a direct
+                // setting reported a partial rollback error, so overrides are
+                // never stranded active.
+                let mut extra_errors = Vec::new();
+                match glph_platform::nvpcf_ppt::restore_if_saved(&inventory, &store) {
+                    Ok(v) => nvpcf_restored = v,
+                    Err(e) => extra_errors.push(e),
+                }
+                match glph_platform::vbios_tgp::restore_if_active(
+                    &inventory,
+                    &store,
+                    glph_platform::read_nvml_power_limits,
+                ) {
+                    Ok(v) => {
+                        gpu_tgp_restored = v;
+                        if gpu_tgp_restored
+                            && inventory.manufacturer == "HP"
+                            && let Err(e) =
+                                glph_platform::write_hp_gpu_power(&inventory, true, true)
+                        {
+                            extra_errors.push(e);
+                        }
+                    }
+                    Err(e) => extra_errors.push(e),
+                }
+                if !extra_errors.is_empty() {
+                    match &mut result {
+                        Ok(()) => {
+                            result = Err(transaction::ApplyFailure {
+                                error: extra_errors.join("; "),
+                                rollback_errors: vec![],
+                            });
+                        }
+                        Err(failure) => failure.rollback_errors.extend(extra_errors),
                     }
                 }
-                Ok(())
-            });
-            store.save_control_result(&serde_json::json!({"schema":1,"operation":"restore","nonce":nonce,"result":result,"direct_restored":direct_restored,"cooling_preferences_restored":cooling_restored,"nvpcf_restored":nvpcf_restored,"gpu_tgp_restored":gpu_tgp_restored,"cooling_hardware_verified":false}))?;
+            }
+            save_ui_result(
+                &store,
+                nonce,
+                "restore",
+                &serde_json::json!({"schema":1,"operation":"restore","nonce":nonce,"result":result,"direct_restored":direct_restored,"cooling_preferences_restored":cooling_restored,"nvpcf_restored":nvpcf_restored,"gpu_tgp_restored":gpu_tgp_restored,"cooling_hardware_verified":false}),
+            )?;
             result.map_err(|e| serde_json::to_string_pretty(&e).unwrap_or(e.error))?;
             let gpu_after = if saved.requested.iter().any(|s| s.feature.needs_nvidia()) {
                 Some(Controller::for_recovery(&saved)?.gpu_report()?)
@@ -937,8 +1321,8 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let nonce = args.get(2).map(String::as_str);
             validate_nonce(nonce)?;
             let profile = store.load(&args[1])?;
-            omen_core::fan_profile::startup_allowed(&profile, true)?;
-            let direct = omen_core::fan_profile::direct_part(&profile)?;
+            glph_core::fan_profile::startup_allowed(&profile, true)?;
+            let direct = glph_core::fan_profile::direct_part(&profile)?;
             let mut controller = Controller::for_profile(&direct)?;
             let plan = transaction::plan(&direct, &mut controller, true);
             if !plan.applicable {
@@ -949,11 +1333,16 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             if args[0] == "profile-ui-startup-enable" {
                 crate::startup_setup::ensure_current_installation()?;
             } else {
-                omen_platform::verify_startup_installation()?;
+                glph_platform::verify_startup_installation()?;
             }
-            omen_platform::authorize_startup_profile(&profile)?;
+            glph_platform::authorize_startup_profile(&profile)?;
             store.enable_startup(&args[1])?;
-            store.save_control_result(&serde_json::json!({"schema":1,"operation":"startup","nonce":nonce,"result":{"Ok":store.startup()?}}))?;
+            save_ui_result(
+                &store,
+                nonce,
+                "startup",
+                &serde_json::json!({"schema":1,"operation":"startup","nonce":nonce,"result":{"Ok":store.startup()?}}),
+            )?;
             print(&store.startup()?)
         }
         Some("profile-startup-disable") if args.len() == 1 => {
@@ -963,6 +1352,27 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
         Some("profile-startup-apply") if args.len() == 1 => {
             let _lease = ControlLease::acquire_foreground()?;
+            // Boot-Crash-Guard: if a previous GPU OC/V/F test survived across a
+            // hard reboot/BSOD, pause startup profile apply automatically to
+            // prevent a boot loop.
+            if let Some(crashed_id) =
+                crate::gpu_crash_guard::check_and_consume_boot_crash(glph_platform::boot_unix_s())
+            {
+                store.disable_startup()?;
+                let pause_msg = glph_core::message::msg("crash_guard.paused", &[&crashed_id]);
+                store.save_startup_result(&serde_json::json!({
+                    "schema": 1,
+                    "recorded_at_unix_seconds": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .ok(),
+                    "process_id": std::process::id(),
+                    "crash_guard_triggered": true,
+                    "crashed_profile_id": crashed_id,
+                    "result": { "Err": pause_msg }
+                }))?;
+                return Err(pause_msg);
+            }
             let selection_at_start = store.startup()?;
             // Approval ends for a changed preset, device or binding; a firmware
             // step or value that fails after those checks does not revoke it.
@@ -978,49 +1388,64 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 let Some(profile) = store.startup_profile()? else {
                     return Ok(None);
                 };
-                let selection = omen_core::battery::Selection::Preset(profile.id.clone());
-                let ac = omen_platform::power_status().ac_connected;
+                let selection = glph_core::battery::Selection::Preset(profile.id.clone());
+                let ac = glph_platform::power_status().ac_connected;
                 skipped_on_battery =
                     ac == Some(false) && store.battery_selection_for(Some(&selection)).is_some();
                 // Either way this preset is the one in use on AC from now on,
                 // so its battery behaviour and the return apply to it. A new
                 // boot also ends the battery session of the earlier one.
-                let mut state = store.battery_state().at_boot(omen_platform::boot_unix_s());
+                let mut state = store.battery_state().at_boot(glph_platform::boot_unix_s());
                 state.ac_selection = Some(selection);
                 if skipped_on_battery {
                     store.save_battery_state(&state)?;
                     return Ok(None);
                 }
-                omen_core::fan_profile::startup_allowed(&profile, true)?;
-                omen_platform::verify_startup_profile(&profile)?;
+                glph_core::fan_profile::startup_allowed(&profile, true)?;
+                glph_platform::verify_startup_profile(&profile)?;
                 let digest = profile_digest(&profile)?;
-                let direct = omen_core::fan_profile::direct_part(&profile)?;
+                let direct = glph_core::fan_profile::direct_part(&profile)?;
                 let mut controller = prepare_apply(&direct, &mut store, true, false)?;
+                let inventory = controller.inventory().clone();
                 device_checked = true;
-                if omen_platform::nvpcf_ppt::apply_for_profile(
-                    controller.inventory(),
+                let armed_crash_guard = profile_has_gpu_oc_or_vf(&profile);
+                if armed_crash_guard {
+                    let _ = crate::gpu_crash_guard::mark_in_flight(&profile.id);
+                }
+                let nvpcf_changed = match glph_platform::nvpcf_ppt::apply_for_profile(
+                    &inventory,
                     &store,
                     &profile,
                     ac == Some(true),
-                )
-                .ok()
-                .flatten()
-                .is_some()
-                {
+                ) {
+                    Ok(mode) => mode.is_some(),
+                    Err(err) => {
+                        if armed_crash_guard {
+                            crate::gpu_crash_guard::clear_in_flight();
+                        }
+                        return Err(err);
+                    }
+                };
+                if nvpcf_changed {
                     controller.set_nvpcf_ppt_unlocked(true);
                 }
                 // The linked curve is requested from the fan helper exactly as
                 // a manual Apply does. A helper that cannot take it yet (it
                 // may still be starting) does not hold back the other values.
-                let request =
-                    match crate::profile_fan::prepare(&profile, &store, controller.inventory()) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            cooling_error = Some(error);
-                            None
-                        }
-                    };
-                if let Err(error) = apply_hp_prelude(&profile, controller.inventory()) {
+                let request = match crate::profile_fan::prepare(&profile, &store, &inventory) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        cooling_error = Some(error);
+                        None
+                    }
+                };
+                if let Err(error) = apply_hp_prelude(&profile, &inventory) {
+                    drop(controller);
+                    let _ =
+                        rollback_pre_transaction(&inventory, &store, false, nvpcf_changed, None);
+                    if armed_crash_guard {
+                        crate::gpu_crash_guard::clear_in_flight();
+                    }
                     return Err(crate::profile_fan::prelude_failed(
                         &store,
                         request.as_ref(),
@@ -1037,11 +1462,33 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     applied,
                 );
                 cooling = requested;
-                let completion =
-                    applied.map_err(|e| serde_json::to_string_pretty(&e).unwrap_or(e.error))?;
+                let completion = match applied {
+                    Ok(c) => c,
+                    Err(mut e) => {
+                        drop(controller);
+                        let rb = rollback_pre_transaction(
+                            &inventory,
+                            &store,
+                            false,
+                            nvpcf_changed,
+                            None,
+                        );
+                        e.rollback_errors.extend(rb);
+                        if armed_crash_guard {
+                            crate::gpu_crash_guard::clear_in_flight();
+                        }
+                        return Err(serde_json::to_string_pretty(&e).unwrap_or(e.error));
+                    }
+                };
                 if ac != Some(false) {
                     // Best effort: the applied preset stands either way.
                     let _ = store.save_battery_state(&state);
+                }
+                if armed_crash_guard {
+                    // Prove 15 s stability in this background logon task before
+                    // clearing the Boot-Crash-Guard marker.
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    crate::gpu_crash_guard::clear_in_flight();
                 }
                 Ok(Some(completion))
             })();
@@ -1053,7 +1500,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             result.map(|_| ())
         }
         Some("profile-startup-status") if args.len() == 1 => print(
-            &serde_json::json!({"selection":store.startup()?,"installation":omen_platform::verify_startup_installation()}),
+            &serde_json::json!({"selection":store.startup()?,"installation":glph_platform::verify_startup_installation()}),
         ),
         Some("profile-startup-check") if args.len() == 1 => {
             // Inspection only: never apply, enable, authorize or disable startup.
@@ -1063,8 +1510,8 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     return Ok(None);
                 };
                 store.startup_eligibility(&profile.id)?;
-                omen_platform::verify_startup_profile(&profile)?;
-                let direct = omen_core::fan_profile::direct_part(&profile)?;
+                glph_platform::verify_startup_profile(&profile)?;
+                let direct = glph_core::fan_profile::direct_part(&profile)?;
                 let mut controller = Controller::for_profile(&direct)?;
                 let plan = transaction::plan(&direct, &mut controller, true);
                 if !plan.applicable {

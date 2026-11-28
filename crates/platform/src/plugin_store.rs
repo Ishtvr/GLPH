@@ -1,6 +1,6 @@
 //! Isolated storage, discovery, pure-Rust archive extraction, and atomic
-//! state persistence for installable PerformanceHub plugins.
-use omen_core::{
+//! state persistence for installable GLPH plugins.
+use glph_core::{
     Inventory,
     plugins::{
         InstalledPlugin, MAX_PLUGIN_FILES, MAX_PLUGIN_UNPACKED_BYTES, PLUGINS_STATE_SCHEMA,
@@ -72,7 +72,14 @@ impl PluginStore {
         if !path.exists() {
             return Ok(PluginsStateFile::default());
         }
-        let raw = fs::read_to_string(&path).map_err(|e| format!("read plugins.json: {e}"))?;
+        let file = fs::File::open(&path).map_err(|e| format!("read plugins.json: {e}"))?;
+        let mut raw = String::new();
+        file.take(256 * 1024 + 1)
+            .read_to_string(&mut raw)
+            .map_err(|e| format!("read plugins.json: {e}"))?;
+        if raw.len() > 256 * 1024 {
+            return Err("plugins.json exceeds 256 KiB bound".into());
+        }
         let state: PluginsStateFile =
             serde_json::from_str(&raw).map_err(|e| format!("parse plugins.json: {e}"))?;
         if state.schema != PLUGINS_STATE_SCHEMA {
@@ -84,26 +91,14 @@ impl PluginStore {
     pub fn save_state(&self, state: &PluginsStateFile) -> Result<(), String> {
         fs::create_dir_all(&self.root).map_err(|e| format!("create data dir: {e}"))?;
         let path = self.state_path();
-        let tmp = self.root.join(format!(".plugins-{}.tmp", next_nonce()));
-        let bytes =
+        let mut bytes =
             serde_json::to_vec_pretty(state).map_err(|e| format!("serialize plugins.json: {e}"))?;
-        fs::write(&tmp, &bytes).map_err(|e| format!("write temp plugins.json: {e}"))?;
-        if let Err(err) = fs::rename(&tmp, &path) {
-            if path.exists() {
-                let _ = fs::remove_file(&path);
-                if let Err(err2) = fs::rename(&tmp, &path) {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(format!("commit plugins.json: {err2}"));
-                }
-            } else {
-                let _ = fs::remove_file(&tmp);
-                return Err(format!("commit plugins.json: {err}"));
-            }
-        }
-        Ok(())
+        bytes.push(b'\n');
+        crate::profile_store::atomic_bytes(&path, &bytes)
+            .map_err(|e| format!("commit plugins.json: {e}"))
     }
 
-    /// Scans `%USERPROFILE%\.performance-hub\plugins\` and returns every
+    /// Scans `%USERPROFILE%\.glph\plugins\` (or legacy `.performance-hub\plugins\`) and returns every
     /// installed plugin sorted deterministically by `(nav_order, id)`.
     pub fn scan(&self, inventory: &Inventory) -> Vec<InstalledPlugin> {
         let dir = self.plugins_dir();
@@ -177,7 +172,7 @@ impl PluginStore {
                         false
                     };
                     if is_duplicate_loser {
-                        let msg = omen_core::message::msg(
+                        let msg = glph_core::message::msg(
                             "plugins.err.duplicate_id",
                             &[&manifest.id, &folder_name],
                         );
@@ -240,7 +235,7 @@ impl PluginStore {
         results
     }
 
-    /// Inspects a `.perfhub-plugin`/`.zip` archive or a `plugin.json` file
+    /// Inspects a `.glph`/`.zip` archive or a `plugin.json` file
     /// without mutating disk state.
     pub fn inspect_package(source: &Path) -> Result<PluginManifest, String> {
         if source
@@ -257,8 +252,8 @@ impl PluginStore {
         Ok(manifest)
     }
 
-    /// Installs a plugin from a `.perfhub-plugin`/`.zip` archive or a `plugin.json`
-    /// file into `%USERPROFILE%\.performance-hub\plugins\<id>\` atomically.
+    /// Installs a plugin from a `.glph`/`.zip` archive or a `plugin.json`
+    /// file into `%USERPROFILE%\.glph\plugins\<id>\` atomically.
     /// Newly installed plugins always start as `(inaktiv)` (`enabled: false`).
     pub fn install_from_path(
         &self,
@@ -282,10 +277,7 @@ impl PluginStore {
         fs::create_dir_all(&staging_dir).map_err(|e| format!("create staging dir: {e}"))?;
 
         let stage_res = if is_manifest_file {
-            let src_dir = source
-                .parent()
-                .ok_or_else(|| "plugin.json has no parent folder".to_owned())?;
-            copy_dir_bounded(src_dir, &staging_dir)
+            stage_manifest_file(source, &manifest, &staging_dir)
         } else {
             extract_zip_bounded(source, &staging_dir)
         };
@@ -304,7 +296,7 @@ impl PluginStore {
         let had_existing = target_dir.exists();
         if had_existing && let Err(err) = fs::rename(&target_dir, &backup_dir) {
             let _ = fs::remove_dir_all(&staging_dir);
-            return Err(omen_core::message::msg(
+            return Err(glph_core::message::msg(
                 "plugins.err.locked",
                 &[&err.to_string()],
             ));
@@ -315,7 +307,7 @@ impl PluginStore {
                 let _ = fs::rename(&backup_dir, &target_dir);
             }
             let _ = fs::remove_dir_all(&staging_dir);
-            return Err(omen_core::message::msg(
+            return Err(glph_core::message::msg(
                 "plugins.err.locked",
                 &[&err.to_string()],
             ));
@@ -325,7 +317,7 @@ impl PluginStore {
             let _ = fs::remove_dir_all(&backup_dir);
         }
 
-        let mut state = self.load_state().unwrap_or_default();
+        let mut state = self.load_state()?;
         state.plugins.insert(
             manifest.id.clone(),
             PluginStateEntry {
@@ -344,7 +336,7 @@ impl PluginStore {
         enabled: bool,
         pinned_sha256: Option<String>,
     ) -> Result<(), String> {
-        let mut state = self.load_state().unwrap_or_default();
+        let mut state = self.load_state()?;
         let entry = state.plugins.entry(id.to_owned()).or_default();
         entry.enabled = enabled;
         if let Some(hash) = pinned_sha256 {
@@ -371,29 +363,41 @@ impl PluginStore {
             }
             let backup = plugins_dir.join(format!(".del-{folder_name}-{}", next_nonce()));
             fs::rename(&target, &backup)
-                .map_err(|e| omen_core::message::msg("plugins.err.locked", &[&e.to_string()]))?;
+                .map_err(|e| glph_core::message::msg("plugins.err.locked", &[&e.to_string()]))?;
             if let Err(err) = fs::remove_dir_all(&backup) {
                 let _ = fs::rename(&backup, &target);
-                return Err(omen_core::message::msg(
+                return Err(glph_core::message::msg(
                     "plugins.err.locked",
                     &[&err.to_string()],
                 ));
             }
         }
-        let mut state = self.load_state().unwrap_or_default();
+        let mut state = self.load_state()?;
         state.plugins.remove(plugin_id);
         self.save_state(&state)
     }
 }
 
+const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+
 fn read_and_validate_manifest(path: &Path) -> Result<PluginManifest, String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|_| omen_core::message::msg("plugins.err.manifest_missing", &[]))?;
+    let file = fs::File::open(path)
+        .map_err(|_| glph_core::message::msg("plugins.err.manifest_missing", &[]))?;
+    let mut raw = String::new();
+    file.take(MAX_MANIFEST_BYTES as u64 + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| glph_core::message::msg("plugins.err.manifest_missing", &[]))?;
+    if raw.len() > MAX_MANIFEST_BYTES {
+        return Err(glph_core::message::msg(
+            "plugins.err.archive_too_large",
+            &[],
+        ));
+    }
     let manifest: PluginManifest = serde_json::from_str(&raw)
-        .map_err(|e| omen_core::message::msg("plugins.err.manifest_invalid", &[&e.to_string()]))?;
+        .map_err(|e| glph_core::message::msg("plugins.err.manifest_invalid", &[&e.to_string()]))?;
     manifest
         .validate()
-        .map_err(|e| omen_core::message::msg("plugins.err.manifest_invalid", &[&e]))?;
+        .map_err(|e| glph_core::message::msg("plugins.err.manifest_invalid", &[&e]))?;
     Ok(manifest)
 }
 
@@ -403,7 +407,7 @@ fn inspect_zip<R: Read + io::Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> Result<(Option<String>, PluginManifest), String> {
     if archive.len() > MAX_PLUGIN_FILES * 2 {
-        return Err(omen_core::message::msg("plugins.err.too_many_files", &[]));
+        return Err(glph_core::message::msg("plugins.err.too_many_files", &[]));
     }
     let mut file_count = 0usize;
     let mut total_bytes = 0u64;
@@ -420,17 +424,17 @@ fn inspect_zip<R: Read + io::Seek>(
             .unix_mode()
             .is_some_and(|m| (m & 0o170000) == 0o120000)
         {
-            return Err(omen_core::message::msg("plugins.err.unsafe_archive", &[]));
+            return Err(glph_core::message::msg("plugins.err.unsafe_archive", &[]));
         }
         validate_relative_path(&name)
-            .map_err(|_| omen_core::message::msg("plugins.err.unsafe_archive", &[]))?;
+            .map_err(|_| glph_core::message::msg("plugins.err.unsafe_archive", &[]))?;
         file_count += 1;
         if file_count > MAX_PLUGIN_FILES {
-            return Err(omen_core::message::msg("plugins.err.too_many_files", &[]));
+            return Err(glph_core::message::msg("plugins.err.too_many_files", &[]));
         }
         total_bytes = total_bytes.saturating_add(entry.size());
         if total_bytes > MAX_PLUGIN_UNPACKED_BYTES {
-            return Err(omen_core::message::msg(
+            return Err(glph_core::message::msg(
                 "plugins.err.archive_too_large",
                 &[],
             ));
@@ -441,25 +445,34 @@ fn inspect_zip<R: Read + io::Seek>(
             let mut text = String::new();
             entry
                 .by_ref()
-                .take(256 * 1024)
+                .take(MAX_MANIFEST_BYTES as u64 + 1)
                 .read_to_string(&mut text)
                 .map_err(|e| format!("read manifest in zip: {e}"))?;
+            if text.len() > MAX_MANIFEST_BYTES {
+                return Err(glph_core::message::msg(
+                    "plugins.err.archive_too_large",
+                    &[],
+                ));
+            }
             manifest_entries.push((name, text));
         }
+    }
+    if manifest_entries.len() > 1 {
+        return Err(glph_core::message::msg("plugins.err.unsafe_archive", &[]));
     }
     let (manifest_name, manifest_raw) = manifest_entries
         .into_iter()
         .next()
-        .ok_or_else(|| omen_core::message::msg("plugins.err.manifest_missing", &[]))?;
+        .ok_or_else(|| glph_core::message::msg("plugins.err.manifest_missing", &[]))?;
     let strip_prefix = manifest_name
         .strip_suffix("plugin.json")
         .filter(|p| !p.is_empty())
         .map(str::to_owned);
     let manifest: PluginManifest = serde_json::from_str(&manifest_raw)
-        .map_err(|e| omen_core::message::msg("plugins.err.manifest_invalid", &[&e.to_string()]))?;
+        .map_err(|e| glph_core::message::msg("plugins.err.manifest_invalid", &[&e.to_string()]))?;
     manifest
         .validate()
-        .map_err(|e| omen_core::message::msg("plugins.err.manifest_invalid", &[&e]))?;
+        .map_err(|e| glph_core::message::msg("plugins.err.manifest_invalid", &[&e]))?;
     Ok((strip_prefix, manifest))
 }
 
@@ -487,10 +500,10 @@ fn extract_zip_bounded(source: &Path, dst_dir: &Path) -> Result<(), String> {
             None => raw_name,
         };
         validate_relative_path(&rel)
-            .map_err(|_| omen_core::message::msg("plugins.err.unsafe_archive", &[]))?;
+            .map_err(|_| glph_core::message::msg("plugins.err.unsafe_archive", &[]))?;
         file_count += 1;
         if file_count > MAX_PLUGIN_FILES {
-            return Err(omen_core::message::msg("plugins.err.too_many_files", &[]));
+            return Err(glph_core::message::msg("plugins.err.too_many_files", &[]));
         }
         let out_path = dst_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
         if let Some(parent) = out_path.parent() {
@@ -508,7 +521,7 @@ fn extract_zip_bounded(source: &Path, dst_dir: &Path) -> Result<(), String> {
             }
             total_written = total_written.saturating_add(n as u64);
             if total_written > MAX_PLUGIN_UNPACKED_BYTES {
-                return Err(omen_core::message::msg(
+                return Err(glph_core::message::msg(
                     "plugins.err.archive_too_large",
                     &[],
                 ));
@@ -520,48 +533,55 @@ fn extract_zip_bounded(source: &Path, dst_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_dir_bounded(src_root: &Path, dst_root: &Path) -> Result<(), String> {
-    let mut file_count = 0usize;
-    let mut total_bytes = 0u64;
-    let mut stack = vec![PathBuf::new()];
-    while let Some(rel_dir) = stack.pop() {
-        let cur_src = src_root.join(&rel_dir);
-        let cur_dst = dst_root.join(&rel_dir);
-        fs::create_dir_all(&cur_dst).map_err(|e| format!("create plugin dir: {e}"))?;
-        for entry in fs::read_dir(&cur_src).map_err(|e| format!("read plugin dir: {e}"))? {
-            let entry = entry.map_err(|e| format!("read plugin entry: {e}"))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let src_path = entry.path();
-            let meta =
-                fs::symlink_metadata(&src_path).map_err(|e| format!("inspect plugin file: {e}"))?;
-            if meta.file_type().is_symlink() {
-                return Err(omen_core::message::msg("plugins.err.unsafe_archive", &[]));
-            }
-            let rel_child = rel_dir.join(&name);
-            let rel_str = rel_child.to_string_lossy().replace('\\', "/");
-            validate_relative_path(&rel_str)
-                .map_err(|_| omen_core::message::msg("plugins.err.unsafe_archive", &[]))?;
-            if meta.is_dir() {
-                stack.push(rel_child);
-            } else if meta.is_file() {
-                file_count += 1;
-                if file_count > MAX_PLUGIN_FILES {
-                    return Err(omen_core::message::msg("plugins.err.too_many_files", &[]));
-                }
-                total_bytes = total_bytes.saturating_add(meta.len());
-                if total_bytes > MAX_PLUGIN_UNPACKED_BYTES {
-                    return Err(omen_core::message::msg(
-                        "plugins.err.archive_too_large",
-                        &[],
-                    ));
-                }
-                fs::copy(&src_path, dst_root.join(&rel_child))
-                    .map_err(|e| format!("copy plugin file: {e}"))?;
-            }
+/// Stages a loose `plugin.json` without blindly copying the entire parent
+/// directory (e.g. `Downloads/` or `Desktop/`).
+/// - `HostSurface` plugins require only `plugin.json`.
+/// - `Process` plugins copy only `plugin.json` and their validated declared
+///   `entry.executable` relative path (refusing symlinks & size overflows).
+fn stage_manifest_file(
+    source: &Path,
+    manifest: &PluginManifest,
+    staging_dir: &Path,
+) -> Result<(), String> {
+    let src_meta = fs::symlink_metadata(source).map_err(|e| format!("inspect plugin.json: {e}"))?;
+    if src_meta.file_type().is_symlink() || !src_meta.is_file() {
+        return Err(glph_core::message::msg("plugins.err.unsafe_archive", &[]));
+    }
+    if src_meta.len() > 256 * 1024 {
+        return Err(glph_core::message::msg(
+            "plugins.err.archive_too_large",
+            &[],
+        ));
+    }
+    fs::copy(source, staging_dir.join("plugin.json"))
+        .map_err(|e| format!("copy plugin.json: {e}"))?;
+    if let Some(entry) = &manifest.entry {
+        validate_relative_path(&entry.executable)
+            .map_err(|_| glph_core::message::msg("plugins.err.unsafe_archive", &[]))?;
+        let src_dir = source
+            .parent()
+            .ok_or_else(|| "plugin.json has no parent folder".to_owned())?;
+        let rel = entry
+            .executable
+            .replace('\\', "/")
+            .replace('/', std::path::MAIN_SEPARATOR_STR);
+        let src_exe = src_dir.join(&rel);
+        let exe_meta = fs::symlink_metadata(&src_exe)
+            .map_err(|e| format!("inspect plugin executable: {e}"))?;
+        if exe_meta.file_type().is_symlink() || !exe_meta.is_file() {
+            return Err(glph_core::message::msg("plugins.err.unsafe_archive", &[]));
         }
+        if exe_meta.len().saturating_add(src_meta.len()) > MAX_PLUGIN_UNPACKED_BYTES {
+            return Err(glph_core::message::msg(
+                "plugins.err.archive_too_large",
+                &[],
+            ));
+        }
+        let dst_exe = staging_dir.join(&rel);
+        if let Some(parent) = dst_exe.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create plugin subdir: {e}"))?;
+        }
+        fs::copy(&src_exe, &dst_exe).map_err(|e| format!("copy plugin executable: {e}"))?;
     }
     Ok(())
 }
@@ -572,7 +592,7 @@ mod tests {
     use std::io::Write;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("perfhub-plugintest-{tag}-{}", next_nonce()));
+        let dir = std::env::temp_dir().join(format!("glph-plugintest-{tag}-{}", next_nonce()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -585,7 +605,7 @@ mod tests {
   "description": { "de": "4-Zonen-RGB-Steuerung für HP OMEN Notebooks.", "en": "4-zone RGB control for HP OMEN laptops." },
   "version": "2.0.0",
   "api_version": 1,
-  "author": "PerformanceHub",
+  "author": "GLPH",
   "category": "lighting",
   "runtime": "host_surface",
   "capabilities": ["hardware.hp_lighting", "ui.sidebar_page"],
@@ -615,7 +635,7 @@ mod tests {
     fn install_toggle_replace_and_remove_zip_plugin() {
         let root = temp_root("lifecycle");
         let store = PluginStore::at(root.clone());
-        let pkg = root.join("hp-omen-4zone-lighting.perfhub-plugin");
+        let pkg = root.join("hp-omen-4zone-lighting.glph");
         write_zip(
             &pkg,
             &[(
@@ -686,7 +706,7 @@ mod tests {
     fn zip_slip_archive_is_rejected_without_writing_files() {
         let root = temp_root("zipslip");
         let store = PluginStore::at(root.clone());
-        let pkg = root.join("bad.perfhub-plugin");
+        let pkg = root.join("bad.glph");
         write_zip(
             &pkg,
             &[
@@ -733,8 +753,8 @@ mod tests {
 
     #[test]
     fn shipped_hp_omen_keyboard_plugin_package_installs_cleanly() {
-        let pkg = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../plugins/hp-omen-4zone-lighting.perfhub-plugin");
+        let pkg =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/hp-omen-4zone-lighting.glph");
         assert!(
             pkg.exists(),
             "Run scripts/package-plugins.ps1 to build {}",
@@ -746,18 +766,42 @@ mod tests {
         let InstallOutcome::Installed(manifest) = outcome else {
             panic!("expected fresh install");
         };
-        assert_eq!(manifest.id, omen_core::plugins::HP_LIGHTING_PLUGIN_ID);
+        assert_eq!(manifest.id, glph_core::plugins::HP_LIGHTING_PLUGIN_ID);
         assert_eq!(manifest.version, "2.0.0");
+
+        // Also verify the unified HP OMEN Control `.glph` package installs cleanly.
+        let control_pkg =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/hp-omen-control.glph");
+        assert!(
+            control_pkg.exists(),
+            "Run scripts/package-plugins.ps1 to build {}",
+            control_pkg.display()
+        );
+        let control_outcome = store.install_from_path(&control_pkg, false).unwrap();
+        let InstallOutcome::Installed(control_manifest) = control_outcome else {
+            panic!("expected fresh install of hp-omen-control");
+        };
+        assert_eq!(
+            control_manifest.id,
+            glph_core::plugins::HP_OMEN_CONTROL_PLUGIN_ID
+        );
+        assert_eq!(control_manifest.version, "2.0.0");
         let hp = Inventory {
             manufacturer: "HP".into(),
             hp_bios_interface_present: true,
             ..Default::default()
         };
         let scanned = store.scan(&hp);
-        assert_eq!(scanned.len(), 1);
-        assert_eq!(scanned[0].status, PluginStatus::Inactive);
+        assert_eq!(scanned.len(), 2);
+        assert!(scanned.iter().all(|p| p.status == PluginStatus::Inactive));
         store.set_enabled(&manifest.id, true, None).unwrap();
-        assert_eq!(store.scan(&hp)[0].status, PluginStatus::Active);
+        store.set_enabled(&control_manifest.id, true, None).unwrap();
+        assert!(
+            store
+                .scan(&hp)
+                .iter()
+                .all(|p| p.status == PluginStatus::Active)
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

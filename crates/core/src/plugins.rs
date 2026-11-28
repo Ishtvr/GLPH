@@ -16,8 +16,10 @@ pub const MAX_PLUGIN_UNPACKED_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_SENSOR_GROUPS: usize = 32;
 pub const MAX_SENSOR_ROWS: usize = 256;
 
-/// Official ID of the installable HP OMEN 4-Zone Keyboard Lighting plugin.
+/// Official ID of the installable HP OMEN 4-Zone Keyboard Lighting plugin (legacy standalone).
 pub const HP_LIGHTING_PLUGIN_ID: &str = "hp-omen-4zone-lighting";
+/// Official ID of the combined HP OMEN Control plugin (4-zone lighting + original HP OMEN modes).
+pub const HP_OMEN_CONTROL_PLUGIN_ID: &str = "hp-omen-control";
 
 const RESERVED_IDS: &[&str] = &[
     "overview", "cooling", "settings", "system", "core", "plugins",
@@ -98,11 +100,13 @@ pub enum PluginRuntime {
 pub enum UiSurfaceKind {
     #[serde(rename = "lighting-4zone")]
     Lighting4Zone,
+    #[serde(rename = "hp-omen-suite")]
+    HpOmenSuite,
     SensorBoard,
     Panel,
 }
 
-/// Closed set of compiled sidebar SVG icons (`chrome.slint`).
+/// Closed set of compiled sidebar icons (`chrome.slint`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NavIcon {
@@ -111,6 +115,7 @@ pub enum NavIcon {
     Gauge,
     Chip,
     Plug,
+    Omen,
 }
 
 impl NavIcon {
@@ -121,6 +126,7 @@ impl NavIcon {
             Self::Gauge => 5,
             Self::Chip => 6,
             Self::Plug => 7,
+            Self::Omen => 8,
         }
     }
 }
@@ -129,6 +135,8 @@ impl NavIcon {
 pub enum PluginCapability {
     #[serde(rename = "hardware.hp_lighting")]
     HardwareHpLighting,
+    #[serde(rename = "hardware.hp_modes")]
+    HardwareHpModes,
     #[serde(rename = "sensors.read")]
     SensorsRead,
     #[serde(rename = "host.telemetry_subscribe")]
@@ -141,6 +149,7 @@ impl PluginCapability {
     pub fn label_key(self) -> &'static str {
         match self {
             Self::HardwareHpLighting => "plugins.cap.hp_lighting",
+            Self::HardwareHpModes => "plugins.cap.hp_modes",
             Self::SensorsRead => "plugins.cap.sensors_read",
             Self::HostTelemetrySubscribe => "plugins.cap.host_telemetry",
             Self::UiSidebarPage => "plugins.cap.sidebar_page",
@@ -265,13 +274,32 @@ impl PluginManifest {
                         "lighting-4zone plugin must declare hardware.hp_lighting capability".into(),
                     );
                 }
+                if self.ui_surface.kind == UiSurfaceKind::HpOmenSuite
+                    && (!self
+                        .capabilities
+                        .contains(&PluginCapability::HardwareHpLighting)
+                        || !self
+                            .capabilities
+                            .contains(&PluginCapability::HardwareHpModes))
+                {
+                    return Err(
+                        "hp-omen-suite plugin must declare hardware.hp_lighting and hardware.hp_modes capabilities"
+                            .into(),
+                    );
+                }
             }
             PluginRuntime::Process => {
                 if self
                     .capabilities
                     .contains(&PluginCapability::HardwareHpLighting)
+                    || self
+                        .capabilities
+                        .contains(&PluginCapability::HardwareHpModes)
                 {
-                    return Err("external process plugins cannot claim hardware.hp_lighting".into());
+                    return Err(
+                        "external process plugins cannot claim built-in HP hardware capabilities"
+                            .into(),
+                    );
                 }
                 let entry = self
                     .entry
@@ -311,6 +339,15 @@ pub fn validate_plugin_id(id: &str) -> Result<(), String> {
     }
     if RESERVED_IDS.contains(&id) {
         return Err(format!("plugin id '{id}' is reserved"));
+    }
+    let windows_reserved = matches!(id, "con" | "prn" | "aux" | "nul")
+        || (id.len() == 4
+            && (id.starts_with("com") || id.starts_with("lpt"))
+            && id.as_bytes()[3].is_ascii_digit());
+    if windows_reserved {
+        return Err(format!(
+            "plugin id '{id}' is a reserved Windows device name"
+        ));
     }
     Ok(())
 }
@@ -359,7 +396,7 @@ pub fn validate_relative_path(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Sidecar state persisted in `%USERPROFILE%\.performance-hub\plugins.json`.
+/// Sidecar state persisted in `%USERPROFILE%\.glph\plugins.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginsStateFile {
@@ -550,7 +587,7 @@ mod tests {
             },
             version: "2.0.0".into(),
             api_version: PLUGIN_API_VERSION,
-            author: "PerformanceHub".into(),
+            author: "GLPH".into(),
             category: PluginCategory::Lighting,
             runtime: PluginRuntime::HostSurface,
             capabilities: vec![
@@ -621,6 +658,9 @@ mod tests {
     fn reserved_ids_and_zip_slip_paths_are_rejected() {
         assert!(validate_plugin_id("settings").is_err());
         assert!(validate_plugin_id("Overview").is_err());
+        for win_reserved in ["con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt0"] {
+            assert!(validate_plugin_id(win_reserved).is_err(), "{win_reserved}");
+        }
         assert!(validate_plugin_id("hp-omen-4zone-lighting").is_ok());
         assert!(validate_relative_path("plugin.json").is_ok());
         assert!(validate_relative_path("../evil.exe").is_err());

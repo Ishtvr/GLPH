@@ -1,7 +1,7 @@
 //! AMD SMU mailbox through the signed PawnIO RyzenSMU module. Only fixed
 //! Raphael/Dragon Range RSMU messages are reachable; no caller-chosen opcode.
 use super::cpu_hardware::{EXECUTE, Handle, LOAD, VERSION, driver_identity, ioctl, wide};
-use omen_core::Inventory;
+use glph_core::Inventory;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::ptr;
@@ -13,7 +13,7 @@ use windows_sys::Win32::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         OPEN_EXISTING,
     },
-    System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+    System::Threading::{ReleaseMutex, WaitForSingleObject},
 };
 
 pub const SMU_MODULE_SHA256: &str =
@@ -125,7 +125,7 @@ fn cells(bytes: &[u8]) -> Vec<u64> {
 impl Smu {
     pub fn new(inventory: &Inventory) -> Result<Self, String> {
         if MODULE.is_empty() {
-            return Err(omen_core::message::msg("cpu.err.no_smu_module", &[]));
+            return Err(glph_core::message::msg("cpu.err.no_smu_module", &[]));
         }
         let is_amd_ryzen = inventory.cpus.iter().any(|cpu| {
             let lower = cpu.to_ascii_lowercase();
@@ -164,11 +164,9 @@ impl Smu {
             return Err("Embedded SMU module differs from its signed release".into());
         }
         ioctl(&driver, LOAD, MODULE, &mut []).map_err(|e| format!("SMU module load: {e}"))?;
-        // SAFETY: Named shared mutex other PawnIO/ZenStates tools also use.
-        let pci = unsafe { CreateMutexW(ptr::null(), 0, wide("Global\\Access_PCI").as_ptr()) };
-        if pci.is_null() {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
+        // Shared cross-session mutex used by PawnIO/ZenStates/HWiNFO and
+        // Session-0 GLPHService; explicit SDDL prevents ERROR_ACCESS_DENIED (5).
+        let pci = super::control_lease::create_or_open_mutex("Global\\Access_PCI")?;
         let smu = Self {
             driver,
             pci: Handle(pci),

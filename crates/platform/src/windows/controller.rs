@@ -3,7 +3,7 @@ mod public_power;
 use super::{
     GpuControlsReport, NvidiaIdentity, OffsetState, gpu::NvidiaControl, inventory, power_status,
 };
-use omen_core::{
+use glph_core::{
     Inventory,
     features::Feature,
     keyboard::KeyboardState,
@@ -43,18 +43,28 @@ pub enum RestoreState {
         identity: NvidiaIdentity,
         state: OffsetState,
         #[serde(default)]
-        gfx_curve: Option<omen_core::vf::VfState>,
+        gfx_curve: Option<glph_core::vf::VfState>,
         #[serde(default)]
         related_core: Option<OffsetState>,
     },
     NvidiaVfCurve {
         identity: NvidiaIdentity,
-        state: omen_core::vf::VfState,
+        state: glph_core::vf::VfState,
         core_offset: OffsetState,
     },
     NvidiaPowerLimit {
         identity: NvidiaIdentity,
-        state: omen_core::gpu_power::PowerLimitState,
+        state: glph_core::gpu_power::PowerLimitState,
+    },
+    /// Public NVML graphics locked-clocks cap (`nvmlDeviceSetGpuLockedClocks` /
+    /// `nvmlDeviceResetGpuLockedClocks`); `active_max_mhz: None` means unlocked stock boost.
+    NvidiaLockedClocks {
+        identity: NvidiaIdentity,
+        active_max_mhz: Option<u32>,
+    },
+    /// Flashless VBIOS Policy[2] direct TGP ceiling tracked in NVML max bounds.
+    VbiosTgp {
+        max_mw: u32,
     },
     Windows {
         image: super::windows_settings::WindowsImage,
@@ -86,17 +96,18 @@ pub struct Controller {
     inventory: Inventory,
     nvidia: Option<NvidiaControl>,
     calibration: bool,
-    curve_calibration: Option<omen_core::vf::CurveTrial>,
+    curve_calibration: Option<glph_core::vf::CurveTrial>,
     vf: Option<super::vf::VfControl>,
     captured: BTreeMap<Feature, Captured<RestoreState>>,
-    curve_target: Option<(Value, omen_core::vf::VfState)>,
+    curve_target: Option<(Value, glph_core::vf::VfState)>,
+    locked_clock_target: Option<u32>,
     memory_last_trial: bool,
     keyboard: Option<super::hp::KeyboardControl>,
     keyboard_calibration: Option<Vec<[u8; 3]>>,
     keyboard_target: Option<KeyboardState>,
     keyboard_mode_calibration: Option<Choice>,
     fan: Option<super::cooling::FanControl>,
-    fan_target: Option<omen_core::cooling::MaxFanState>,
+    fan_target: Option<glph_core::cooling::MaxFanState>,
     fan_calibration: bool,
     fan_observations: Vec<super::cooling::FanReport>,
     /// Windows targets written in this transaction (accepted by later checks).
@@ -127,7 +138,7 @@ fn mux_mode(choice: Choice) -> Result<u8, String> {
         Choice::Hybrid => Ok(0),
         Choice::DiscreteOnly => Ok(1),
         Choice::IntegratedOnly => Ok(3),
-        _ => Err(omen_core::message::msg("support.err.graphics_mode", &[])),
+        _ => Err(glph_core::message::msg("support.err.graphics_mode", &[])),
     }
 }
 /// The HP `0x22` flags: cTGP (byte 0) and PPAB/Dynamic Boost (byte 1). Each
@@ -206,6 +217,7 @@ impl Controller {
             vf: None,
             captured: BTreeMap::new(),
             curve_target: None,
+            locked_clock_target: None,
             memory_last_trial: false,
             keyboard: None,
             keyboard_calibration: None,
@@ -423,12 +435,12 @@ impl Controller {
         }
         self.vf.as_ref().ok_or("V/F session unavailable".into())
     }
-    pub fn gpu_curve(&mut self) -> Result<omen_core::vf::VfState, String> {
+    pub fn gpu_curve(&mut self) -> Result<glph_core::vf::VfState, String> {
         self.curve()?.snapshot()
     }
     fn restore_graphics(
         &mut self,
-        original: &omen_core::vf::VfState,
+        original: &glph_core::vf::VfState,
         core: Option<&OffsetState>,
     ) -> Result<(), String> {
         if let Some(core) = core {
@@ -582,7 +594,7 @@ impl Controller {
             return Err("Curve validation requires existing zero global offsets".into());
         }
         let state = self.gpu_curve()?;
-        let operation = omen_core::vf::CurveTrial::AllPointsMinus15;
+        let operation = glph_core::vf::CurveTrial::AllPointsMinus15;
         let target = operation.target(&state)?;
         let profile = PerformanceProfile {
             schema: PROFILE_SCHEMA,
@@ -627,7 +639,7 @@ impl Controller {
                     .into(),
             );
         }
-        let operation = omen_core::vf::CurveTrial::FirstPointMinus15;
+        let operation = glph_core::vf::CurveTrial::FirstPointMinus15;
         let target = operation.target(&state)?;
         let profile = PerformanceProfile {
             schema: PROFILE_SCHEMA,
@@ -732,10 +744,10 @@ impl Backend for Controller {
         // 30 October 2026); each PPT/Slow write checks it and is skipped alone.
         self.planned_power_scheme = super::windows_settings::requested_scheme(settings)?;
         self.firmware_ppt = !self.nvpcf_ppt_unlocked
-            && omen_core::hp_mode::HpMode::of_settings(
+            && glph_core::hp_mode::HpMode::of_settings(
                 settings,
                 super::power_status().ac_connected == Some(true),
-            ) == Some(omen_core::hp_mode::HpMode::Unleashed);
+            ) == Some(glph_core::hp_mode::HpMode::Unleashed);
         Ok(())
     }
     fn write_order(&self, settings: &[Setting]) -> Vec<usize> {
@@ -781,6 +793,27 @@ impl Backend for Controller {
         if feature == Feature::GpuPowerLimitMw {
             return self.public_power_capability();
         }
+        if feature == Feature::GpuMaxClockMhz {
+            return match self.qualifies().and_then(|()| {
+                if !self.gpu()?.locked_clocks_available() {
+                    return Err("NVML locked-clocks API is unavailable on this driver".into());
+                }
+                Ok(())
+            }) {
+                Ok(()) => Capability {
+                    feature,
+                    access: Access::ReadWrite,
+                    reason: "Public NVML max graphics clock cap (instant, zero GPU restart, restores cleanly via reset)".into(),
+                    integer_range: Some((
+                        glph_core::profiles::GPU_MAX_CLOCK_MIN_MHZ,
+                        glph_core::profiles::GPU_MAX_CLOCK_MAX_MHZ,
+                    )),
+                    requires_ac: false,
+                    startup_safe: true,
+                },
+                Err(reason) => Capability::unsupported(feature, reason),
+            };
+        }
         if feature == Feature::GraphicsMode {
             return if self.inventory.manufacturer == "HP"
                 && self.inventory.board == "8E35"
@@ -797,7 +830,7 @@ impl Backend for Controller {
             } else {
                 Capability::unsupported(
                     feature,
-                    omen_core::message::msg("support.err.graphics_board", &[]),
+                    glph_core::message::msg("support.err.graphics_board", &[]),
                 )
             };
         }
@@ -831,7 +864,7 @@ impl Backend for Controller {
             } else {
                 Capability::unsupported(
                     feature,
-                    omen_core::message::msg("support.err.boost_board", &[]),
+                    glph_core::message::msg("support.err.boost_board", &[]),
                 )
             };
         }
@@ -846,8 +879,8 @@ impl Backend for Controller {
                     reason: "Chassis IR surface max-temperature guard (35-55 °C, sensor 0x23) enforced by the fan service"
                         .into(),
                     integer_range: Some((
-                        i64::from(omen_core::fan::IR_LIMIT_MIN_C),
-                        i64::from(omen_core::fan::IR_LIMIT_MAX_C),
+                        i64::from(glph_core::fan::IR_LIMIT_MIN_C),
+                        i64::from(glph_core::fan::IR_LIMIT_MAX_C),
                     )),
                     requires_ac: false,
                     startup_safe: true,
@@ -855,7 +888,7 @@ impl Backend for Controller {
             } else {
                 Capability::unsupported(
                     feature,
-                    omen_core::message::msg("support.err.fan_board", &[]),
+                    glph_core::message::msg("support.err.fan_board", &[]),
                 )
             };
         }
@@ -877,7 +910,7 @@ impl Backend for Controller {
             } else {
                 Capability::unsupported(
                     feature,
-                    omen_core::message::msg("support.err.boost_board", &[]),
+                    glph_core::message::msg("support.err.boost_board", &[]),
                 )
             };
         }
@@ -891,7 +924,7 @@ impl Backend for Controller {
                     feature,
                     access: Access::ReadWrite,
                     reason: if feature == Feature::CpuCcdAffinity {
-                        "Saved for the PerformanceHub background service, which pins the foreground program to the selected CCDs and restores it at all CCDs"
+                        "Saved for the GLPH background service, which pins the foreground program to the selected CCDs and restores it at all CCDs"
                     } else {
                         "Windows setting with exact readback and restore"
                     }
@@ -913,7 +946,7 @@ impl Backend for Controller {
             {
                 return Capability::unsupported(
                     feature,
-                    omen_core::message::msg("support.err.fan_board", &[]),
+                    glph_core::message::msg("support.err.fan_board", &[]),
                 );
             }
             return Capability{feature,access:Access::ReadWrite,reason:"Validated maximum-cooling override; live elevated capture checks exact fan table/state before any write. OFF releases only the override. Embedded software curves and physical lifecycle remain unqualified".into(),integer_range:None,requires_ac: false,startup_safe: true};
@@ -928,14 +961,14 @@ impl Backend for Controller {
             {
                 return Capability::unsupported(
                     feature,
-                    omen_core::message::msg("support.err.keyboard_board", &[]),
+                    glph_core::message::msg("support.err.keyboard_board", &[]),
                 );
             }
             return Capability {feature,access:Access::ReadWrite,reason:"Qualified classic four-zone RGB/static mode; elevated capture verifies the complete live layout and original before any write".into(),integer_range:None,requires_ac:false,startup_safe:true};
         }
         if feature == Feature::GpuVfCurve {
             let verified = self.gpu_writes_verified();
-            let state: Result<omen_core::vf::VfState, String> = (|| {
+            let state: Result<glph_core::vf::VfState, String> = (|| {
                 let state = self.gpu_curve()?;
                 state.value()?;
                 Ok(state)
@@ -962,10 +995,7 @@ impl Backend for Controller {
             let state = self.qualifies().and_then(|()| self.gpu()?.offset(feature));
             return match state {
                 Ok(state) => {
-                    let setter = self
-                        .gpu()
-                        .and_then(|g| g.report())
-                        .is_ok_and(|r| r.clock_setter_export);
+                    let setter = self.gpu().is_ok_and(|g| g.clock_setter_export());
                     let verified = self.gpu_writes_verified();
                     let ready = setter && (verified || self.calibration);
                     let range = if self.calibration {
@@ -1015,7 +1045,7 @@ impl Backend for Controller {
             {
                 return Capability::unsupported(
                     feature,
-                    omen_core::message::msg("support.err.board", &[]),
+                    glph_core::message::msg("support.err.board", &[]),
                 );
             }
             return Capability {
@@ -1033,7 +1063,7 @@ impl Backend for Controller {
             if !super::vbios_tgp::model_supported(&self.inventory) {
                 return Capability::unsupported(
                     feature,
-                    omen_core::message::msg("vbios_tgp.err.unsupported", &[]),
+                    glph_core::message::msg("vbios_tgp.err.unsupported", &[]),
                 );
             }
             return Capability {
@@ -1041,8 +1071,8 @@ impl Backend for Controller {
                 access: Access::ReadWrite,
                 reason: "Flashless direct VBIOS Policy[2] GPU Power Limit (50-175 W, independent of CPU & Dynamic Boost, verified via NVML)".into(),
                 integer_range: Some((
-                    i64::from(omen_core::profiles::GPU_DIRECT_TGP_MIN_W) * 1_000,
-                    i64::from(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W) * 1_000,
+                    i64::from(glph_core::profiles::GPU_DIRECT_TGP_MIN_W) * 1_000,
+                    i64::from(glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W) * 1_000,
                 )),
                 requires_ac: true,
                 startup_safe: false,
@@ -1050,26 +1080,26 @@ impl Backend for Controller {
         }
         let reason = match feature {
             Feature::CpuFanCurve | Feature::GpuFanCurve => {
-                omen_core::message::msg("support.err.fan_profile", &[])
+                glph_core::message::msg("support.err.fan_profile", &[])
             }
             // The HP mode is the dashboard's switch, not a preset field.
-            Feature::OmenPerformanceMode => omen_core::message::msg("support.err.coupled_hp", &[]),
+            Feature::OmenPerformanceMode => glph_core::message::msg("support.err.coupled_hp", &[]),
             Feature::GpuVoltageOffsetMv | Feature::GpuVoltageLimitMv => {
-                omen_core::message::msg("support.err.gpu_voltage", &[])
+                glph_core::message::msg("support.err.gpu_voltage", &[])
             }
             Feature::GpuMemoryVoltageOffsetMv => {
-                omen_core::message::msg("support.err.vram_voltage", &[])
+                glph_core::message::msg("support.err.vram_voltage", &[])
             }
             Feature::GpuCoreClockLimitMhz | Feature::GpuMemoryClockLimitMhz => {
-                omen_core::message::msg("support.err.locked_clocks", &[])
+                glph_core::message::msg("support.err.locked_clocks", &[])
             }
             Feature::AmdCpuClockMhz | Feature::AmdCpuVoltageMv => {
-                omen_core::message::msg("support.err.cpu_fixed", &[])
+                glph_core::message::msg("support.err.cpu_fixed", &[])
             }
             Feature::CpuBoostProfile | Feature::CpuAllCoreVoltageOffsetMv => {
-                omen_core::message::msg("support.err.cpu_offset", &[])
+                glph_core::message::msg("support.err.cpu_offset", &[])
             }
-            _ => omen_core::message::msg("support.err.adapter_missing", &[]),
+            _ => glph_core::message::msg("support.err.adapter_missing", &[]),
         };
         Capability::unsupported(feature, reason)
     }
@@ -1080,6 +1110,17 @@ impl Backend for Controller {
                 .gpu()?
                 .power_limit()
                 .map(|s| Value::Integer(i64::from(s.current_mw)));
+        }
+        if feature == Feature::GpuMaxClockMhz {
+            let mhz = self
+                .locked_clock_target
+                .or_else(|| self.gpu().ok().and_then(|g| g.max_graphics_clock_mhz()))
+                .unwrap_or(glph_core::profiles::GPU_MAX_CLOCK_MAX_MHZ as u32);
+            return Ok(Value::Integer(i64::from(mhz)));
+        }
+        if feature == Feature::GpuDynamicBoostLimitMw {
+            let (_, max_mw) = self.gpu()?.power_bounds_mw()?;
+            return Ok(Value::Integer(i64::from(max_mw)));
         }
         if feature == Feature::GraphicsMode {
             return Ok(Value::Choice(mux_choice(super::read_hp_graphics_mode(
@@ -1100,7 +1141,7 @@ impl Backend for Controller {
         if feature == Feature::CpuSkinTemperatureLimitC {
             let limit = crate::profile_store::ProfileStore::user_data()?
                 .chassis_max_temp_c()?
-                .unwrap_or(omen_core::fan::IR_EMERGENCY_C);
+                .unwrap_or(glph_core::fan::IR_EMERGENCY_C);
             return Ok(Value::Integer(i64::from(limit)));
         }
         if uses_hp_gpu_power(feature) {
@@ -1131,6 +1172,34 @@ impl Backend for Controller {
     fn capture(&mut self, feature: Feature) -> Result<Captured<RestoreState>, String> {
         if feature == Feature::GpuPowerLimitMw {
             return self.capture_public_power();
+        }
+        if feature == Feature::GpuMaxClockMhz {
+            let gpu = self.gpu()?;
+            let identity = gpu.identity()?;
+            let baseline_mhz = self
+                .locked_clock_target
+                .or_else(|| gpu.max_graphics_clock_mhz())
+                .unwrap_or(glph_core::profiles::GPU_MAX_CLOCK_MAX_MHZ as u32);
+            let saved = Captured {
+                feature,
+                value: Value::Integer(i64::from(baseline_mhz)),
+                restore: RestoreState::NvidiaLockedClocks {
+                    identity,
+                    active_max_mhz: self.locked_clock_target,
+                },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
+        }
+        if feature == Feature::GpuDynamicBoostLimitMw {
+            let (_, max_mw) = self.gpu()?.power_bounds_mw()?;
+            let saved = Captured {
+                feature,
+                value: Value::Integer(i64::from(max_mw)),
+                restore: RestoreState::VbiosTgp { max_mw },
+            };
+            self.captured.insert(feature, saved.clone());
+            return Ok(saved);
         }
         if feature == Feature::GraphicsMode {
             let mode = super::read_hp_graphics_mode(&self.inventory)?;
@@ -1170,7 +1239,7 @@ impl Backend for Controller {
         }
         if feature == Feature::CpuSkinTemperatureLimitC {
             let limit_c = crate::profile_store::ProfileStore::user_data()?.chassis_max_temp_c()?;
-            let effective = limit_c.unwrap_or(omen_core::fan::IR_EMERGENCY_C);
+            let effective = limit_c.unwrap_or(glph_core::fan::IR_EMERGENCY_C);
             let saved = Captured {
                 feature,
                 value: Value::Integer(i64::from(effective)),
@@ -1297,6 +1366,27 @@ impl Backend for Controller {
         }
         if matches!(saved.restore, RestoreState::NvidiaPowerLimit { .. }) {
             return self.restore_public_power(saved);
+        }
+        if let RestoreState::NvidiaLockedClocks {
+            identity,
+            active_max_mhz,
+        } = &saved.restore
+        {
+            self.qualifies()?;
+            if identity != &self.gpu()?.identity()? || saved.feature != Feature::GpuMaxClockMhz {
+                return Err("GPU max-clock restore identity/feature differs".into());
+            }
+            match active_max_mhz {
+                Some(mhz) => self.gpu()?.set_locked_clocks(*mhz)?,
+                None => self.gpu()?.reset_locked_clocks()?,
+            }
+            self.locked_clock_target = *active_max_mhz;
+            return Ok(());
+        }
+        if matches!(saved.restore, RestoreState::VbiosTgp { .. }) {
+            // Flashless VBIOS registry restore + PnP restart runs in `profile_commands`
+            // after `Controller` drops its live NVML handle.
+            return Ok(());
         }
         if let RestoreState::Windows { image } = &saved.restore {
             self.verify_captured(saved)?;
@@ -1456,6 +1546,31 @@ impl Backend for Controller {
         if matches!(saved.restore, RestoreState::NvidiaPowerLimit { .. }) {
             return self.verify_public_power(saved);
         }
+        if let RestoreState::NvidiaLockedClocks {
+            identity,
+            active_max_mhz,
+        } = &saved.restore
+        {
+            if identity != &self.gpu()?.identity()? {
+                return Err("GPU max-clock identity changed".into());
+            }
+            if self.locked_clock_target != *active_max_mhz
+                && !self.windows_targets.contains_key(&saved.feature)
+            {
+                return Err("GPU max-clock state differs from original and target".into());
+            }
+            return Ok(());
+        }
+        if let RestoreState::VbiosTgp { max_mw } = &saved.restore {
+            let (_, live_max_mw) = self.gpu()?.power_bounds_mw()?;
+            if live_max_mw != *max_mw
+                && self.windows_targets.get(&saved.feature)
+                    != Some(&Value::Integer(i64::from(live_max_mw)))
+            {
+                return Err("GPU VBIOS TGP ceiling differs from original and target".into());
+            }
+            return Ok(());
+        }
         if self.captured.get(&saved.feature) != Some(saved) {
             return Err("Control verification image is not owned by this session".into());
         }
@@ -1492,7 +1607,7 @@ impl Backend for Controller {
                 None => false,
             };
             if live != *image && !owned {
-                return Err(omen_core::message::msg(
+                return Err(glph_core::message::msg(
                     "cpu.err.changed_externally",
                     &[&format!("@field.{feature:?}")],
                 ));
@@ -1514,8 +1629,8 @@ impl Backend for Controller {
         if let RestoreState::ChassisTemp { limit_c } = &saved.restore {
             let live = crate::profile_store::ProfileStore::user_data()?
                 .chassis_max_temp_c()?
-                .unwrap_or(omen_core::fan::IR_EMERGENCY_C);
-            let orig = limit_c.unwrap_or(omen_core::fan::IR_EMERGENCY_C);
+                .unwrap_or(glph_core::fan::IR_EMERGENCY_C);
+            let orig = limit_c.unwrap_or(glph_core::fan::IR_EMERGENCY_C);
             if live != orig
                 && self.windows_targets.get(&saved.feature)
                     != Some(&Value::Integer(i64::from(live)))
@@ -1578,6 +1693,8 @@ impl Backend for Controller {
             } => (core_offset, Some(state), None),
             RestoreState::HpKeyboardColors { .. }
             | RestoreState::NvidiaPowerLimit { .. }
+            | RestoreState::NvidiaLockedClocks { .. }
+            | RestoreState::VbiosTgp { .. }
             | RestoreState::HpMaxFan { .. }
             | RestoreState::Windows { .. }
             | RestoreState::HpGpuPower { .. }
@@ -1636,6 +1753,29 @@ impl Backend for Controller {
     fn verify_target(&mut self, setting: &Setting) -> Result<Value, String> {
         if setting.feature == Feature::GpuPowerLimitMw {
             return self.verify_public_power_target(setting);
+        }
+        if setting.feature == Feature::GpuMaxClockMhz {
+            let Value::Integer(mhz) = setting.value else {
+                return Err("GPU max clock cap needs integer MHz".into());
+            };
+            let expected = u32::try_from(mhz).map_err(|_| "GPU max clock cap out of range")?;
+            if self.locked_clock_target != Some(expected) || !self.gpu()?.locked_clocks_available()
+            {
+                return Err("GPU max clock cap target is not active".into());
+            }
+            let _ = self.gpu()?.identity()?;
+            return Ok(setting.value.clone());
+        }
+        if setting.feature == Feature::GpuDynamicBoostLimitMw {
+            let actual = self.read(setting.feature)?;
+            return if actual == setting.value {
+                Ok(actual)
+            } else {
+                Err(format!(
+                    "GPU VBIOS TGP readback differs: requested {:?}, obtained {:?}",
+                    setting.value, actual
+                ))
+            };
         }
         if setting.feature == Feature::GraphicsMode {
             let actual = self.read(setting.feature)?;
@@ -1828,6 +1968,9 @@ impl Backend for Controller {
             RestoreState::HpGpuPower { custom_tgp, ppab } => {
                 Ok(target.value == Value::Boolean(gpu_flag(target.feature, *custom_tgp, *ppab)))
             }
+            RestoreState::NvidiaLockedClocks { active_max_mhz, .. } => Ok(
+                active_max_mhz.is_some_and(|mhz| target.value == Value::Integer(i64::from(mhz)))
+            ),
             _ => Ok(saved.value == target.value),
         }
     }
@@ -1840,7 +1983,10 @@ impl Backend for Controller {
         if transaction.requested.iter().any(|s| {
             matches!(
                 s.feature,
-                Feature::GpuCoreOffsetMhz | Feature::GpuMemoryOffsetMhz | Feature::GpuVfCurve
+                Feature::GpuCoreOffsetMhz
+                    | Feature::GpuMemoryOffsetMhz
+                    | Feature::GpuVfCurve
+                    | Feature::GpuMaxClockMhz
             )
         }) {
             self.qualifies()?;
@@ -1859,6 +2005,30 @@ impl Backend for Controller {
         for (saved, requested) in transaction.original.iter().zip(&transaction.requested) {
             if matches!(saved.restore, RestoreState::NvidiaPowerLimit { .. }) {
                 self.prepare_public_power_recovery(saved, requested)?;
+                continue;
+            }
+            if let RestoreState::NvidiaLockedClocks { identity, .. } = &saved.restore {
+                if requested.feature != Feature::GpuMaxClockMhz
+                    || saved.feature != Feature::GpuMaxClockMhz
+                    || identity != &self.gpu()?.identity()?
+                {
+                    return Err("Persisted GPU max-clock restore image differs".into());
+                }
+                if let Value::Integer(mhz) = requested.value
+                    && let Ok(v) = u32::try_from(mhz)
+                {
+                    self.locked_clock_target = Some(v);
+                }
+                self.windows_targets
+                    .insert(saved.feature, requested.value.clone());
+                continue;
+            }
+            if matches!(saved.restore, RestoreState::VbiosTgp { .. }) {
+                if requested.feature != saved.feature {
+                    return Err("Persisted GPU VBIOS TGP feature differs".into());
+                }
+                self.windows_targets
+                    .insert(saved.feature, requested.value.clone());
                 continue;
             }
             if let RestoreState::HpGraphicsMode { mode } = &saved.restore {
@@ -2095,6 +2265,30 @@ impl Backend for Controller {
         if setting.feature == Feature::GpuPowerLimitMw {
             return self.write_public_power(setting);
         }
+        if setting.feature == Feature::GpuMaxClockMhz {
+            let Value::Integer(mhz) = setting.value else {
+                return Err("GPU max clock cap needs integer MHz".into());
+            };
+            let cap_mhz = u32::try_from(mhz).map_err(|_| "GPU max clock cap out of range")?;
+            // A clock cap only limits peak frequency — never blocked by thermal guard.
+            self.gpu()?.set_locked_clocks(cap_mhz)?;
+            self.locked_clock_target = Some(cap_mhz);
+            self.windows_targets
+                .insert(setting.feature, setting.value.clone());
+            return Ok(());
+        }
+        if setting.feature == Feature::GpuDynamicBoostLimitMw {
+            let actual = self.read(setting.feature)?;
+            if actual != setting.value {
+                return Err(format!(
+                    "GPU VBIOS TGP limit {:?} differs from requested {:?}",
+                    actual, setting.value
+                ));
+            }
+            self.windows_targets
+                .insert(setting.feature, setting.value.clone());
+            return Ok(());
+        }
         if setting.feature == Feature::GraphicsMode {
             let Value::Choice(choice) = setting.value else {
                 return Err("Graphics mode needs a choice".into());
@@ -2117,7 +2311,7 @@ impl Backend for Controller {
                     Value::Integer(mw) => format!("{} W", mw / 1000),
                     other => format!("{other:?}"),
                 };
-                return Err(omen_core::message::msg("cpu.err.firmware_ppt", &[&held]));
+                return Err(glph_core::message::msg("cpu.err.firmware_ppt", &[&held]));
             }
             super::cpu_tuning::write(self.smu()?, setting.feature, &setting.value)?;
             self.windows_targets
@@ -2261,7 +2455,6 @@ impl Backend for Controller {
         }
         if setting.feature == Feature::GpuVfCurve {
             self.validate_setting(setting)?;
-            self.gpu()?.thermal_guard(87)?;
             let Value::VfCurve(target) = &setting.value else {
                 return Err("V/F target must be a complete typed curve".into());
             };
@@ -2275,6 +2468,12 @@ impl Backend for Controller {
                 _ => return Err("Curve capture has another adapter".into()),
             };
             let proof = state.target_state(target)?;
+            let raising = proof
+                .nodes
+                .iter()
+                .zip(&state.nodes)
+                .any(|(next, orig)| next.delta_khz > orig.delta_khz && next.delta_khz > 0);
+            self.gpu()?.thermal_guard_if_raising(87, raising)?;
             let deltas: Vec<_> = proof.nodes.iter().map(|p| (p.index, p.delta_khz)).collect();
             self.curve()?.set_deltas(&state, &deltas)?;
             self.curve_target = Some((setting.value.clone(), proof));
@@ -2288,9 +2487,11 @@ impl Backend for Controller {
             return Err("Value outside validated operation bounds".into());
         }
         let gpu = self.gpu()?;
-        // The measured HP threshold is 87 C; keep three degrees of headroom
-        // below the stricter of that threshold and the driver's slowdown limit.
-        gpu.thermal_guard(87)?;
+        // Directional thermal guard: never block negative offsets / undervolts
+        // or reductions of an existing positive offset on a hot GPU.
+        let current_offset = gpu.offset(setting.feature)?.current_mhz;
+        let raising = value > i64::from(current_offset) && value > 0;
+        gpu.thermal_guard_if_raising(87, raising)?;
         let memory_graphics = if setting.feature == Feature::GpuMemoryOffsetMhz {
             Some((
                 self.gpu_curve()?,
@@ -2370,6 +2571,25 @@ impl Backend for Controller {
             {
                 return Err("The fixed RGB trial does not allow other targets".into());
             }
+        }
+        if setting.feature == Feature::GpuDynamicBoostLimitMw {
+            let Value::Integer(mw) = setting.value else {
+                return Err("GPU TGP needs milliwatts".into());
+            };
+            if mw % 1000 != 0
+                || !(i64::from(glph_core::profiles::GPU_DIRECT_TGP_MIN_W)
+                    ..=i64::from(glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W))
+                    .contains(&(mw / 1000))
+            {
+                return Err(glph_core::message::msg(
+                    "vbios_tgp.err.range",
+                    &[
+                        &glph_core::profiles::GPU_DIRECT_TGP_MIN_W,
+                        &glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
+                    ],
+                ));
+            }
+            return Ok(());
         }
         if setting.feature == Feature::GpuVfCurve {
             let Value::VfCurve(points) = &setting.value else {

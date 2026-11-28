@@ -1,6 +1,6 @@
 //! Keyboard preview and RGB draft; all hardware writes still use DirectLighting.
 use super::*;
-use omen_core::lighting_editor::{Draft, Group};
+use glph_core::lighting_editor::{Draft, Group};
 
 fn group_index(group: Group) -> i32 {
     match group {
@@ -286,7 +286,7 @@ impl Host {
             return;
         };
         let d = w.global::<Workbench>();
-        if let Some(color) = omen_core::appearance::parse_hex(value.trim()) {
+        if let Some(color) = glph_core::appearance::parse_hex(value.trim()) {
             if let Some(draft) = self.lighting_draft.borrow_mut().as_mut() {
                 draft.set_color(color);
                 d.set_lighting_brightness(draft.brightness().unwrap_or(0).to_string().into());

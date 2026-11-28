@@ -1,6 +1,6 @@
 //! Public NVIDIA telemetry only. No undocumented power-policy setters.
+use glph_core::GpuSample;
 use libloading::Library;
-use omen_core::GpuSample;
 use std::{
     ffi::{c_char, c_void},
     mem::size_of,
@@ -18,6 +18,16 @@ type NvmlDevice = unsafe extern "C" fn(u32, *mut Handle) -> i32;
 type NvmlName = unsafe extern "C" fn(Handle, *mut c_char, u32) -> i32;
 type NvmlValue = unsafe extern "C" fn(Handle, *mut u32) -> i32;
 type NvmlLimits = unsafe extern "C" fn(Handle, *mut u32, *mut u32) -> i32;
+type NvmlUtilizationFn = unsafe extern "C" fn(Handle, *mut NvmlUtilization) -> i32;
+type NvmlIndexedValueFn = unsafe extern "C" fn(Handle, i32, *mut u32) -> i32;
+
+/// Public NVML `nvmlUtilization_t` C layout (8 bytes, align 4).
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct NvmlUtilization {
+    gpu: u32,
+    memory: u32,
+}
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -73,7 +83,9 @@ fn nvapi_session_lost(status: i32) -> bool {
     matches!(status, -4 | -6 | -8 | -10)
 }
 fn nvml_session_lost(status: i32) -> bool {
-    matches!(status, 1 | 15)
+    // 1 = UNINITIALIZED, 11 = DRIVER_NOT_LOADED, 15 = GPU_IS_LOST,
+    // 18 = RESET_REQUIRED, 999 = UNKNOWN (e.g. after dGPU PnP restart).
+    matches!(status, 1 | 11 | 15 | 18 | 999)
 }
 
 struct Nvapi {
@@ -194,9 +206,16 @@ struct Nvml {
     gpu: Handle,
     name: String,
     power: NvmlValue,
+    utilization: Option<NvmlUtilizationFn>,
+    temperature: Option<NvmlIndexedValueFn>,
+    clock_info: Option<NvmlIndexedValueFn>,
     enforced_limit: Option<NvmlValue>,
     default_limit: NvmlValue,
     constraints: NvmlLimits,
+    /// Static VBIOS limits cached once per live NVML session to avoid two
+    /// redundant driver calls on every live telemetry tick.
+    cached_default_limit_w: Option<f64>,
+    cached_maximum_limit_w: Option<f64>,
 }
 impl Nvml {
     fn new(expected_name: Option<&str>) -> Result<Self, String> {
@@ -214,14 +233,26 @@ impl Nvml {
             let power = *library
                 .get(b"nvmlDeviceGetPowerUsage\0")
                 .map_err(|e| e.to_string())?;
+            let utilization = library
+                .get::<NvmlUtilizationFn>(b"nvmlDeviceGetUtilizationRates\0")
+                .ok()
+                .map(|f| *f);
+            let temperature = library
+                .get::<NvmlIndexedValueFn>(b"nvmlDeviceGetTemperature\0")
+                .ok()
+                .map(|f| *f);
+            let clock_info = library
+                .get::<NvmlIndexedValueFn>(b"nvmlDeviceGetClockInfo\0")
+                .ok()
+                .map(|f| *f);
             let enforced_limit = library
                 .get::<NvmlValue>(b"nvmlDeviceGetEnforcedPowerLimit\0")
                 .ok()
                 .map(|f| *f);
-            let default_limit = *library
+            let default_limit: NvmlValue = *library
                 .get(b"nvmlDeviceGetPowerManagementDefaultLimit\0")
                 .map_err(|e| e.to_string())?;
-            let constraints = *library
+            let constraints: NvmlLimits = *library
                 .get(b"nvmlDeviceGetPowerManagementLimitConstraints\0")
                 .map_err(|e| e.to_string())?;
             let status = init();
@@ -245,15 +276,26 @@ impl Nvml {
                 shutdown();
                 return Err("NVML/NVAPI GPU names differ; power readings were not combined".into());
             }
+            let mut default_mw = 0u32;
+            let cached_default_limit_w =
+                (default_limit(gpu, &mut default_mw) == 0).then(|| f64::from(default_mw) / 1000.0);
+            let (mut min_mw, mut max_mw) = (0u32, 0u32);
+            let cached_maximum_limit_w = (constraints(gpu, &mut min_mw, &mut max_mw) == 0)
+                .then(|| f64::from(max_mw) / 1000.0);
             Ok(Self {
                 _library: library,
                 shutdown,
                 gpu,
                 name,
                 power,
+                utilization,
+                temperature,
+                clock_info,
                 enforced_limit,
                 default_limit,
                 constraints,
+                cached_default_limit_w,
+                cached_maximum_limit_w,
             })
         }
     }
@@ -261,27 +303,53 @@ impl Nvml {
         if sample.name.is_empty() {
             sample.name = self.name.clone();
         }
-        // SAFETY: All out parameters have the exact documented u32 layout.
+        sample.default_limit_w = self.cached_default_limit_w;
+        sample.maximum_limit_w = self.cached_maximum_limit_w;
+        // SAFETY: All out parameters have the exact documented C layouts.
         unsafe {
-            for (label, getter, output) in [
-                ("power", self.power, &mut sample.power_w),
-                (
-                    "default power limit",
-                    self.default_limit,
-                    &mut sample.default_limit_w,
-                ),
-            ] {
-                let mut value = 0;
-                let status = getter(self.gpu, &mut value);
-                if status == 0 {
-                    *output = Some(f64::from(value) / 1000.0);
-                } else {
-                    sample
-                        .warnings
-                        .push(format!("NVML {label} unavailable: {status}"));
-                    if nvml_session_lost(status) {
-                        return true;
-                    }
+            let mut power_mw = 0;
+            let status = (self.power)(self.gpu, &mut power_mw);
+            if status == 0 {
+                sample.power_w = Some(f64::from(power_mw) / 1000.0);
+            } else {
+                sample
+                    .warnings
+                    .push(format!("NVML power unavailable: {status}"));
+                if nvml_session_lost(status) {
+                    return true;
+                }
+            }
+            if let Some(getter) = self.utilization {
+                let mut util = NvmlUtilization::default();
+                let status = getter(self.gpu, &mut util);
+                if status == 0 && util.gpu <= 100 {
+                    sample.utilization_percent = Some(util.gpu as u8);
+                } else if nvml_session_lost(status) {
+                    return true;
+                }
+            }
+            // Fallback temperature if NVAPI was unavailable or failed this tick.
+            if sample.temperature_c.is_none()
+                && let Some(getter) = self.temperature
+            {
+                let mut temp = 0u32;
+                let status = getter(self.gpu, 0 /* NVML_TEMPERATURE_GPU */, &mut temp);
+                if status == 0 && (1..=150).contains(&temp) {
+                    sample.temperature_c = Some(temp as i32);
+                } else if nvml_session_lost(status) {
+                    return true;
+                }
+            }
+            // Fallback graphics clock if NVAPI was unavailable or failed this tick.
+            if sample.clock_mhz.is_none()
+                && let Some(getter) = self.clock_info
+            {
+                let mut clock = 0u32;
+                let status = getter(self.gpu, 0 /* NVML_CLOCK_GRAPHICS */, &mut clock);
+                if status == 0 && clock <= 6000 {
+                    sample.clock_mhz = Some(clock);
+                } else if nvml_session_lost(status) {
+                    return true;
                 }
             }
             if let Some(getter) = self.enforced_limit {
@@ -292,18 +360,6 @@ impl Nvml {
                 } else if nvml_session_lost(status) {
                     return true;
                 }
-            }
-            let (mut minimum, mut maximum) = (0, 0);
-            let status = (self.constraints)(self.gpu, &mut minimum, &mut maximum);
-            if status == 0 {
-                sample.maximum_limit_w = Some(f64::from(maximum) / 1000.0);
-            } else {
-                sample
-                    .warnings
-                    .push(format!("NVML power constraints unavailable: {status}"));
-            }
-            if nvml_session_lost(status) {
-                return true;
             }
         }
         false
@@ -423,11 +479,11 @@ impl Drop for GpuLimitProbe {
     }
 }
 
-/// One-shot NVML query of `(default_limit_mw, min_limit_mw, max_limit_mw)`
+/// Board-agnostic one-shot NVML query of `(default_limit_mw, min_limit_mw, max_limit_mw)`
 /// for verifying flashless GPU Dynamic Boost TGP ceiling changes after a
-/// dGPU PnP restart.
+/// dGPU PnP restart on any discrete NVIDIA GPU.
 pub fn read_nvml_power_limits() -> Result<(u32, u32, u32), String> {
-    read_nvml_power_limits_for(Some("NVIDIA GeForce RTX 5070 Laptop GPU"))
+    read_nvml_power_limits_for(None)
 }
 
 /// Board-agnostic one-shot NVML query of `(default_limit_mw, min_limit_mw, max_limit_mw)`
@@ -525,12 +581,19 @@ mod tests {
         assert!(nvapi_session_lost(-8));
         assert!(!nvapi_session_lost(-104));
         assert!(nvml_session_lost(15));
+        assert!(nvml_session_lost(11));
+        assert!(nvml_session_lost(18));
+        assert!(nvml_session_lost(999));
         assert!(!nvml_session_lost(3));
     }
     #[test]
     fn public_nvapi_structures_have_exact_abi_sizes() {
         assert_eq!(size_of::<Thermal>(), 68);
         assert_eq!(size_of::<Clocks>(), 264);
+        assert_eq!(size_of::<NvmlUtilization>(), 8);
+        assert_eq!(std::mem::align_of::<NvmlUtilization>(), 4);
+        assert_eq!(std::mem::offset_of!(NvmlUtilization, gpu), 0);
+        assert_eq!(std::mem::offset_of!(NvmlUtilization, memory), 4);
     }
     #[test]
     fn refuses_to_combine_different_gpu_models() {

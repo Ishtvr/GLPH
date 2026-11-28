@@ -1,7 +1,7 @@
 //! Fixed own cooling-task inspection/resumption. Never installs a task, accepts
 //! a supplied command, or stops a process. Only its existing protected action.
 use super::startup;
-use omen_core::cooling_override::{Acknowledgement, HelperIdentity, Mode};
+use glph_core::cooling_override::{Acknowledgement, HelperIdentity, Mode};
 use serde::Deserialize;
 use std::{
     fs::{File, OpenOptions},
@@ -61,7 +61,7 @@ impl Drop for Handle {
     }
 }
 pub(super) fn image_path() -> Result<PathBuf, String> {
-    Ok(startup::installation_root()?.join("Omen Hub++ Fan.exe"))
+    Ok(startup::installation_root()?.join("glph-fan.exe"))
 }
 /// The protected per-user receipt of the installed cooling task.
 fn receipt() -> Result<startup::StartupInstallation, String> {
@@ -91,7 +91,7 @@ pub(super) fn verify(expected_hash: &str, start: bool) -> Result<bool, String> {
     let root = startup::installation_root()?;
     let sid = startup::current_user_sid()?;
     let receipt = receipt()?;
-    let name = format!("OmenHubPP-Fan-{sid}");
+    let name = format!("GLPH-Fan-{sid}");
     let path = image_path()?;
     if receipt.schema != 1
         || receipt.user_sid != sid
@@ -225,9 +225,7 @@ fn running(expected_hash: &str) -> Result<Option<LiveHelper>, String> {
             .iter()
             .position(|c| *c == 0)
             .ok_or("Cooling process name is unterminated")?;
-        if String::from_utf16_lossy(&entry.szExeFile[..end])
-            .eq_ignore_ascii_case("Omen Hub++ Fan.exe")
-        {
+        if String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case("glph-fan.exe") {
             let h = unsafe {
                 OpenProcess(
                     PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -424,7 +422,7 @@ mod tests {
     use super::*;
     #[test]
     fn only_the_fixed_fan_service_invocation_can_acknowledge_cooling() {
-        let exe = std::path::Path::new(r"C:\Program Files\OmenHubPlusPlus\Omen Hub++ Fan.exe");
+        let exe = std::path::Path::new(r"C:\Program Files\GLPH\glph-fan.exe");
         verify_command(&format!("\"{}\" fan-service", exe.display()), exe).unwrap();
         for command in [
             format!("\"{}\" --tray", exe.display()),

@@ -1,5 +1,5 @@
 //! Native Windows dialogs and Explorer integration for Plugin management.
-//! Lives in `omen-platform` so `crates/app`'s `i18n` wide-literal test stays
+//! Lives in `glph-platform` so `crates/app`'s `i18n` wide-literal test stays
 //! focused purely on user-facing display strings.
 use std::{
     ffi::OsString,
@@ -45,8 +45,8 @@ pub fn open_plugins_folder(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens the native Windows file picker for `.perfhub-plugin`, `.zip`, or
-/// `plugin.json` bundles. Runs synchronously on the calling worker thread.
+/// Opens the native Windows file picker for `.glph`, `.zip`, or `plugin.json`
+/// bundles. Runs synchronously on the calling worker thread.
 pub fn pick_plugin_file(
     owner_hwnd: isize,
     title: &str,
@@ -55,7 +55,7 @@ pub fn pick_plugin_file(
     let mut filter: Vec<u16> = Vec::new();
     filter.extend(filter_label.encode_utf16());
     filter.push(0);
-    filter.extend("*.perfhub-plugin;*.zip;plugin.json".encode_utf16());
+    filter.extend("*.glph;*.zip;plugin.json".encode_utf16());
     filter.push(0);
     filter.push(0);
 

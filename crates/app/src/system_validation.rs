@@ -1,13 +1,13 @@
 //! Explicit, fixed, conservative qualification trials. Never run at startup.
 //! Each trial uses the production transaction engine and restores the complete
 //! original before returning the preceding recovery journal to its exact bytes.
-use omen_core::{
+use glph_core::{
     features::Feature,
     profiles::{Choice, CoreDelta, PROFILE_SCHEMA, PerformanceProfile, Setting, Value},
     transaction::{self, Backend},
 };
-use omen_platform::profile_store::{ProfileStore, profile_digest};
-use omen_platform::{ControlLease, Controller, CpuHardwareReader, RestoreState, SmuImage};
+use glph_platform::profile_store::{ProfileStore, profile_digest};
+use glph_platform::{ControlLease, Controller, CpuHardwareReader, RestoreState, SmuImage};
 use serde_json::{Value as Json, json};
 
 const CASES: &[&str] = &[
@@ -183,7 +183,7 @@ fn run_case(name: &str, store: &mut ProfileStore) -> Result<Json, String> {
         return Err("Fixed qualification requires AC power".into());
     }
     if name.starts_with("cpu-") {
-        let sample = CpuHardwareReader::new(&omen_platform::inventory())?.temperature_sample()?;
+        let sample = CpuHardwareReader::new(&glph_platform::inventory())?.temperature_sample()?;
         if !sample.temperature_c.is_some_and(|c| c < 85.0) {
             return Err("Conservative CPU qualification requires Tctl below 85 C".into());
         }

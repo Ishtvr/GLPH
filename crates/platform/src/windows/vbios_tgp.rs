@@ -24,7 +24,7 @@ use crate::{
     profile_store::{ProfileStore, VbiosTgpState},
     windows::nvidia::read_nvml_power_limits,
 };
-use omen_core::{
+use glph_core::{
     Inventory,
     features::Feature,
     message::msg,
@@ -43,7 +43,7 @@ use std::{
 use windows_sys::Win32::{
     Devices::DeviceAndDriverInstallation::{
         CM_Disable_DevNode, CM_Enable_DevNode, CM_Get_DevNode_Status, CM_Locate_DevNodeW,
-        CR_SUCCESS, DN_STARTED,
+        CM_Reenumerate_DevNode, CR_SUCCESS, DN_STARTED,
     },
     Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS},
     System::Registry::{
@@ -82,10 +82,14 @@ const OFF_LIMIT_MAX: usize = 0x15;
 const OFF_INFLECTION_0: usize = 0x2D;
 const OFF_TGP_RATED: usize = 0x49;
 
-const DISABLE_SETTLE: Duration = Duration::from_millis(2000);
+const DISABLE_SETTLE: Duration = Duration::from_millis(2500);
+const RECOVERY_DISABLE_SETTLES: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(8)];
+const CODE43_EARLY_DETECT_WAIT: Duration = Duration::from_secs(3);
 const DEVNODE_WAIT: Duration = Duration::from_secs(12);
 const NVML_WAIT: Duration = Duration::from_secs(8);
 const POST_ENABLE_SETTLE: Duration = Duration::from_millis(1000);
+const CM_PROB_NEED_RESTART: u32 = 14;
+const CM_PROB_FAILED_POST_START: u32 = 43;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyOutcome {
@@ -687,45 +691,166 @@ fn locate_gpu_device() -> Result<GpuDeviceLocation, String> {
     fallback.ok_or_else(|| msg("vbios_tgp.err.device_missing", &[]))
 }
 
+fn is_recoverable_restart_problem(problem: u32) -> bool {
+    matches!(problem, CM_PROB_FAILED_POST_START | CM_PROB_NEED_RESTART)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DevNodeProbe {
+    cr: u32,
+    status: u32,
+    problem: u32,
+}
+
+impl DevNodeProbe {
+    fn is_healthy(self) -> bool {
+        self.cr == CR_SUCCESS && (self.status & DN_STARTED) != 0 && self.problem == 0
+    }
+
+    fn is_recoverable_problem(self) -> bool {
+        self.cr == CR_SUCCESS && is_recoverable_restart_problem(self.problem)
+    }
+}
+
+/// Runs one initial dGPU disable/enable cycle followed by up to two bounded
+/// recovery cycles (with escalated WDDM/display settle windows: 5 s, then 8 s +
+/// devnode re-enumeration) when an external display or recent load triggers
+/// `CM_PROB_FAILED_POST_START` (Code 43) or `CM_PROB_NEED_RESTART` (Code 14).
+#[allow(clippy::too_many_arguments)]
+fn cycle_devnode_with_recovery(
+    settle_schedule: &[Duration],
+    poll_interval: Duration,
+    early_detect_wait: Duration,
+    devnode_wait: Duration,
+    mut disable: impl FnMut() -> u32,
+    mut enable: impl FnMut() -> u32,
+    mut reenumerate: impl FnMut() -> u32,
+    mut probe: impl FnMut() -> DevNodeProbe,
+    mut sleep: impl FnMut(Duration),
+) -> Result<usize, String> {
+    let mut last_probe = DevNodeProbe {
+        cr: CR_SUCCESS,
+        status: 0,
+        problem: 0,
+    };
+    let last_index = settle_schedule.len().saturating_sub(1);
+
+    for (attempt, &disable_settle) in settle_schedule.iter().enumerate() {
+        let dis = disable();
+        if dis != CR_SUCCESS {
+            return Err(msg(
+                "vbios_tgp.err.restart",
+                &[&format!("disable=0x{dis:x}")],
+            ));
+        }
+        sleep(disable_settle);
+
+        let en = enable();
+        if en != CR_SUCCESS {
+            return Err(msg("vbios_tgp.err.restart", &[&format!("enable=0x{en:x}")]));
+        }
+
+        let mut elapsed = Duration::ZERO;
+        let mut reenumerated = false;
+        loop {
+            last_probe = probe();
+            if last_probe.is_healthy() {
+                return Ok(attempt);
+            }
+            // On the final recovery attempt, if the devnode still reports a
+            // post-start problem after the early-detect window, request one
+            // synchronous PnP re-enumeration before waiting out the deadline.
+            if attempt == last_index
+                && !reenumerated
+                && elapsed >= early_detect_wait
+                && last_probe.is_recoverable_problem()
+            {
+                let _ = reenumerate();
+                reenumerated = true;
+            }
+            // On earlier attempts, bail out promptly once Code 43 / Code 14 has
+            // persisted past `early_detect_wait` so recovery starts right away.
+            if attempt < last_index
+                && elapsed >= early_detect_wait
+                && last_probe.is_recoverable_problem()
+            {
+                break;
+            }
+            if elapsed >= devnode_wait {
+                if attempt < last_index && last_probe.is_recoverable_problem() {
+                    break;
+                }
+                return Err(msg(
+                    "vbios_tgp.err.restart",
+                    &[&format!(
+                        "cr=0x{:x} status=0x{:x} problem={} attempts={}",
+                        last_probe.cr,
+                        last_probe.status,
+                        last_probe.problem,
+                        attempt + 1
+                    )],
+                ));
+            }
+            let step = poll_interval.min(devnode_wait.saturating_sub(elapsed));
+            if step.is_zero() {
+                break;
+            }
+            sleep(step);
+            elapsed += step;
+        }
+    }
+
+    Err(msg(
+        "vbios_tgp.err.restart",
+        &[&format!(
+            "cr=0x{:x} status=0x{:x} problem={} attempts={}",
+            last_probe.cr,
+            last_probe.status,
+            last_probe.problem,
+            settle_schedule.len()
+        )],
+    ))
+}
+
 fn restart_gpu_and_verify(
     location: &GpuDeviceLocation,
     expected: (u32, u32, u32),
     read_limits: &mut impl FnMut() -> Result<(u32, u32, u32), String>,
 ) -> Result<(), String> {
-    // SAFETY: Verified discrete NVIDIA PnP devnode handle.
-    let dis = unsafe { CM_Disable_DevNode(location.dev_inst, 0) };
-    if dis != CR_SUCCESS {
-        return Err(msg(
-            "vbios_tgp.err.restart",
-            &[&format!("disable=0x{dis:x}")],
-        ));
-    }
-    std::thread::sleep(DISABLE_SETTLE);
-    // SAFETY: Immediately re-enabling the same devnode.
-    let en = unsafe { CM_Enable_DevNode(location.dev_inst, 0) };
-    if en != CR_SUCCESS {
-        return Err(msg("vbios_tgp.err.restart", &[&format!("enable=0x{en:x}")]));
-    }
-
-    let deadline = Instant::now() + DEVNODE_WAIT;
-    loop {
-        let mut status: u32 = 0;
-        let mut problem: u32 = 0;
-        // SAFETY: Valid devnode handle and out pointers.
-        let cr = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, location.dev_inst, 0) };
-        if cr == CR_SUCCESS && (status & DN_STARTED) != 0 && problem == 0 {
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(msg(
-                "vbios_tgp.err.restart",
-                &[&format!(
-                    "cr=0x{cr:x} status=0x{status:x} problem={problem}"
-                )],
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
+    // Signal background telemetry (`gpu-sensor-worker`) and Session-0 cooling to
+    // release NVML/NVAPI handles before `CM_Disable_DevNode` to prevent Code-43 races.
+    let _gpu_pause = super::ControlLease::signal_gpu_pause();
+    std::thread::sleep(Duration::from_millis(200));
+    let schedule = [
+        DISABLE_SETTLE,
+        RECOVERY_DISABLE_SETTLES[0],
+        RECOVERY_DISABLE_SETTLES[1],
+    ];
+    cycle_devnode_with_recovery(
+        &schedule,
+        Duration::from_millis(150),
+        CODE43_EARLY_DETECT_WAIT,
+        DEVNODE_WAIT,
+        // SAFETY: Verified discrete NVIDIA PnP devnode handle.
+        || unsafe { CM_Disable_DevNode(location.dev_inst, 0) },
+        // SAFETY: Re-enabling the same verified devnode.
+        || unsafe { CM_Enable_DevNode(location.dev_inst, 0) },
+        // SAFETY: Synchronous re-enumeration fallback on the final recovery attempt.
+        || unsafe { CM_Reenumerate_DevNode(location.dev_inst, 0) },
+        || {
+            let mut status: u32 = 0;
+            let mut problem: u32 = 0;
+            // SAFETY: Valid devnode handle and writable out pointers.
+            let cr =
+                unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, location.dev_inst, 0) };
+            DevNodeProbe {
+                cr,
+                status,
+                problem,
+            }
+        },
+        std::thread::sleep,
+    )?;
     std::thread::sleep(POST_ENABLE_SETTLE);
 
     let nvml_deadline = Instant::now() + NVML_WAIT;
@@ -860,9 +985,20 @@ fn load_source(inventory: &Inventory, store: &ProfileStore) -> Result<CeilingSou
     let saved = store.vbios_tgp_state();
     let class_key = RegKey::open(&location.driver_subkey, KEY_QUERY_VALUE)?;
     let original_override = class_key.read_binary(VALUE_VBIOS)?;
-    let stock_rom = match (&saved, &original_override) {
-        (None, None) => read_session_vbios(&location.driver_subkey)?
-            .ok_or_else(|| msg("vbios_tgp.err.session_missing", &[]))?,
+    let (effective_saved, stock_rom) = match (&saved, &original_override) {
+        (None, None) => (
+            None,
+            read_session_vbios(&location.driver_subkey)?
+                .ok_or_else(|| msg("vbios_tgp.err.session_missing", &[]))?,
+        ),
+        // Self-heal stale saved state when a driver update replaced the display
+        // class subkey or cleared `vbios` (no override present in Registry).
+        (Some(_), None) => {
+            let rom = read_session_vbios(&location.driver_subkey)?
+                .ok_or_else(|| msg("vbios_tgp.err.session_missing", &[]))?;
+            let _ = store.save_vbios_tgp_state(None);
+            (None, rom)
+        }
         (Some(state), Some(bytes))
             if state
                 .driver_subkey
@@ -890,14 +1026,14 @@ fn load_source(inventory: &Inventory, store: &ProfileStore) -> Result<CeilingSou
             if expected_bytes != *bytes {
                 return Err(msg("vbios_tgp.err.foreign_override", &[]));
             }
-            stock
+            (saved, stock)
         }
         _ => return Err(msg("vbios_tgp.err.foreign_override", &[])),
     };
     let stock = locate_and_validate_stock_policy2(&stock_rom)?;
     Ok(CeilingSource {
         location,
-        saved,
+        saved: effective_saved,
         original_override,
         stock_rom,
         stock,
@@ -1025,19 +1161,19 @@ fn apply_target_with_mode(
     if source.saved.is_none() {
         store.save_vbios_stock(&source.stock_rom)?;
     }
-    if let Some(bytes) = &target_bytes {
-        store.save_vbios_tgp_state(Some(&VbiosTgpState {
-            driver_subkey: location.driver_subkey.clone(),
-            stock_sha256: sha256_hex(&source.stock_rom),
-            applied_sha256: sha256_hex(bytes),
-            target_watts: target_w,
-            direct_fixed,
-            expected_default_mw: Some(expected_limits.0),
-            expected_min_mw: Some(expected_limits.1),
-            stock_default_mw: Some(source.stock.limit_rated_mw),
-            stock_max_mw: Some(source.stock.limit_max_mw),
-        }))?;
-    }
+    let next_state = target_bytes.as_ref().map(|bytes| VbiosTgpState {
+        driver_subkey: location.driver_subkey.clone(),
+        stock_sha256: sha256_hex(&source.stock_rom),
+        applied_sha256: sha256_hex(bytes),
+        target_watts: target_w,
+        direct_fixed,
+        expected_default_mw: Some(expected_limits.0),
+        expected_min_mw: Some(expected_limits.1),
+        stock_default_mw: Some(source.stock.limit_rated_mw),
+        stock_max_mw: Some(source.stock.limit_max_mw),
+    });
+    // Write Registry BEFORE committing the new VbiosTgpState so a failed
+    // Registry write never leaves a mismatched hash causing `foreign_override`.
     let dispatch = match &target_bytes {
         Some(bytes) => class_key.set_binary(VALUE_VBIOS, bytes),
         None => class_key.delete_value(VALUE_VBIOS),
@@ -1045,8 +1181,12 @@ fn apply_target_with_mode(
     drop(class_key);
 
     let dispatched = dispatch.is_ok();
-    let result =
-        dispatch.and_then(|()| restart_gpu_and_verify(location, expected_limits, &mut read_limits));
+    let result = dispatch.and_then(|()| {
+        if let Some(state) = &next_state {
+            store.save_vbios_tgp_state(Some(state))?;
+        }
+        restart_gpu_and_verify(location, expected_limits, &mut read_limits)
+    });
     if let Err(error) = result {
         let restored = (|| {
             let rollback_key =
@@ -1096,19 +1236,41 @@ pub fn restore_if_active(
         return Err(msg("vbios_tgp.err.unsupported", &[]));
     }
     let location = locate_gpu_device()?;
+    let class_key = RegKey::open(&location.driver_subkey, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
+    let existing = class_key.read_binary(VALUE_VBIOS)?;
     if !saved
         .driver_subkey
         .eq_ignore_ascii_case(&location.driver_subkey)
     {
+        // If a driver update moved the GPU to a new display class subkey and
+        // no `vbios` override exists there, clear stale state cleanly instead
+        // of permanently locking out restore with `foreign_override`.
+        if existing.is_none() {
+            drop(class_key);
+            store.save_vbios_tgp_state(None)?;
+            return Ok(false);
+        }
         return Err(msg("vbios_tgp.err.foreign_override", &[]));
     }
+    let parsed_backup = store
+        .read_vbios_stock()
+        .ok()
+        .flatten()
+        .and_then(|rom| locate_and_validate_stock_policy2(&rom).ok());
     let stock_expected = (
-        saved.stock_default_mw.unwrap_or(STOCK_LIMIT_RATED_MW),
-        saved.expected_min_mw.unwrap_or(STOCK_LIMIT_MIN_MW),
-        saved.stock_max_mw.unwrap_or(STOCK_LIMIT_MAX_MW),
+        saved
+            .stock_default_mw
+            .or_else(|| parsed_backup.map(|s| s.limit_rated_mw))
+            .unwrap_or(STOCK_LIMIT_RATED_MW),
+        saved
+            .expected_min_mw
+            .or_else(|| parsed_backup.map(|s| s.limit_min_mw))
+            .unwrap_or(STOCK_LIMIT_MIN_MW),
+        saved
+            .stock_max_mw
+            .or_else(|| parsed_backup.map(|s| s.limit_max_mw))
+            .unwrap_or(STOCK_LIMIT_MAX_MW),
     );
-    let class_key = RegKey::open(&location.driver_subkey, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
-    let existing = class_key.read_binary(VALUE_VBIOS)?;
     let had_value = existing.is_some();
     if let Some(bytes) = existing {
         if sha256_hex(&bytes) != saved.applied_sha256 {
@@ -1338,5 +1500,176 @@ mod tests {
         assert!(!driver_subkey_valid(
             "{00000000-0000-0000-0000-000000000000}\\0000"
         ));
+    }
+
+    #[test]
+    fn fast_path_skips_recovery_when_first_start_succeeds() {
+        let schedule = [
+            Duration::from_millis(2500),
+            Duration::from_secs(5),
+            Duration::from_secs(8),
+        ];
+        let mut disables = 0usize;
+        let mut enables = 0usize;
+        let mut reenums = 0usize;
+        let mut sleeps = Vec::new();
+        let attempt = cycle_devnode_with_recovery(
+            &schedule,
+            Duration::from_millis(150),
+            Duration::from_secs(3),
+            Duration::from_secs(12),
+            || {
+                disables += 1;
+                CR_SUCCESS
+            },
+            || {
+                enables += 1;
+                CR_SUCCESS
+            },
+            || {
+                reenums += 1;
+                CR_SUCCESS
+            },
+            || DevNodeProbe {
+                cr: CR_SUCCESS,
+                status: DN_STARTED,
+                problem: 0,
+            },
+            |d| sleeps.push(d),
+        )
+        .unwrap();
+        assert_eq!(attempt, 0);
+        assert_eq!(disables, 1);
+        assert_eq!(enables, 1);
+        assert_eq!(reenums, 0);
+        assert_eq!(sleeps, vec![Duration::from_millis(2500)]);
+    }
+
+    #[test]
+    fn retry_recovers_on_first_code43_attempt() {
+        use std::cell::Cell;
+        let schedule = [
+            Duration::from_millis(2500),
+            Duration::from_secs(5),
+            Duration::from_secs(8),
+        ];
+        let cycle = Cell::new(0usize);
+        let mut sleeps = Vec::new();
+        let attempt = cycle_devnode_with_recovery(
+            &schedule,
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            Duration::from_secs(12),
+            || {
+                cycle.set(cycle.get() + 1);
+                CR_SUCCESS
+            },
+            || CR_SUCCESS,
+            || CR_SUCCESS,
+            || {
+                if cycle.get() == 1 {
+                    DevNodeProbe {
+                        cr: CR_SUCCESS,
+                        status: 0x1802400,
+                        problem: CM_PROB_FAILED_POST_START,
+                    }
+                } else {
+                    DevNodeProbe {
+                        cr: CR_SUCCESS,
+                        status: DN_STARTED,
+                        problem: 0,
+                    }
+                }
+            },
+            |d| sleeps.push(d),
+        )
+        .unwrap();
+        assert_eq!(attempt, 1);
+        assert_eq!(cycle.get(), 2);
+        assert!(sleeps.contains(&Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn retry_recovers_on_second_code43_attempt_with_reenumeration() {
+        use std::cell::Cell;
+        let schedule = [
+            Duration::from_millis(2500),
+            Duration::from_secs(5),
+            Duration::from_secs(8),
+        ];
+        let cycle = Cell::new(0usize);
+        let reenumerated = Cell::new(false);
+        let attempt = cycle_devnode_with_recovery(
+            &schedule,
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            Duration::from_secs(12),
+            || {
+                cycle.set(cycle.get() + 1);
+                CR_SUCCESS
+            },
+            || CR_SUCCESS,
+            || {
+                reenumerated.set(true);
+                CR_SUCCESS
+            },
+            || {
+                if cycle.get() == 3 && reenumerated.get() {
+                    DevNodeProbe {
+                        cr: CR_SUCCESS,
+                        status: DN_STARTED,
+                        problem: 0,
+                    }
+                } else {
+                    DevNodeProbe {
+                        cr: CR_SUCCESS,
+                        status: 0x1802400,
+                        problem: CM_PROB_FAILED_POST_START,
+                    }
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(attempt, 2);
+        assert_eq!(cycle.get(), 3);
+        assert!(reenumerated.get());
+    }
+
+    #[test]
+    fn persistent_code43_fails_cleanly_after_bounded_retries() {
+        let schedule = [
+            Duration::from_millis(2500),
+            Duration::from_secs(5),
+            Duration::from_secs(8),
+        ];
+        let mut cycle = 0usize;
+        let mut reenums = 0usize;
+        let err = cycle_devnode_with_recovery(
+            &schedule,
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+            || {
+                cycle += 1;
+                CR_SUCCESS
+            },
+            || CR_SUCCESS,
+            || {
+                reenums += 1;
+                CR_SUCCESS
+            },
+            || DevNodeProbe {
+                cr: CR_SUCCESS,
+                status: 0x1802400,
+                problem: CM_PROB_FAILED_POST_START,
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(cycle, 3);
+        assert_eq!(reenums, 1);
+        assert!(err.contains("problem=43"));
+        assert!(err.contains("attempts=3"));
     }
 }

@@ -1,5 +1,5 @@
 //! Bounded, versioned profile persistence and durable hardware transaction journal.
-use omen_core::{
+use glph_core::{
     battery::Selection,
     profiles::{PerformanceProfile, Setting, validate_id},
     quick_switch::{FanMode, GraphicsMode, GraphicsRecord},
@@ -21,7 +21,7 @@ pub use fan_presets::{FanPolicyOwner, FanPolicyPhase, FanPolicyRequest};
 #[serde(deny_unknown_fields)]
 struct UiSettingsFile {
     schema: u32,
-    appearance: omen_core::appearance::Appearance,
+    appearance: glph_core::appearance::Appearance,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,13 +101,13 @@ impl ProfileStore {
         #[cfg(not(windows))]
         {
             let local = std::env::var_os("LOCALAPPDATA")
-                .ok_or(omen_core::message::msg("store.err.user_directory", &[]))?;
-            Self::at(PathBuf::from(local).join("OmenHubPlusPlus"))
+                .ok_or(glph_core::message::msg("store.err.user_directory", &[]))?;
+            Self::at(PathBuf::from(local).join("GLPH"))
         }
     }
     pub fn at(root: PathBuf) -> Result<Self, String> {
         if !root.is_absolute() {
-            return Err(omen_core::message::msg("store.err.absolute_directory", &[]));
+            return Err(glph_core::message::msg("store.err.absolute_directory", &[]));
         }
         fs::create_dir_all(root.join("profiles")).map_err(|e| e.to_string())?;
         Ok(Self { root })
@@ -117,7 +117,7 @@ impl ProfileStore {
     }
     pub fn checkpoint_completed_journal(&self) -> Result<JournalCheckpoint, String> {
         if self.pending()? {
-            return Err(omen_core::message::msg("store.err.pending_checkpoint", &[]));
+            return Err(glph_core::message::msg("store.err.pending_checkpoint", &[]));
         }
         let previous = if self
             .journal_path()
@@ -128,7 +128,7 @@ impl ProfileStore {
             let file: JournalFile<serde_json::Value> =
                 serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
             if file.pending || file.schema != 1 {
-                return Err(omen_core::message::msg("store.err.checkpoint_changed", &[]));
+                return Err(glph_core::message::msg("store.err.checkpoint_changed", &[]));
             }
             file.transaction.validate()?;
             let path = self
@@ -153,7 +153,7 @@ impl ProfileStore {
         digest: &str,
     ) -> Result<(), String> {
         if checkpoint.root != self.root {
-            return Err(omen_core::message::msg("store.err.checkpoint_store", &[]));
+            return Err(glph_core::message::msg("store.err.checkpoint_store", &[]));
         }
         let current: JournalFile<serde_json::Value> = read_json(&self.journal_path())?;
         current.transaction.validate()?;
@@ -163,7 +163,7 @@ impl ProfileStore {
             || current.transaction.profile_id != id
             || current.transaction.profile_digest != digest
         {
-            return Err(omen_core::message::msg("store.err.checkpoint_restore", &[]));
+            return Err(glph_core::message::msg("store.err.checkpoint_restore", &[]));
         }
         if let Some(previous) = checkpoint.previous {
             atomic_bytes(&self.journal_path(), &previous)?;
@@ -174,12 +174,12 @@ impl ProfileStore {
     /// Keep the old files; a pending original journal is copied before profiles.
     pub fn migrate_legacy(&self) -> Result<usize, String> {
         let source = std::env::var_os("LOCALAPPDATA")
-            .ok_or(omen_core::message::msg("store.err.legacy_directory", &[]))?;
+            .ok_or(glph_core::message::msg("store.err.legacy_directory", &[]))?;
         self.migrate_from(&PathBuf::from(source).join("OmenHubPlusPlus"))
     }
     fn migrate_from(&self, source: &Path) -> Result<usize, String> {
         if !source.is_absolute() || !source.join("profiles").is_dir() {
-            return Err(omen_core::message::msg("store.err.legacy_missing", &[]));
+            return Err(glph_core::message::msg("store.err.legacy_missing", &[]));
         }
         if !self.list()?.is_empty()
             || self
@@ -187,7 +187,7 @@ impl ProfileStore {
                 .try_exists()
                 .map_err(|e| e.to_string())?
         {
-            return Err(omen_core::message::msg("store.err.migration_existing", &[]));
+            return Err(glph_core::message::msg("store.err.migration_existing", &[]));
         }
         let old = Self {
             root: source.to_owned(),
@@ -228,7 +228,7 @@ impl ProfileStore {
         let profile: PerformanceProfile = read_json(&self.path(id)?)?;
         profile.validate()?;
         if profile.id != id {
-            return Err(omen_core::message::msg("store.err.filename_id", &[]));
+            return Err(glph_core::message::msg("store.err.filename_id", &[]));
         }
         Ok(profile)
     }
@@ -240,7 +240,7 @@ impl ProfileStore {
     pub fn delete(&self, id: &str) -> Result<(), String> {
         let profile = self.load(id)?;
         if self.pending()? {
-            return Err(omen_core::message::msg("store.err.delete_recovery", &[]));
+            return Err(glph_core::message::msg("store.err.delete_recovery", &[]));
         }
         let selection = self.startup()?;
         if selection.profile_id.as_deref() == Some(id) {
@@ -270,12 +270,12 @@ impl ProfileStore {
                     .path()
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .ok_or(omen_core::message::msg("store.err.filename_encoding", &[]))?
+                    .ok_or(glph_core::message::msg("store.err.filename_encoding", &[]))?
                     .to_owned();
                 result.push(self.load(&id)?);
             }
             if result.len() > 256 {
-                return Err(omen_core::message::msg("store.err.count", &[]));
+                return Err(glph_core::message::msg("store.err.count", &[]));
             }
         }
         result.sort_by(|a, b| a.id.cmp(&b.id));
@@ -291,11 +291,11 @@ impl ProfileStore {
         }
         let file: JournalFile<serde_json::Value> = read_json(&path)?;
         if file.schema != 1 || file.transaction.schema != 1 {
-            return Err(omen_core::message::msg("store.err.journal_version", &[]));
+            return Err(glph_core::message::msg("store.err.journal_version", &[]));
         }
         file.transaction.validate()?;
         if file.pending == file.completion.is_some() {
-            return Err(omen_core::message::msg("store.err.journal_state", &[]));
+            return Err(glph_core::message::msg("store.err.journal_state", &[]));
         }
         Ok(file.pending)
     }
@@ -338,7 +338,7 @@ impl ProfileStore {
     pub fn last_transaction<S: DeserializeOwned>(&self) -> Result<PendingTransaction<S>, String> {
         let file: JournalFile<S> = read_json(&self.journal_path())?;
         if file.schema != 1 || file.transaction.schema != 1 {
-            return Err(omen_core::message::msg("store.err.journal_schema", &[]));
+            return Err(glph_core::message::msg("store.err.journal_schema", &[]));
         }
         file.transaction.validate()?;
         Ok(file.transaction)
@@ -353,7 +353,7 @@ impl ProfileStore {
         }
         let selection: StartupSelection = read_json(&path)?;
         if selection.schema != 1 {
-            return Err(omen_core::message::msg("store.err.startup_schema", &[]));
+            return Err(glph_core::message::msg("store.err.startup_schema", &[]));
         }
         Ok(selection)
     }
@@ -369,7 +369,7 @@ impl ProfileStore {
     /// Startup can select only the exact, successfully applied profile revision.
     pub fn startup_eligibility(&self, id: &str) -> Result<StartupSelection, String> {
         let profile = self.load(id)?;
-        omen_core::fan_profile::startup_allowed(&profile, true)?;
+        glph_core::fan_profile::startup_allowed(&profile, true)?;
         let digest = profile_digest(&profile)?;
         let journal: JournalFile<serde_json::Value> = read_json(&self.journal_path())?;
         journal.transaction.validate()?;
@@ -384,13 +384,13 @@ impl ProfileStore {
             // with a linked curve journals only its direct controls.
             || (journal.transaction.requested != profile.settings
                 && journal.transaction.requested != profile.effective().settings
-                && omen_core::fan_profile::direct_part(&profile)
+                && glph_core::fan_profile::direct_part(&profile)
                     .map(|direct| direct.effective().settings)
                     .ok()
                     .as_ref()
                     != Some(&journal.transaction.requested))
         {
-            return Err(omen_core::message::msg("store.err.startup_revision", &[]));
+            return Err(glph_core::message::msg("store.err.startup_revision", &[]));
         }
         Ok(StartupSelection {
             schema: 1,
@@ -414,10 +414,10 @@ impl ProfileStore {
         // stop the sign-in preset.
         let id = selection
             .profile_id
-            .ok_or(omen_core::message::msg("store.err.startup_id", &[]))?;
+            .ok_or(glph_core::message::msg("store.err.startup_id", &[]))?;
         let profile = self.load(&id)?;
         if Some(profile_digest(&profile)?) != selection.profile_digest {
-            return Err(omen_core::message::msg("store.err.startup_changed", &[]));
+            return Err(glph_core::message::msg("store.err.startup_changed", &[]));
         }
         Ok(Some(profile))
     }
@@ -452,10 +452,10 @@ impl ProfileStore {
         &self,
         board: &str,
         bios: &str,
-    ) -> Option<omen_core::device_defaults::DeviceDefaultsRecord> {
-        let mut record: omen_core::device_defaults::DeviceDefaultsRecord =
+    ) -> Option<glph_core::device_defaults::DeviceDefaultsRecord> {
+        let mut record: glph_core::device_defaults::DeviceDefaultsRecord =
             read_json(&self.root.join("device-defaults.json")).ok()?;
-        if record.schema != omen_core::device_defaults::DEFAULTS_SCHEMA
+        if record.schema != glph_core::device_defaults::DEFAULTS_SCHEMA
             || record.board != board
             || record.bios != bios
         {
@@ -465,7 +465,7 @@ impl ProfileStore {
             .settings
             .into_iter()
             .filter_map(|s| {
-                omen_core::device_defaults::sanitize_default(s.feature, s.value).map(|value| {
+                glph_core::device_defaults::sanitize_default(s.feature, s.value).map(|value| {
                     Setting {
                         feature: s.feature,
                         value,
@@ -479,10 +479,10 @@ impl ProfileStore {
     /// schema 1 compatibility with `board`, `bios`, `settings` plus `modes`).
     pub fn save_device_defaults_record(
         &self,
-        record: &omen_core::device_defaults::DeviceDefaultsRecord,
+        record: &glph_core::device_defaults::DeviceDefaultsRecord,
     ) -> Result<(), String> {
-        if record.schema != omen_core::device_defaults::DEFAULTS_SCHEMA {
-            return Err(omen_core::message::msg("store.err.journal_schema", &[]));
+        if record.schema != glph_core::device_defaults::DEFAULTS_SCHEMA {
+            return Err(glph_core::message::msg("store.err.journal_schema", &[]));
         }
         for setting in &record.settings {
             setting.validate()?;
@@ -508,7 +508,7 @@ impl ProfileStore {
         for reading in readings {
             reading.validate()?;
         }
-        let merged = omen_core::device_defaults::merge_discovered(
+        let merged = glph_core::device_defaults::merge_discovered(
             board,
             bios,
             "",
@@ -525,6 +525,55 @@ impl ProfileStore {
     pub fn control_result(&self) -> Result<serde_json::Value, String> {
         read_json(&self.root.join("last-control-result.json"))
     }
+    /// Per-nonce UAC child result file (`control-results/<nonce>.json`) so
+    /// concurrent UI operations (`apply_queue`, `aux_worker`, `control_worker`)
+    /// never overwrite each other's completion record.
+    pub fn save_nonce_control_result<T: Serialize>(
+        &self,
+        nonce: &str,
+        value: &T,
+    ) -> Result<(), String> {
+        validate_result_nonce(nonce)?;
+        let dir = self.root.join("control-results");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        atomic_json(&dir.join(format!("{nonce}.json")), value)
+    }
+    /// Reads and removes a per-nonce UAC child result file, returning `Ok(None)`
+    /// when absent.
+    pub fn take_nonce_control_result(
+        &self,
+        nonce: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        validate_result_nonce(nonce)?;
+        let path = self
+            .root
+            .join("control-results")
+            .join(format!("{nonce}.json"));
+        if !path.try_exists().map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        let record: serde_json::Value = read_json(&path)?;
+        let _ = fs::remove_file(&path);
+        Ok(Some(record))
+    }
+    /// Dedicated record of the last Apply/Mode/Restore outcome for `preset_hold`,
+    /// isolated from unrelated UI operations (`mux`, `hp_service`, `hardware_service`,
+    /// `device_defaults`) that write `last-control-result.json`.
+    pub fn save_last_apply_result<T: Serialize>(&self, value: &T) -> Result<(), String> {
+        atomic_json(&self.root.join("last-apply-result.json"), value)
+    }
+    /// Reads `last-apply-result.json`, falling back to `last-control-result.json`
+    /// when the dedicated file does not exist yet (upgrade/legacy compatibility).
+    pub fn last_apply_result(&self) -> Result<Option<serde_json::Value>, String> {
+        let path = self.root.join("last-apply-result.json");
+        if path.try_exists().map_err(|e| e.to_string())? {
+            return read_json(&path).map(Some);
+        }
+        match self.control_result() {
+            Ok(v) => Ok(Some(v)),
+            Err(_) => Ok(None),
+        }
+    }
     pub fn save_cpu_error<T: Serialize>(&self, value: &T) -> Result<(), String> {
         atomic_json(&self.root.join("last-cpu-error.json"), value)
     }
@@ -540,13 +589,13 @@ impl ProfileStore {
     /// the BIOS keeps automatic fan control.
     pub fn save_active_fan_curve(
         &self,
-        points: &[omen_core::profiles::FanPoint],
+        points: &[glph_core::profiles::FanPoint],
     ) -> Result<(), String> {
         #[cfg(windows)]
         let _preference = lock_fan_preference(&self.root)?;
-        omen_core::profiles::Setting {
-            feature: omen_core::features::Feature::CpuFanCurve,
-            value: omen_core::profiles::Value::FanCurve(points.to_vec()),
+        glph_core::profiles::Setting {
+            feature: glph_core::features::Feature::CpuFanCurve,
+            value: glph_core::profiles::Value::FanCurve(points.to_vec()),
         }
         .validate()?;
         atomic_json(
@@ -554,14 +603,14 @@ impl ProfileStore {
             &serde_json::json!({"schema": 1, "points": points}),
         )
     }
-    pub fn active_fan_curve(&self) -> Result<Option<Vec<omen_core::profiles::FanPoint>>, String> {
+    pub fn active_fan_curve(&self) -> Result<Option<Vec<glph_core::profiles::FanPoint>>, String> {
         let path = self.root.join("active-fan-curve.json");
         if !path.try_exists().map_err(|e| e.to_string())? {
             return Ok(None);
         }
         let value: serde_json::Value = read_json(&path)?;
         if value["schema"] != 1 {
-            return Err(omen_core::message::msg("store.err.fan_schema", &[]));
+            return Err(glph_core::message::msg("store.err.fan_schema", &[]));
         }
         serde_json::from_value(value["points"].clone())
             .map(Some)
@@ -610,7 +659,7 @@ impl ProfileStore {
     }
     /// Closing the dashboard hides it in the tray unless the user turned
     /// that off; absent or unreadable keeps the tray behaviour.
-    pub fn app_settings(&self) -> Result<omen_core::app_settings::AppSettings, String> {
+    pub fn app_settings(&self) -> Result<glph_core::app_settings::AppSettings, String> {
         self.app_settings_with_start_default(false)
     }
     /// Preserve the old Run entry's tray preference while reading a pre-settings
@@ -618,17 +667,17 @@ impl ProfileStore {
     pub fn app_settings_with_start_default(
         &self,
         start_in_tray: bool,
-    ) -> Result<omen_core::app_settings::AppSettings, String> {
+    ) -> Result<glph_core::app_settings::AppSettings, String> {
         let path = self.root.join("app-settings.json");
         if !path.try_exists().map_err(|e| e.to_string())? {
-            return Ok(omen_core::app_settings::AppSettings {
+            return Ok(glph_core::app_settings::AppSettings {
                 start_in_tray,
                 ..Default::default()
             });
         }
         let value: serde_json::Value = read_json(&path)?;
         let explicit_start = value.get("start_in_tray").is_some();
-        let mut settings: omen_core::app_settings::AppSettings =
+        let mut settings: glph_core::app_settings::AppSettings =
             serde_json::from_value(value).map_err(|e| e.to_string())?;
         if !explicit_start {
             settings.start_in_tray = start_in_tray;
@@ -638,7 +687,7 @@ impl ProfileStore {
     }
     pub fn save_app_settings(
         &self,
-        settings: &omen_core::app_settings::AppSettings,
+        settings: &glph_core::app_settings::AppSettings,
     ) -> Result<(), String> {
         settings.validate()?;
         atomic_json(&self.root.join("app-settings.json"), settings)
@@ -649,21 +698,21 @@ impl ProfileStore {
     }
     /// Separate from app-settings.json: protected older helpers reject unknown
     /// fields in that file. Cosmetic preferences must not break their lifecycle.
-    pub fn ui_appearance(&self) -> Result<omen_core::appearance::Appearance, String> {
+    pub fn ui_appearance(&self) -> Result<glph_core::appearance::Appearance, String> {
         let path = self.root.join("ui-settings.json");
         if !path.try_exists().map_err(|e| e.to_string())? {
             return Ok(Default::default());
         }
         let record: UiSettingsFile = read_json(&path)?;
         if record.schema != 1 {
-            return Err(omen_core::message::msg("settings.invalid_schema", &[]));
+            return Err(glph_core::message::msg("settings.invalid_schema", &[]));
         }
         record.appearance.validate()?;
         Ok(record.appearance)
     }
     pub fn save_ui_appearance(
         &self,
-        appearance: &omen_core::appearance::Appearance,
+        appearance: &glph_core::appearance::Appearance,
     ) -> Result<(), String> {
         appearance.validate()?;
         atomic_json(
@@ -678,7 +727,7 @@ impl ProfileStore {
     /// kept separate from `app-settings.json` so older protected helpers keep
     /// parsing their unchanged schema. Defaults to 135 W when absent.
     pub fn gpu_tgp_max_w(&self) -> Result<u32, String> {
-        use omen_core::profiles::{
+        use glph_core::profiles::{
             GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W, GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
             GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
         };
@@ -688,12 +737,12 @@ impl ProfileStore {
         }
         let record: GpuTgpSettingsFile = read_json(&path)?;
         if record.schema != 1 {
-            return Err(omen_core::message::msg("settings.invalid_schema", &[]));
+            return Err(glph_core::message::msg("settings.invalid_schema", &[]));
         }
         if !(GPU_DYNAMIC_BOOST_LIMIT_MIN_W..=GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W)
             .contains(&record.max_w)
         {
-            return Err(omen_core::message::msg(
+            return Err(glph_core::message::msg(
                 "settings.invalid_gpu_tgp_max",
                 &[
                     &GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
@@ -704,11 +753,11 @@ impl ProfileStore {
         Ok(record.max_w)
     }
     pub fn save_gpu_tgp_max_w(&self, max_w: u32) -> Result<(), String> {
-        use omen_core::profiles::{
+        use glph_core::profiles::{
             GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W, GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
         };
         if !(GPU_DYNAMIC_BOOST_LIMIT_MIN_W..=GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W).contains(&max_w) {
-            return Err(omen_core::message::msg(
+            return Err(glph_core::message::msg(
                 "settings.invalid_gpu_tgp_max",
                 &[
                     &GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
@@ -722,26 +771,63 @@ impl ProfileStore {
         )
     }
     /// Saved original NVPCF registry values before Omen Hub++ unlocked PPT.
+    /// Stored in its own atomic file (`nvpcf-ppt-original.json`) isolated from
+    /// UI battery state, with transparent read-migration from legacy `power-switch.json`.
     pub fn nvpcf_ppt_original(&self) -> Option<NvpcfPptOriginal> {
+        let path = self.root.join("nvpcf-ppt-original.json");
+        if path.try_exists().unwrap_or(false) {
+            return read_json::<serde_json::Value>(&path)
+                .ok()
+                .filter(|v| v["schema"] == 1)
+                .and_then(|v| serde_json::from_value(v["original"].clone()).ok());
+        }
         serde_json::from_value(self.power_state()["nvpcf_ppt_original"].clone()).ok()
     }
     pub fn save_nvpcf_ppt_original(&self, value: Option<NvpcfPptOriginal>) -> Result<(), String> {
-        let encoded = match value {
-            Some(original) => serde_json::to_value(original).map_err(|e| e.to_string())?,
-            None => serde_json::Value::Null,
-        };
-        self.update_power_state("nvpcf_ppt_original", encoded)
+        let path = self.root.join("nvpcf-ppt-original.json");
+        match value {
+            Some(original) => atomic_json(
+                &path,
+                &serde_json::json!({ "schema": 1, "original": original }),
+            ),
+            None => {
+                if path.try_exists().map_err(|e| e.to_string())? {
+                    fs::remove_file(&path).map_err(|e| e.to_string())?;
+                }
+                if !self.power_state()["nvpcf_ppt_original"].is_null() {
+                    let _ = self.update_power_state("nvpcf_ppt_original", serde_json::Value::Null);
+                }
+                Ok(())
+            }
+        }
     }
     /// Active flashless GPU Dynamic Boost TGP VBIOS override state, if any.
+    /// Stored in its own atomic file (`vbios-tgp-state.json`) isolated from
+    /// UI battery state, with transparent read-migration from legacy `power-switch.json`.
     pub fn vbios_tgp_state(&self) -> Option<VbiosTgpState> {
+        let path = self.root.join("vbios-tgp-state.json");
+        if path.try_exists().unwrap_or(false) {
+            return read_json::<serde_json::Value>(&path)
+                .ok()
+                .filter(|v| v["schema"] == 1)
+                .and_then(|v| serde_json::from_value(v["state"].clone()).ok());
+        }
         serde_json::from_value(self.power_state()["vbios_tgp_state"].clone()).ok()
     }
     pub fn save_vbios_tgp_state(&self, state: Option<&VbiosTgpState>) -> Result<(), String> {
-        let encoded = match state {
-            Some(state) => serde_json::to_value(state).map_err(|e| e.to_string())?,
-            None => serde_json::Value::Null,
-        };
-        self.update_power_state("vbios_tgp_state", encoded)
+        let path = self.root.join("vbios-tgp-state.json");
+        match state {
+            Some(state) => atomic_json(&path, &serde_json::json!({ "schema": 1, "state": state })),
+            None => {
+                if path.try_exists().map_err(|e| e.to_string())? {
+                    fs::remove_file(&path).map_err(|e| e.to_string())?;
+                }
+                if !self.power_state()["vbios_tgp_state"].is_null() {
+                    let _ = self.update_power_state("vbios_tgp_state", serde_json::Value::Null);
+                }
+                Ok(())
+            }
+        }
     }
     pub fn vbios_stock_path(&self) -> PathBuf {
         self.root.join("vbios-stock-original.bin")
@@ -755,7 +841,7 @@ impl ProfileStore {
     }
     pub fn save_vbios_stock(&self, bytes: &[u8]) -> Result<(), String> {
         if bytes.len() as u64 > MAX_FILE_BYTES {
-            return Err(omen_core::message::msg("store.err.size", &[]));
+            return Err(glph_core::message::msg("store.err.size", &[]));
         }
         atomic_bytes(&self.vbios_stock_path(), bytes)
     }
@@ -782,7 +868,7 @@ impl ProfileStore {
     /// The selection applied on battery while `ac` is in use on AC: the
     /// preset's own choice, otherwise the older global setting.
     pub fn battery_selection_for(&self, ac: Option<&Selection>) -> Option<Selection> {
-        omen_core::battery::selection_for(
+        glph_core::battery::selection_for(
             ac,
             &self.battery_links(),
             self.battery_selection().as_ref(),
@@ -790,11 +876,11 @@ impl ProfileStore {
     }
     /// Stores the battery behaviour of preset `id`; `None` turns it off.
     pub fn save_battery_link(&self, id: &str, battery: Option<&Selection>) -> Result<(), String> {
-        omen_core::profiles::validate_id(id)?;
+        glph_core::profiles::validate_id(id)?;
         let mut links = self.battery_links();
         links.insert(
             id.to_owned(),
-            battery.map_or_else(|| omen_core::battery::OFF.to_owned(), Selection::key),
+            battery.map_or_else(|| glph_core::battery::OFF.to_owned(), Selection::key),
         );
         self.write_battery_links(&links)
     }
@@ -827,19 +913,23 @@ impl ProfileStore {
         self.update_power_state("battery_switched", switched.into())
     }
     /// The complete persisted state of the automatic battery switch.
-    pub fn battery_state(&self) -> omen_core::battery::State {
+    pub fn battery_state(&self) -> glph_core::battery::State {
         let state = self.power_state();
-        omen_core::battery::State {
+        glph_core::battery::State {
             ac_selection: state["ac_selection"].as_str().and_then(Selection::parse),
             switched: state["battery_switched"].as_bool().unwrap_or(false),
             manual_override: state["manual_override_on_battery"]
                 .as_bool()
                 .unwrap_or(false),
             boot_unix_s: state["boot_unix_s"].as_u64(),
+            applied_battery_preset: state["applied_battery_preset"]
+                .as_str()
+                .filter(|id| validate_id(id).is_ok())
+                .map(str::to_owned),
         }
     }
     /// Writes the state's fields in one atomic file replacement.
-    pub fn save_battery_state(&self, battery: &omen_core::battery::State) -> Result<(), String> {
+    pub fn save_battery_state(&self, battery: &glph_core::battery::State) -> Result<(), String> {
         let mut state = self.power_state();
         match &battery.ac_selection {
             Some(selection) => state["ac_selection"] = selection.key().into(),
@@ -855,19 +945,50 @@ impl ProfileStore {
                 state.as_object_mut().map(|o| o.remove("boot_unix_s"));
             }
         }
+        match &battery.applied_battery_preset {
+            Some(id) => state["applied_battery_preset"] = id.clone().into(),
+            None => {
+                state
+                    .as_object_mut()
+                    .map(|o| o.remove("applied_battery_preset"));
+            }
+        }
         atomic_json(&self.root.join("power-switch.json"), &state)
     }
     /// Start type HPOmenCap had before the "Disable HP OMEN Cap" setting.
+    /// Stored in its own atomic file (`hp-service-state.json`) isolated from
+    /// UI battery state, with transparent read-migration from legacy `power-switch.json`.
     pub fn hp_service_start_type(&self) -> Option<u32> {
+        let path = self.root.join("hp-service-state.json");
+        if path.try_exists().unwrap_or(false) {
+            return read_json::<serde_json::Value>(&path)
+                .ok()
+                .filter(|v| v["schema"] == 1)
+                .and_then(|v| v["start_type"].as_u64())
+                .and_then(|v| u32::try_from(v).ok());
+        }
         self.power_state()["hp_service_start_type"]
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
     }
     pub fn save_hp_service_start_type(&self, start: Option<u32>) -> Result<(), String> {
-        self.update_power_state(
-            "hp_service_start_type",
-            start.map_or(serde_json::Value::Null, Into::into),
-        )
+        let path = self.root.join("hp-service-state.json");
+        match start {
+            Some(start_type) => atomic_json(
+                &path,
+                &serde_json::json!({ "schema": 1, "start_type": start_type }),
+            ),
+            None => {
+                if path.try_exists().map_err(|e| e.to_string())? {
+                    fs::remove_file(&path).map_err(|e| e.to_string())?;
+                }
+                if !self.power_state()["hp_service_start_type"].is_null() {
+                    let _ =
+                        self.update_power_state("hp_service_start_type", serde_json::Value::Null);
+                }
+                Ok(())
+            }
+        }
     }
     /// Runtime state of the battery switch and the HP service setting, kept
     /// apart from the user's settings file.
@@ -895,14 +1016,14 @@ impl ProfileStore {
         }
         let value: serde_json::Value = read_json(&path)?;
         if value["schema"] != 1 {
-            return Err(omen_core::message::msg("store.err.ccd_schema", &[]));
+            return Err(glph_core::message::msg("store.err.ccd_schema", &[]));
         }
         value["selection"]
             .as_u64()
             .and_then(|s| u8::try_from(s).ok())
             .filter(|s| *s > 0)
             .map(Some)
-            .ok_or_else(|| omen_core::message::msg("store.err.ccd_selection", &[]))
+            .ok_or_else(|| glph_core::message::msg("store.err.ccd_selection", &[]))
     }
     pub fn save_ccd_selection(&self, selection: Option<u8>) -> Result<(), String> {
         let path = self.root.join("ccd-affinity.json");
@@ -932,7 +1053,7 @@ impl ProfileStore {
             .as_u64()
             .and_then(|c| u8::try_from(c).ok())
             .filter(|c| {
-                (omen_core::fan::IR_LIMIT_MIN_C..=omen_core::fan::IR_LIMIT_MAX_C).contains(c)
+                (glph_core::fan::IR_LIMIT_MIN_C..=glph_core::fan::IR_LIMIT_MAX_C).contains(c)
             })
             .map(Some)
             .ok_or_else(|| "Chassis max temperature is outside 35..=55 °C".into())
@@ -941,7 +1062,7 @@ impl ProfileStore {
         let path = self.root.join("chassis-max-temp.json");
         match temp_c {
             Some(c)
-                if (omen_core::fan::IR_LIMIT_MIN_C..=omen_core::fan::IR_LIMIT_MAX_C)
+                if (glph_core::fan::IR_LIMIT_MIN_C..=glph_core::fan::IR_LIMIT_MAX_C)
                     .contains(&c) =>
             {
                 atomic_json(&path, &serde_json::json!({"schema": 1, "celsius": c}))
@@ -992,11 +1113,13 @@ impl<S: Serialize + DeserializeOwned> Journal<S> for ProfileStore {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            fs::copy(
-                self.journal_path(),
-                history.join(format!("superseded-{now}.json")),
-            )
-            .map_err(|e| e.to_string())?;
+            let bytes = read_bytes(&self.journal_path())?;
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            let suffix = &hash[..12];
+            atomic_bytes(
+                &history.join(format!("superseded-{now}-{suffix}.json")),
+                &bytes,
+            )?;
         }
         #[derive(Serialize)]
         struct NewJournal<'a, S> {
@@ -1018,7 +1141,7 @@ impl<S: Serialize + DeserializeOwned> Journal<S> for ProfileStore {
     fn finish(&mut self, completion: Completion) -> Result<(), String> {
         let mut file: JournalFile<S> = read_json(&self.journal_path())?;
         if file.schema != 1 || !file.pending {
-            return Err(omen_core::message::msg("store.err.journal_inactive", &[]));
+            return Err(glph_core::message::msg("store.err.journal_inactive", &[]));
         }
         file.pending = false;
         file.completion = Some(completion);
@@ -1033,7 +1156,7 @@ impl<S: Serialize + DeserializeOwned> Journal<S> for ProfileStore {
             || serde_json::to_value(&file.transaction).map_err(|e| e.to_string())?
                 != serde_json::to_value(transaction).map_err(|e| e.to_string())?
         {
-            return Err(omen_core::message::msg("store.err.recovery_changed", &[]));
+            return Err(glph_core::message::msg("store.err.recovery_changed", &[]));
         }
         file.pending = true;
         file.completion = None;
@@ -1048,13 +1171,20 @@ impl<S: Serialize + DeserializeOwned> Journal<S> for ProfileStore {
             || file.transaction.profile_digest != transaction.profile_digest
             || file.transaction.requested != transaction.requested
         {
-            return Err(omen_core::message::msg("store.err.journal_inactive", &[]));
+            return Err(glph_core::message::msg("store.err.journal_inactive", &[]));
         }
         file.transaction =
             serde_json::from_value(serde_json::to_value(transaction).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
         atomic_json(&self.journal_path(), &file)
     }
+}
+
+fn validate_result_nonce(nonce: &str) -> Result<(), String> {
+    if nonce.is_empty() || nonce.len() > 64 || !nonce.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err("Invalid UI operation token".into());
+    }
+    Ok(())
 }
 
 fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
@@ -1064,7 +1194,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
         .read_to_end(&mut data)
         .map_err(|e| e.to_string())?;
     if data.len() as u64 > MAX_FILE_BYTES {
-        return Err(omen_core::message::msg("store.err.size", &[]));
+        return Err(glph_core::message::msg("store.err.size", &[]));
     }
     Ok(data)
 }
@@ -1079,11 +1209,11 @@ pub(crate) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), St
 }
 pub(crate) fn atomic_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
     if data.len() as u64 > MAX_FILE_BYTES {
-        return Err(omen_core::message::msg("store.err.size", &[]));
+        return Err(glph_core::message::msg("store.err.size", &[]));
     }
     let parent = path
         .parent()
-        .ok_or(omen_core::message::msg("store.err.parent_directory", &[]))?;
+        .ok_or(glph_core::message::msg("store.err.parent_directory", &[]))?;
     let temp = parent.join(format!(
         ".omen-{}-{}.tmp",
         std::process::id(),
@@ -1135,7 +1265,7 @@ fn replace(temp: &Path, path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omen_core::{
+    use glph_core::{
         features::Feature,
         profiles::{DeviceBinding, PROFILE_SCHEMA, Setting, Value},
         transaction::Captured,
@@ -1144,7 +1274,7 @@ mod tests {
     fn future_cosmetic_preferences_do_not_block_legacy_control_preferences() {
         let fixture = Fixture::new();
         let store = &fixture.0;
-        let options = omen_core::app_settings::AppSettings {
+        let options = glph_core::app_settings::AppSettings {
             close_to_tray: false,
             ..Default::default()
         };
@@ -1198,15 +1328,15 @@ mod tests {
 
         // Per-mode Standard & Performance TDC/EDC persist alongside settings,
         // and dirty factory offsets (e.g. CO +10) are sanitized back to 0.
-        let mut record = omen_core::device_defaults::DeviceDefaultsRecord::new("8E35", "F.13");
-        record.modes.standard = Some(omen_core::device_defaults::ModePowerDefaults {
+        let mut record = glph_core::device_defaults::DeviceDefaultsRecord::new("8E35", "F.13");
+        record.modes.standard = Some(glph_core::device_defaults::ModePowerDefaults {
             ppt_mw: Some(80_000),
             slow_ppt_mw: Some(55_000),
             tdc_ma: Some(108_000),
             edc_ma: Some(160_000),
             tctl_c: Some(100),
         });
-        record.modes.performance = Some(omen_core::device_defaults::ModePowerDefaults {
+        record.modes.performance = Some(glph_core::device_defaults::ModePowerDefaults {
             ppt_mw: Some(80_000),
             slow_ppt_mw: Some(60_000),
             tdc_ma: Some(108_000),
@@ -1261,7 +1391,7 @@ mod tests {
             value: Value::Integer(50),
         };
         fresh.settings.push(hidden.clone());
-        let cleaned = omen_core::preset::merge(&loaded, &fresh, &loaded.name, &edits).unwrap();
+        let cleaned = glph_core::preset::merge(&loaded, &fresh, &loaded.name, &edits).unwrap();
         assert!(cleaned.settings.contains(&hidden));
         assert!(cleaned.settings.iter().all(|s| !s.feature.retired()));
         assert_ne!(
@@ -1276,7 +1406,7 @@ mod tests {
             .find(|s| s.feature.retired())
             .unwrap()
             .value = Value::Integer(45001);
-        assert!(omen_core::preset::merge(&loaded, &fresh, &loaded.name, &edits).is_err());
+        assert!(glph_core::preset::merge(&loaded, &fresh, &loaded.name, &edits).is_err());
         store.save(&cleaned).unwrap();
         assert_eq!(store.load(&old.id).unwrap(), cleaned);
     }
@@ -1298,6 +1428,7 @@ mod tests {
             let root = self.0.root();
             for directory in [
                 root.join("control-history"),
+                root.join("control-results"),
                 root.join("deleted-profiles"),
                 root.join("profiles"),
                 root.to_owned(),
@@ -1312,6 +1443,7 @@ mod tests {
             }
             let _ = fs::remove_dir(root.join("profiles"));
             let _ = fs::remove_dir(root.join("control-history"));
+            let _ = fs::remove_dir(root.join("control-results"));
             let _ = fs::remove_dir(root.join("deleted-profiles"));
             let _ = fs::remove_dir(root);
         }
@@ -1323,7 +1455,7 @@ mod tests {
         assert!(store.close_to_tray());
         let mut settings = store.app_settings().unwrap();
         settings.close_to_tray = false;
-        settings.language = omen_core::app_settings::LanguagePreference::English;
+        settings.language = glph_core::app_settings::LanguagePreference::English;
         settings.start_in_tray = true;
         store.save_app_settings(&settings).unwrap();
         assert!(!store.close_to_tray());
@@ -1334,13 +1466,13 @@ mod tests {
         assert!(store.close_to_tray());
         assert_eq!(
             store.app_settings().unwrap().language,
-            omen_core::app_settings::LanguagePreference::English
+            glph_core::app_settings::LanguagePreference::English
         );
         fs::remove_file(store.root().join("app-settings.json")).unwrap();
     }
     #[test]
     fn a_presets_battery_behaviour_lives_in_its_own_file() {
-        use omen_core::hp_mode::HpMode;
+        use glph_core::hp_mode::HpMode;
         let fixture = Fixture::new();
         let store = &fixture.0;
         let gaming = Selection::Preset("preset-gaming".into());
@@ -1378,7 +1510,7 @@ mod tests {
     }
     #[test]
     fn battery_switch_state_is_kept_apart_from_the_settings_file() {
-        use omen_core::hp_mode::HpMode;
+        use glph_core::hp_mode::HpMode;
         let fixture = Fixture::new();
         let store = &fixture.0;
         assert_eq!(store.battery_selection(), None);
@@ -1420,7 +1552,7 @@ mod tests {
         }
         let mut settings = store.app_settings().unwrap();
         settings.close_to_tray = false;
-        settings.language = omen_core::app_settings::LanguagePreference::English;
+        settings.language = glph_core::app_settings::LanguagePreference::English;
         store.save_app_settings(&settings).unwrap();
         for name in protected {
             assert_eq!(
@@ -1763,11 +1895,11 @@ mod tests {
         assert_eq!(store.fan_mode(), FanMode::Bios);
 
         let points = vec![
-            omen_core::profiles::FanPoint {
+            glph_core::profiles::FanPoint {
                 temperature_c: 40,
                 duty_percent: 30,
             },
-            omen_core::profiles::FanPoint {
+            glph_core::profiles::FanPoint {
                 temperature_c: 80,
                 duty_percent: 90,
             },
@@ -1779,11 +1911,11 @@ mod tests {
         );
 
         let invalid = vec![
-            omen_core::profiles::FanPoint {
+            glph_core::profiles::FanPoint {
                 temperature_c: 80,
                 duty_percent: 90,
             },
-            omen_core::profiles::FanPoint {
+            glph_core::profiles::FanPoint {
                 temperature_c: 40,
                 duty_percent: 30,
             },
@@ -1810,7 +1942,7 @@ mod tests {
 #[cfg(test)]
 mod battery_state_tests {
     use super::*;
-    use omen_core::{battery::State, hp_mode::HpMode};
+    use glph_core::{battery::State, hp_mode::HpMode};
 
     #[test]
     fn battery_switch_state_survives_a_restart_and_keeps_other_fields() {
@@ -1829,6 +1961,7 @@ mod battery_state_tests {
             switched: true,
             manual_override: false,
             boot_unix_s: Some(1_795_300_000),
+            applied_battery_preset: Some("preset-battery".into()),
         };
         store.save_battery_state(&state).unwrap();
         let reopened = ProfileStore::at(path.clone()).unwrap();
@@ -1839,12 +1972,72 @@ mod battery_state_tests {
             switched: false,
             manual_override: true,
             boot_unix_s: None,
+            applied_battery_preset: None,
         };
         reopened.save_battery_state(&cleared).unwrap();
         assert_eq!(reopened.battery_state(), cleared);
         assert_eq!(
             Selection::parse(&Selection::Mode(HpMode::Quiet).key()),
             Some(Selection::Mode(HpMode::Quiet))
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn hardware_anchors_are_isolated_from_battery_state_and_migrate_from_legacy() {
+        let path = std::env::temp_dir().join(format!(
+            "omen-anchor-split-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = ProfileStore::at(path.clone()).unwrap();
+        // Legacy power-switch.json carrying hardware anchors is still readable.
+        std::fs::write(
+            path.join("power-switch.json"),
+            br#"{"schema":1,"hp_service_start_type":2,"nvpcf_ppt_original":{"config_version":1,"supported_funcs":1287}}"#,
+        )
+        .unwrap();
+        assert_eq!(store.hp_service_start_type(), Some(2));
+        assert_eq!(
+            store.nvpcf_ppt_original(),
+            Some(NvpcfPptOriginal {
+                config_version: Some(1),
+                supported_funcs: Some(1287),
+            })
+        );
+        // Saving new anchors writes dedicated files isolated from battery_state.
+        store.save_hp_service_start_type(Some(3)).unwrap();
+        assert!(path.join("hp-service-state.json").is_file());
+        assert_eq!(store.hp_service_start_type(), Some(3));
+        store
+            .save_battery_state(&State {
+                ac_selection: Some(Selection::Preset("preset-gaming".into())),
+                switched: true,
+                manual_override: false,
+                boot_unix_s: Some(42),
+                applied_battery_preset: Some("preset-eco".into()),
+            })
+            .unwrap();
+        // Battery state write never disturbs hardware anchor files.
+        assert_eq!(store.hp_service_start_type(), Some(3));
+        // Clearing an anchor removes both dedicated file and legacy key.
+        store.save_hp_service_start_type(None).unwrap();
+        assert_eq!(store.hp_service_start_type(), None);
+        // Per-nonce results & dedicated last-apply-result round-trip independently.
+        store
+            .save_nonce_control_result("abc123", &serde_json::json!({"nonce":"abc123"}))
+            .unwrap();
+        store
+            .save_last_apply_result(&serde_json::json!({"operation":"apply"}))
+            .unwrap();
+        assert_eq!(
+            store.take_nonce_control_result("abc123").unwrap(),
+            Some(serde_json::json!({"nonce":"abc123"}))
+        );
+        assert_eq!(store.take_nonce_control_result("abc123").unwrap(), None);
+        assert_eq!(
+            store.last_apply_result().unwrap(),
+            Some(serde_json::json!({"operation":"apply"}))
         );
         let _ = std::fs::remove_dir_all(path);
     }

@@ -7,14 +7,14 @@ use crate::{
     preset_fields::{self, Field, GROUPS, SECTIONS},
     theme,
 };
-use omen_core::{
+use glph_core::{
     curve_editor::Curve,
     features::{Feature, ValueKind},
     preset,
     profiles::{CoreDelta, DeviceBinding, PROFILE_SCHEMA, PerformanceProfile, Setting, Value},
     transaction::{self, Backend},
 };
-use omen_platform::{Controller, profile_store::ProfileStore};
+use glph_platform::{Controller, profile_store::ProfileStore};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -59,7 +59,7 @@ const INFO_OFFSET: usize = FIELD_STRIDE - 1;
 const INFO_SIZE: i32 = 26;
 pub const CLASS: &str = "OmenHubPPPresetEditor";
 fn disable_selected_startup(store: &ProfileStore, id: &str) -> Result<(), String> {
-    let _lease = omen_platform::ControlLease::acquire_foreground()?;
+    let _lease = glph_platform::ControlLease::acquire_foreground()?;
     if store.startup()?.profile_id.as_deref() == Some(id) {
         store.disable_startup()?;
     }
@@ -74,8 +74,8 @@ pub(crate) struct View {
     /// This device's own values, shown greyed and used by Reset.
     pub(crate) defaults: BTreeMap<Feature, Value>,
     /// Full discovered defaults record including Standard & Performance TDC/EDC.
-    pub(crate) defaults_record: omen_core::device_defaults::DeviceDefaultsRecord,
-    pub(crate) curve: Result<omen_core::vf::VfState, String>,
+    pub(crate) defaults_record: glph_core::device_defaults::DeviceDefaultsRecord,
+    pub(crate) curve: Result<glph_core::vf::VfState, String>,
     pub(crate) removed_options: usize,
     pub(crate) pending: bool,
     pub(crate) applicable: bool,
@@ -83,20 +83,42 @@ pub(crate) struct View {
     pub(crate) startup_enabled: bool,
     pub(crate) startup_valid: bool,
     /// Selection applied on battery while this preset is in use on AC.
-    pub(crate) battery: Option<omen_core::battery::Selection>,
+    pub(crate) battery: Option<glph_core::battery::Selection>,
 }
 fn load(id: Option<&str>) -> Result<View, String> {
     let store = ProfileStore::user_data()?;
     let selected = id.map(|id| store.load(id)).transpose()?;
-    let mut controller = Controller::new(true, None)?;
+    let selected_uuid = selected
+        .as_ref()
+        .and_then(|p| p.binding.nvidia_uuid.as_deref());
+    let selected_needs_nvidia = selected
+        .as_ref()
+        .is_some_and(|p| p.settings.iter().any(|s| s.feature.needs_nvidia()));
+    let dgpu_asleep = glph_platform::nvidia_gpu_awake() == Some(false);
+    // D3cold-safe & non-NVIDIA/multi-GPU-safe: never wake a sleeping dGPU unless
+    // the selected preset explicitly needs NVIDIA controls, and fall back to a
+    // non-NVIDIA controller instead of failing the entire Presets view.
+    let (mut controller, curve) = if dgpu_asleep && !selected_needs_nvidia {
+        (
+            Controller::new(false, None)?,
+            Err("Discrete NVIDIA GPU is asleep (D3cold); wake GPU or select an NVIDIA preset to edit its V/F curve".into()),
+        )
+    } else {
+        match Controller::new(true, selected_uuid) {
+            Ok(mut c) => {
+                let curve = c.gpu_curve();
+                (c, curve)
+            }
+            Err(gpu_err) => (Controller::new(false, None)?, Err(gpu_err)),
+        }
+    };
     let inventory = controller.inventory().clone();
     let binding = controller.context()?.binding;
     // Automatically discover safe system/Windows/BIOS defaults and, on a clean
     // boot before any control ran, volatile SMU limits as well.
     let defaults_record =
-        omen_platform::discover_passive_defaults(&inventory, &store, &mut controller);
+        glph_platform::discover_passive_defaults(&inventory, &store, &mut controller);
     let defaults = defaults_record.map();
-    let curve = controller.gpu_curve();
     let removed_options = selected.as_ref().map_or(0, |p| {
         p.settings
             .iter()
@@ -105,7 +127,7 @@ fn load(id: Option<&str>) -> Result<View, String> {
     });
     let parts = selected
         .as_ref()
-        .map(omen_core::fan_profile::split)
+        .map(glph_core::fan_profile::split)
         .transpose();
     let plan = parts
         .as_ref()
@@ -121,13 +143,13 @@ fn load(id: Option<&str>) -> Result<View, String> {
     let startup_valid = startup_enabled
         && store.startup_profile().is_ok_and(|p| {
             p.as_ref()
-                .is_some_and(|p| omen_platform::verify_startup_profile(p).is_ok())
+                .is_some_and(|p| glph_platform::verify_startup_profile(p).is_ok())
         });
     // A new preset starts with the older global setting, if any.
     let battery = store.battery_selection_for(
         selected
             .as_ref()
-            .map(|p| omen_core::battery::Selection::Preset(p.id.clone()))
+            .map(|p| glph_core::battery::Selection::Preset(p.id.clone()))
             .as_ref(),
     );
     Ok(View {
@@ -160,7 +182,7 @@ pub(crate) struct SaveData {
     pub(crate) startup: Option<bool>,
     /// Battery behaviour chosen in the draft: `None` leaves it unchanged,
     /// `Some(None)` turns the automatic change off for this preset.
-    pub(crate) battery: Option<Option<omen_core::battery::Selection>>,
+    pub(crate) battery: Option<Option<glph_core::battery::Selection>>,
 }
 pub(crate) enum Request {
     List,
@@ -177,7 +199,7 @@ pub(crate) enum Update {
         Result<
             (
                 Vec<PerformanceProfile>,
-                Option<omen_core::battery::Selection>,
+                Option<glph_core::battery::Selection>,
                 bool,
             ),
             String,
@@ -219,10 +241,42 @@ pub(crate) fn worker(
                 }
                 Request::Save(data) => {
                     let store = ProfileStore::user_data()?;
-                    let mut profile = if let Some(base) = &data.baseline {
-                        preset::merge(base, &store.load(&base.id)?, &data.name, &data.edits)?
+                    let edit_adds_nvidia = data
+                        .edits
+                        .iter()
+                        .any(|(feature, value)| value.is_some() && feature.needs_nvidia());
+                    let base_missing_nvidia = data.baseline.as_ref().is_none_or(|p| {
+                        p.binding.nvidia_uuid.is_none()
+                            || p.binding.nvidia_driver.is_none()
+                            || p.binding.nvidia_vbios.is_none()
+                    });
+                    let live_gpu_binding = if edit_adds_nvidia && base_missing_nvidia {
+                        if data.binding.nvidia_uuid.is_some()
+                            && data.binding.nvidia_driver.is_some()
+                            && data.binding.nvidia_vbios.is_some()
+                        {
+                            Some(data.binding.clone())
+                        } else {
+                            // `load()` avoids waking a sleeping (D3cold) discrete GPU
+                            // for CPU-only presets; query live NVML on demand once the
+                            // user explicitly adds an NVIDIA setting.
+                            Controller::new(true, None)
+                                .and_then(|mut c| c.context().map(|ctx| ctx.binding))
+                                .ok()
+                        }
                     } else {
-                        let settings = data
+                        None
+                    };
+                    let mut profile = if let Some(base) = &data.baseline {
+                        preset::merge_with_binding(
+                            base,
+                            &store.load(&base.id)?,
+                            &data.name,
+                            &data.edits,
+                            live_gpu_binding.as_ref(),
+                        )?
+                    } else {
+                        let settings: Vec<Setting> = data
                             .edits
                             .iter()
                             .filter_map(|(feature, value)| {
@@ -232,35 +286,28 @@ pub(crate) fn worker(
                                 })
                             })
                             .collect();
+                        let binding = live_gpu_binding
+                            .unwrap_or_else(|| data.binding.clone())
+                            .for_settings(&settings);
                         PerformanceProfile {
                             schema: PROFILE_SCHEMA,
                             id: format!("preset-{}", ui::token()),
                             name: data.name.clone(),
-                            binding: data.binding.clone(),
+                            binding,
                             settings,
                         }
                     };
-                    if data
-                        .baseline
-                        .as_ref()
-                        .is_some_and(|p| p.binding.nvidia_uuid.is_none())
-                        && profile.settings.iter().any(|s| s.feature.needs_nvidia())
-                    {
-                        profile.binding.nvidia_uuid = data.binding.nvidia_uuid.clone();
-                        profile.binding.nvidia_driver = data.binding.nvidia_driver.clone();
-                        profile.binding.nvidia_vbios = data.binding.nvidia_vbios.clone();
-                    }
                     profile.binding = profile.binding.for_settings(&profile.settings);
                     let current_startup = store.startup()?;
                     let enable = data.startup.unwrap_or(
                         current_startup.enabled
                             && current_startup.profile_id.as_deref() == Some(profile.id.as_str()),
                     );
-                    omen_core::fan_profile::startup_allowed(&profile, enable)?;
+                    glph_core::fan_profile::startup_allowed(&profile, enable)?;
                     store.save(&profile)?;
                     if let Some(battery) = &data.battery {
                         // Choosing the battery-optimised template creates it.
-                        if matches!(battery, Some(omen_core::battery::Selection::Preset(id)) if id == crate::battery_preset::ID)
+                        if matches!(battery, Some(glph_core::battery::Selection::Preset(id)) if id == crate::battery_preset::ID)
                         {
                             crate::battery_preset::ensure(&store)?;
                         }
@@ -271,7 +318,7 @@ pub(crate) fn worker(
                     // October 2026).
                     let startup = data.startup.or_else(|| {
                         let selection = store.startup().ok()?;
-                        let digest = omen_platform::profile_store::profile_digest(&profile).ok();
+                        let digest = glph_platform::profile_store::profile_digest(&profile).ok();
                         (selection.enabled
                             && selection.profile_id.as_deref() == Some(profile.id.as_str())
                             && selection.profile_digest != digest)
@@ -281,16 +328,11 @@ pub(crate) fn worker(
                     // preset, then enable it, with the existing approved commands.
                     let message = match startup {
                         Some(true) => {
-                            let mut controller = Controller::new(true, None)?;
+                            let direct = glph_core::fan_profile::direct_part(&profile)?;
+                            let mut controller = Controller::for_profile(&direct)?;
                             // The preset is already saved: any later failure is
                             // reported with the reloaded view, never as a lost save.
-                            if !transaction::plan(
-                                &omen_core::fan_profile::direct_part(&profile)?,
-                                &mut controller,
-                                true,
-                            )
-                            .applicable
-                            {
+                            if !transaction::plan(&direct, &mut controller, true).applicable {
                                 format!("{} {}", t("preset.saved"), t("preset.startup_blocked"))
                             } else {
                                 match elevation::run_serial(Some(&profile.id), Action::Replace) {
@@ -351,10 +393,10 @@ pub(crate) fn worker(
                     let message = if enabled {
                         // Not applied in this exact revision yet: apply it first.
                         let store = ProfileStore::user_data()?;
-                        omen_core::fan_profile::startup_allowed(&store.load(&id)?, true)?;
+                        glph_core::fan_profile::startup_allowed(&store.load(&id)?, true)?;
                         let record = if store.startup_eligibility(&id).is_err() {
-                            let mut controller = Controller::new(true, None)?;
-                            let direct = omen_core::fan_profile::direct_part(&store.load(&id)?)?;
+                            let direct = glph_core::fan_profile::direct_part(&store.load(&id)?)?;
+                            let mut controller = Controller::for_profile(&direct)?;
                             if !transaction::plan(&direct, &mut controller, true).applicable {
                                 return Err(t("preset.startup_blocked").into());
                             }
@@ -1975,7 +2017,7 @@ fn run_window(
         return Err(t("error.preview_size").into());
     }
     if let Some(id) = &id {
-        omen_core::profiles::validate_id(id)?;
+        glph_core::profiles::validate_id(id)?;
     }
     let (tx, requests) = mpsc::channel();
     let (updates, rx) = mpsc::channel();

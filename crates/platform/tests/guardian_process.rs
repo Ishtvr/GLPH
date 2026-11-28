@@ -12,7 +12,7 @@ fn main() {
 }
 #[cfg(windows)]
 mod fixture {
-    use omen_core::{
+    use glph_core::{
         cooling_override::{
             Acknowledgement, Checkpoint, FORCED_MAXIMUM, HelperIdentity, Mode,
             Phase as CoolingPhase, RecoveryReadiness, RestoreAction,
@@ -23,7 +23,7 @@ mod fixture {
             Subject,
         },
     };
-    use omen_platform::guardian::{self, GuardianProcess, Outcome, ParentProcess, Request, Target};
+    use glph_platform::guardian::{self, GuardianProcess, Outcome, ParentProcess, Request, Target};
     use serde::{Deserialize, Serialize};
     use std::{
         fs,
@@ -175,7 +175,7 @@ mod fixture {
             save(&root.join("preference.json"), &original)?;
         }
         let current: Vec<u8> = read(&root.join("preference.json"))?;
-        let mode = omen_core::cooling_override::preference_mode(Some(&current))?;
+        let mode = glph_core::cooling_override::preference_mode(Some(&current))?;
         record.confirm_restored(
             owner,
             &identity(),
@@ -245,7 +245,7 @@ mod fixture {
         guardian::write_frame(&mut std::io::stdout(), &ready)?;
         if bad {
             let began = Instant::now();
-            while guardian::link_state(&input) == omen_core::guardian::LinkState::Open
+            while guardian::link_state(&input) == glph_core::guardian::LinkState::Open
                 && began.elapsed() < Duration::from_secs(3)
             {
                 std::thread::sleep(Duration::from_millis(10));
@@ -313,7 +313,7 @@ mod fixture {
         } else {
             None
         };
-        let owner = omen_platform::hp_control::current_owner_identity()?;
+        let owner = glph_platform::hp_control::current_owner_identity()?;
         let request = Request {
             schema: 1,
             owner: owner.clone(),

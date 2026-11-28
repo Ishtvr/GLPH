@@ -5,9 +5,9 @@ param([ValidateSet('Install','Inspect','Remove')][string]$Mode = 'Install',[stri
 $ErrorActionPreference = 'Stop'
 $taskIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $taskSid = $taskIdentity.User.Value
-$taskName = 'OmenHubPP-Profile-' + $taskSid
-$taskInstallRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramFiles 'OmenHubPlusPlus'))
-$taskBinary = Join-Path $taskInstallRoot 'Omen Hub++.exe'
+$taskName = 'GLPH-Profile-' + $taskSid
+$taskInstallRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramFiles 'GLPH'))
+$taskBinary = Join-Path $taskInstallRoot 'glph.exe'
 $taskReceipt = Join-Path $taskInstallRoot 'installation.json'
 $taskApproval = Join-Path $taskInstallRoot ('startup-authorized-' + $taskSid + '.json')
 $taskExisting = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -37,12 +37,12 @@ if (-not ([Security.Principal.WindowsPrincipal]::new($taskIdentity)).IsInRole([S
 }
 # A pending coupled recovery must keep both protected binaries and tasks intact.
 # Serialize against the native qualification owner before any installer action.
-$recoveryGate = [Threading.Mutex]::new($false, 'Global\OmenHubPP.HpControllerOwner')
+$recoveryGate = [Threading.Mutex]::new($false, 'Global\GLPH.HpControllerOwner')
 $recoveryGateOwned = $false
 try {
     try { $recoveryGateOwned = $recoveryGate.WaitOne(0) }
     catch [Threading.AbandonedMutexException] { $recoveryGateOwned = $true }
-    if (-not $recoveryGateOwned) { throw 'An Omen Hub++ controller session is active; installation/removal was blocked.' }
+    if (-not $recoveryGateOwned) { throw 'A GLPH controller session is active; installation/removal was blocked.' }
     foreach ($recoveryFile in @('controller-ownership.json','controller-cooling.json')) {
         $recoveryPath = Join-Path $taskInstallRoot $recoveryFile
         if (Test-Path -LiteralPath $recoveryPath) {
@@ -71,7 +71,15 @@ if ($Mode -eq 'Remove') {
     [pscustomobject]@{ Removed = $true; TaskName = $taskName; ProfilesRetained = $true } | ConvertTo-Json
     return
 }
-$taskSource = if([string]::IsNullOrWhiteSpace($SourceBinary)){Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\Omen Hub++.exe'}else{[IO.Path]::GetFullPath($SourceBinary)}
+$taskSource = if ([string]::IsNullOrWhiteSpace($SourceBinary)) {
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        throw 'SourceBinary must be specified when install-startup.ps1 runs inline.'
+    }
+    $rel = Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\glph.exe'
+    if (Test-Path -LiteralPath $rel -PathType Leaf) { $rel } else { Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\glph.exe' }
+} else {
+    [IO.Path]::GetFullPath($SourceBinary)
+}
 if (-not (Test-Path -LiteralPath $taskSource -PathType Leaf)) { throw 'Build the release executable before installing startup.' }
 $taskSourceHash = (Get-FileHash -LiteralPath $taskSource -Algorithm SHA256).Hash
 # The build the existing sign-in approval belongs to (see the carry-over below).
@@ -110,7 +118,7 @@ $taskPrincipal = New-ScheduledTaskPrincipal -UserId $taskSid -LogonType Interact
 $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
 $taskRegistered = $false
 try {
-    Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Description 'Omen Hub++: apply only the previously verified, selected profile after user logon.' -Force | Out-Null
+    Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $taskTrigger -Principal $taskPrincipal -Settings $taskSettings -Description 'GLPH: apply only the previously verified, selected profile after user logon.' -Force | Out-Null
     $taskRegistered = $true
     $taskScheduler = New-Object -ComObject 'Schedule.Service'
     $taskScheduler.Connect()

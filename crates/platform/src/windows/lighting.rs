@@ -2,7 +2,7 @@
 //! Reuse the qualified RGB and 64/E4 contracts, never an arbitrary BIOS writer.
 use super::{ControlLease, Controller, RestoreState};
 use crate::profile_store::{ProfileStore, profile_digest};
-use omen_core::{
+use glph_core::{
     features::Feature,
     keyboard::KeyboardState,
     profiles::{Choice, PROFILE_SCHEMA, PerformanceProfile, Setting, Value},

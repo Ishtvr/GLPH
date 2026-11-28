@@ -53,12 +53,22 @@ pub fn spawn() {
         return;
     }
     thread::spawn(|| {
+        crate::runtime_priority::configure_background_thread();
         let mut failures = Failures::default();
         let mut missing_shown = false;
         loop {
-            let failed = if omen_platform::fan_service_present() {
+            // When the dedicated Session-0 `PerformanceHubService` is running,
+            // it owns cooling cleanly — skip legacy task verification (avoiding
+            // 30-second SHA-256 disk hashing and Task Scheduler COM RPCs).
+            if glph_platform::service_client::is_service_running_fast() {
                 missing_shown = false;
-                match omen_platform::ensure_fan_service_running() {
+                failures.record(false);
+                thread::sleep(INTERVAL);
+                continue;
+            }
+            let failed = if glph_platform::fan_service_present() {
+                missing_shown = false;
+                match glph_platform::ensure_fan_service_running() {
                     Ok(started) => {
                         if started {
                             record("started", None);
@@ -90,7 +100,7 @@ pub fn spawn() {
 
 /// The last start or failure, for diagnosis only.
 fn record(event: &str, error: Option<&str>) {
-    let Ok(store) = omen_platform::profile_store::ProfileStore::user_data() else {
+    let Ok(store) = glph_platform::profile_store::ProfileStore::user_data() else {
         return;
     };
     let now = SystemTime::now()

@@ -39,13 +39,85 @@ pub const UNLEASHED_TDC_MA: i64 = 108_000;
 pub const UNLEASHED_EDC_MA: i64 = 160_000;
 pub const STOCK_TCTL_C: i64 = 100;
 /// Hard-coded GPU temperature target in the Hub's TGP/PPAB write.
-const GPS_MAX_TEMPERATURE: u8 = 87;
+pub const GPS_MIN_TEMPERATURE: u8 = 65;
+pub const GPS_MAX_TEMPERATURE: u8 = 87;
+/// Original HP OMEN Gaming Hub Unleashed CPU PL1 slider range (watts).
+pub const UNLEASHED_PL1_MIN_W: u8 = 45;
+pub const UNLEASHED_PL1_MAX_W: u8 = 95;
 /// `GpuDState.D1`, the only state the Hub writes outside IR-overheat handling.
 const D1: u8 = 1;
 /// Upper end of the 8E35 TPP range; the Hub's Unleashed default.
 pub const SHARED_BUDGET_MAX_W: u8 = 72;
 /// Lowest firmware default we accept as a plausible restore value.
-const SHARED_BUDGET_MIN_W: u8 = 30;
+pub const SHARED_BUDGET_MIN_W: u8 = 30;
+
+/// Original HP OMEN Gaming Hub Unleashed-mode controls (strictly limited to
+/// verified HP BIOS WMI `0x1A` / `0x22` / `0x29` payloads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HpUnleashedOptions {
+    pub cpu_pl1_w: u8,
+    pub shared_budget_w: u8,
+    pub custom_tgp: bool,
+    pub dynamic_boost: bool,
+    pub gpu_max_temp_c: u8,
+}
+
+impl Default for HpUnleashedOptions {
+    fn default() -> Self {
+        Self {
+            cpu_pl1_w: UNLEASHED_PL1_W,
+            shared_budget_w: SHARED_BUDGET_MAX_W,
+            custom_tgp: true,
+            dynamic_boost: true,
+            gpu_max_temp_c: GPS_MAX_TEMPERATURE,
+        }
+    }
+}
+
+impl HpUnleashedOptions {
+    pub fn validate(self) -> Result<(), String> {
+        if !(UNLEASHED_PL1_MIN_W..=UNLEASHED_PL1_MAX_W).contains(&self.cpu_pl1_w) {
+            return Err(format!(
+                "HP Unleashed CPU PL1 {} W is outside {UNLEASHED_PL1_MIN_W}..={UNLEASHED_PL1_MAX_W} W",
+                self.cpu_pl1_w
+            ));
+        }
+        if !(SHARED_BUDGET_MIN_W..=SHARED_BUDGET_MAX_W).contains(&self.shared_budget_w) {
+            return Err(format!(
+                "HP Unleashed shared budget {} W is outside {SHARED_BUDGET_MIN_W}..={SHARED_BUDGET_MAX_W} W",
+                self.shared_budget_w
+            ));
+        }
+        if !(GPS_MIN_TEMPERATURE..=GPS_MAX_TEMPERATURE).contains(&self.gpu_max_temp_c) {
+            return Err(format!(
+                "HP Unleashed GPU max temperature {} °C is outside {GPS_MIN_TEMPERATURE}..={GPS_MAX_TEMPERATURE} °C",
+                self.gpu_max_temp_c
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Builds the exact HP WMI Unleashed `ModePlan` for user-chosen original OMEN
+/// Hub Unleashed slider values.
+pub fn plan_unleashed(opts: HpUnleashedOptions) -> Result<ModePlan, String> {
+    opts.validate()?;
+    Ok(ModePlan {
+        mode: HpMode::Unleashed,
+        thermal: thermal_payload(HpMode::Unleashed),
+        gpu_power: [
+            u8::from(opts.custom_tgp),
+            u8::from(opts.dynamic_boost),
+            D1,
+            opts.gpu_max_temp_c,
+        ],
+        shared_budget: [0xFF, 0xFF, 0xFF, opts.shared_budget_w],
+        cpu_power: [opts.cpu_pl1_w, opts.cpu_pl1_w, 0xFF, 0xFF],
+        expect_custom_tgp: opts.custom_tgp,
+        expect_ppab: opts.dynamic_boost,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -2,27 +2,221 @@ export global Theme {
     pure callback tr(string) -> string;
     in property <bool> dark: true;
     in property <bool> reduce-motion: false;
-    in property <color> canvas: #202127;
-    in property <color> surface: #27282E;
-    in property <color> control: #2E2F34;
-    in property <color> hover: #37383E;
-    in property <color> line: #424349;
+    in property <color> canvas: #18191F;
+    in property <color> surface: #21222A;
+    in property <color> control: #292B34;
+    in property <color> hover: #333540;
+    in property <color> line: #3B3D48;
     in property <color> ink: #F2F3F5;
-    in property <color> muted: #B3B4B7;
-    in property <color> quiet: #74757A;
+    in property <color> muted: #AFB2BC;
+    in property <color> quiet: #727581;
     in property <color> accent: #7C87F8;
     in property <color> on-accent: #000000;
+
+    // Dedicated Secondary / Navigation Chrome channel (auto-contrast-safe)
+    in property <color> nav: #22242D;
+    in property <bool> nav-dark: true;
+    in property <color> nav-ink: #F2F3F5;
+    in property <color> nav-muted: #A9ADB9;
+    in property <color> nav-quiet: #737784;
+    in property <color> nav-line: #3C3F4D;
+    in property <color> nav-hover: #313440;
+    in property <color> nav-accent: #7C87F8;
+
+    // Per-channel visual Look:
+    // 0=Standard, 1=Metallic, 2=Glass, 3=Glossy, 4=Gradient,
+    // 5=Soft, 6=Neon, 7=Matte, 8=Contrast.
+    out property <int> look-gradient-index: 4;
+    in property <int> background-look: 0;
+    in property <int> nav-background-look: 0;
+    in property <int> foreground-look: 0;
+    in property <int> accent-look: 0;
+
+    in property <color> canvas-secondary: #14213D;
+    in property <color> nav-secondary: #1B2845;
+    in property <color> ink-secondary: #A8B0C2;
+    in property <color> accent-secondary: #A855F7;
+
+    // Precomputed perceptual material stops from Rust (immune to #000000 * brighter == 0)
+    in property <color> canvas-hi: #18191F;
+    in property <color> canvas-mid: #18191F;
+    in property <color> canvas-lo: #18191F;
+    in property <color> surface-hi: #21222A;
+    in property <color> surface-mid: #21222A;
+    in property <color> surface-lo: #21222A;
+    in property <color> control-hi: #292B34;
+    in property <color> control-mid: #292B34;
+    in property <color> control-lo: #292B34;
+    in property <color> nav-hi: #22242D;
+    in property <color> nav-mid: #22242D;
+    in property <color> nav-lo: #22242D;
+    in property <color> accent-hi: #7C87F8;
+    in property <color> accent-mid: #7C87F8;
+    in property <color> accent-lo: #7C87F8;
+    in property <color> rim-hi: #3B3D48;
+    in property <color> rim-lo: #3B3D48;
+    in property <color> nav-rim-hi: #3C3F4D;
+    in property <color> nav-rim-lo: #3C3F4D;
+
+    // Procedural optical surface textures (SDF-masked in Rust so ZERO pixels bleed
+    // past rounded borders in either FemtoVG or Software Renderer!).
+    in property <image> nav-texture;
+    in property <image> canvas-texture;
+    in property <image> surface-texture;
+
+    out property <bool> has-nav-texture:
+        nav-background-look == 1 || nav-background-look == 2 || nav-background-look == 3
+        || nav-background-look == 4 || nav-background-look == 6 || nav-background-look == 7;
+    out property <bool> has-canvas-texture:
+        background-look == 1 || background-look == 2 || background-look == 3
+        || background-look == 4 || background-look == 6 || background-look == 7;
+    out property <bool> has-surface-texture:
+        background-look == 1 || background-look == 2 || background-look == 3
+        || background-look == 4 || background-look == 6 || background-look == 7;
+
+    // Harmonized Telemetry chart tokens (guaranteed readable on Dark, OLED Black, and Light)
+    in property <color> chart-cpu: #7C87F8;
+    in property <color> chart-gpu: #F2A66B;
+    in property <color> chart-grid: #30323D;
+
+    // IMPORTANT Slint rendering & color-math invariants:
+    // 1. `a.mix(b, factor)` computes `a * factor + b * (1 - factor)`.
+    // 2. EVERY rounded Rectangle fill & border MUST stay a solid `<color>` (NEVER
+    //    `@linear-gradient`), because Slint's software renderer draws linear gradients
+    //    as unclipped sharp squares behind rounded borders. Optical depth & reflections
+    //    come from the SDF-masked `nav-texture` / `canvas-texture` / `surface-texture`.
+
+    // Outer chrome base color (topped by full-bleed `nav-texture` in AppWindow)
+    out property <color> nav-fill: nav;
+
+    // Selected navigation item: restrained lifted glass/chrome fill + crisp accent rim
+    out property <color> nav-selected-fill:
+        nav-background-look == 2 ? nav-hover.mix(#FFF4E4, nav-dark ? 0.88 : 0.62).with-alpha(nav-dark ? 0.74 : 0.86)
+      : nav-background-look == 3 ? nav-hover.mix(#06080E, nav-dark ? 0.78 : 0.96).with-alpha(nav-dark ? 0.78 : 0.88)
+      : nav-background-look == 6 || accent-look == 6 ? nav-hover.mix(nav-accent, nav-dark ? 0.80 : 0.86)
+      : nav-hover.mix(nav-accent, nav-dark ? 0.86 : 0.90);
+
+    out property <color> nav-selected-border:
+        accent-look == 1 ? accent-hi.mix(nav-accent, 0.45)
+      : accent-look == 2 ? nav-accent.mix(#FFFFFF, nav-dark ? 0.76 : 0.62).with-alpha(0.86)
+      : accent-look == 3 ? nav-accent.mix(#FFFFFF, nav-dark ? 0.72 : 0.58).with-alpha(0.90)
+      : accent-look == 6 || nav-background-look == 6 ? nav-accent
+      : nav-accent.with-alpha(nav-dark ? 0.80 : 0.88);
+
+    // Inset rounded canvas outer border (separates outer chrome from inset content pane)
+    out property <color> canvas-frame-border:
+        background-look == 1 ? rim-hi.mix(accent, 0.78)
+      : background-look == 2 ? (dark ? #FFF3E042 : #FFF8EECC)
+      : background-look == 3 ? (dark ? #FFFFFF34 : #FFFFFFE0)
+      : background-look == 6 ? accent.with-alpha(0.70)
+      : background-look == 8 ? line
+      : line.with-alpha(dark ? 0.85 : 0.90);
+
+    // Main inset content canvas solid base (topped by SDF-masked `canvas-texture`)
+    out property <color> canvas-fill: canvas;
+
+    // Cards & elevated containers (solid base + translucent glass refraction in Glass/Glossy)
+    out property <color> surface-fill:
+        background-look == 2 ? surface.mix(#FFF1DC, dark ? 0.88 : 0.60).with-alpha(dark ? 0.76 : 0.86)
+      : background-look == 3 ? surface.mix(#05070D, dark ? 0.76 : 0.95).with-alpha(dark ? 0.80 : 0.90)
+      : background-look == 6 ? surface.mix(accent, dark ? 0.96 : 0.97)
+      : surface;
+
+    out property <color> surface-border:
+        background-look == 1 ? rim-hi.mix(accent, 0.78)
+      : background-look == 2 ? (dark ? #FFF3E044 : #FFF9F0D8)
+      : background-look == 3 ? (dark ? #FFFFFF32 : #FFFFFFE2)
+      : background-look == 6 ? accent.with-alpha(0.68)
+      : line;
+
+    // Subtle 1px inner top Fresnel catch-light (solid color, cleanly inset inside corners)
+    out property <color> surface-top-sheen:
+        background-look == 1 ? (dark ? #FFFFFF34 : #FFFFFF99)
+      : background-look == 2 ? (dark ? #FFF6E854 : #FFFDF8E0)
+      : background-look == 3 ? (dark ? #FFFFFF52 : #FFFFFFE8)
+      : background-look == 6 ? accent.with-alpha(0.55)
+      : transparent;
+
+    // Interactive controls: sleek, restrained solid rounded surfaces (zero Vista plastic bars!)
+    out property <color> control-fill:
+        background-look == 1 ? control.mix(control-hi, 0.80)
+      : background-look == 2 ? control.mix(#FFF1DC, dark ? 0.86 : 0.58).with-alpha(dark ? 0.74 : 0.86)
+      : background-look == 3 ? control.mix(#06080E, dark ? 0.72 : 0.96).with-alpha(dark ? 0.82 : 0.90)
+      : background-look == 6 ? control.mix(accent, dark ? 0.94 : 0.96)
+      : control;
+
+    out property <color> control-hover-fill:
+        background-look == 1 ? hover.mix(control-hi, 0.72)
+      : background-look == 2 ? hover.mix(#FFF5E6, dark ? 0.80 : 0.52).with-alpha(dark ? 0.84 : 0.92)
+      : background-look == 3 ? hover.mix(#FFFFFF, dark ? 0.90 : 0.75).with-alpha(dark ? 0.88 : 0.94)
+      : background-look == 6 ? hover.mix(accent, dark ? 0.84 : 0.90)
+      : hover;
+
+    // Tactile pointer-down pressed fill (Emil Kowalski / Apple instant press feedback)
+    out property <color> control-pressed-fill:
+        dark ? control-fill.mix(#000000, 0.76) : control-fill.mix(#000000, 0.92);
+
+    out property <color> control-border:
+        background-look == 1 ? rim-hi.mix(accent, 0.80)
+      : background-look == 2 ? (dark ? #FFF3E03C : #FFF9F0CC)
+      : background-look == 3 ? (dark ? #FFFFFF2E : #FFFFFFD8)
+      : background-look == 6 ? accent.with-alpha(0.56)
+      : line;
+
+    // Popups, dialogs, dropdown menus (higher opacity for crisp legibility over content)
+    out property <color> popup-fill:
+        background-look == 2 ? surface.mix(#FFF1DC, dark ? 0.88 : 0.62).with-alpha(dark ? 0.92 : 0.96)
+      : background-look == 3 ? surface.mix(#05070D, dark ? 0.78 : 0.95).with-alpha(dark ? 0.94 : 0.97)
+      : surface;
+
+    out property <color> popup-border: surface-border;
+
+    // Primary Accent fills & borders (solid rounded colors — zero corner bleed)
+    out property <color> accent-fill:
+        accent-look == 1 ? accent.mix(accent-hi, 0.76)
+      : accent-look == 2 ? accent.mix(#FFFFFF, 0.90).with-alpha(0.92)
+      : accent-look == 3 ? accent.mix(#FFFFFF, 0.92)
+      : accent-look == 4 ? accent.mix(accent-secondary, 0.72)
+      : accent-look == 6 ? accent-hi.mix(accent, 0.45)
+      : accent;
+
+    out property <color> accent-hover-fill:
+        accent-look == 6 ? accent-hi
+      : accent-fill.mix(#FFFFFF, dark ? 0.88 : 0.92);
+
+    out property <color> accent-pressed-fill:
+        accent-fill.mix(#000000, 0.86);
+
+    out property <color> accent-border:
+        accent-look == 1 ? accent-hi
+      : accent-look == 2 ? accent.mix(#FFFFFF, 0.68)
+      : accent-look == 3 ? accent.mix(#FFFFFF, 0.64)
+      : accent-look == 6 ? accent-hi
+      : accent;
+
+    // Foreground heading fill — crisp solid color (no gradient text)
+    out property <color> ink-fill: ink;
+
+    // Telemetry plot recessed fill (translucent in Glass/Glossy so optical reflections show through)
+    out property <color> chart-plot-fill:
+        background-look == 2 ? canvas.with-alpha(dark ? 0.54 : 0.68)
+      : background-look == 3 ? canvas.mix(#000000, dark ? 0.72 : 0.96).with-alpha(dark ? 0.68 : 0.82)
+      : background-look == 6 ? canvas.mix(accent, 0.95)
+      : canvas.mix(surface, 0.62);
+
+    // Modal backdrop scrim (theme-aware)
+    out property <color> scrim: dark ? #000000A6 : #10131C6E;
+
+    // Card border width (stronger in High Contrast)
+    out property <length> card-border-width: background-look == 8 ? 1.5px : 1px;
+
     out property <color> good: dark ? #71D5A6 : #147347;
     out property <color> warning: dark ? #E5C18A : #765000;
     out property <color> error: dark ? #F3A1AF : #A21635;
     out property <length> control-height: 36px;
     out property <length> field-width: 276px;
-    // Number fields carry their unit inside the frame and keep the common
-    // field width, so every editor column has the same left and right edge.
     out property <length> number-width: self.field-width;
-    // A settings row: the control height plus equal space above and below.
     out property <length> row-height: 48px;
-    // Slot of the round info button; also kept free in rows without one.
     out property <length> info-width: 28px;
     out property <length> action-width: 128px;
     out property <length> workspace-width: 1280px;

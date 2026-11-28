@@ -3,7 +3,7 @@ use crate::{
     i18n::{t, tf},
     theme::{self, Theme},
 };
-use omen_core::{CpuHardwareStatus, Snapshot};
+use glph_core::{CpuHardwareStatus, Snapshot};
 use std::ptr;
 use windows_sys::Win32::{
     Foundation::*, Graphics::Gdi::*, System::LibraryLoader::GetModuleHandleW,
@@ -125,7 +125,7 @@ pub unsafe fn create(hwnd: HWND, th: &Theme) {
         };
         let label =
             |id, value, font, panel, muted| control(id, "STATIC", value, 0, font, panel, muted);
-        label(120, "PerformanceHub", th.title, false, false);
+        label(120, "GLPH", th.title, false, false);
         label(121, t("dash.subtitle"), th.body, false, true);
         label(122, t("dash.power_reading"), th.body, false, true);
         for (id, value, font, panel, muted) in [
@@ -143,13 +143,6 @@ pub unsafe fn create(hwnd: HWND, th: &Theme) {
             (148, t("dash.cpu_temperature"), th.body, true, true),
             (142, t("common.unavailable"), th.body, true, false),
             (144, t("dash.load_measuring"), th.body, true, false),
-            (
-                145,
-                t("dash.windows_clock_unavailable"),
-                th.small,
-                true,
-                true,
-            ),
             (146, "", th.small, true, true),
             (150, t("dash.controls"), th.heading, false, false),
             (160, t("dash.system"), th.heading, false, false),
@@ -327,8 +320,7 @@ pub unsafe fn layout(hwnd: HWND) {
         boxes.extend([
             (136, [margin + 24, 290, content, 24]),
             (144, [right + 24, 290, content, 24]),
-            (145, [right + 24, 318, content, 22]),
-            (146, [right + 24, 344, content, 26]),
+            (146, [right + 24, 322, content, 26]),
             (150, [28, PANEL_BOTTOM + 24, width - 640, 30]),
         ]);
         // Fan and graphics switches, right-aligned on the Controls heading
@@ -487,16 +479,6 @@ pub unsafe fn update(hwnd: HWND, th: &Theme, s: &Snapshot) {
             text(hwnd, 141, t("dash.measuring"));
         }
         text(hwnd, 144, &cpu_load_line(s));
-        text(
-            hwnd,
-            145,
-            &tf(
-                "dash.windows_clock",
-                &[&cpu
-                    .and_then(|c| c.windows_clock_mhz)
-                    .map_or(t("common.unavailable").into(), |v| format!("{v} MHz"))],
-            ),
-        );
         theme::error(
             GetDlgItem(hwnd, 146),
             matches!(s.cpu_hardware_status, CpuHardwareStatus::Error(_)),

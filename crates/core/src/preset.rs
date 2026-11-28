@@ -2,7 +2,7 @@
 use crate::{
     features::Feature,
     message::msg,
-    profiles::{PerformanceProfile, Setting, Value},
+    profiles::{DeviceBinding, PerformanceProfile, Setting, Value},
 };
 use std::collections::BTreeSet;
 
@@ -88,6 +88,19 @@ pub fn merge(
     desired_name: &str,
     edits: &[(Feature, Option<Value>)],
 ) -> Result<PerformanceProfile, String> {
+    merge_with_binding(baseline, fresh, desired_name, edits, None)
+}
+
+/// Like [`merge`], but supplies an optional live [`DeviceBinding`] so editing a
+/// previously CPU-only preset to add NVIDIA GPU settings populates the required
+/// GPU identity before validation runs.
+pub fn merge_with_binding(
+    baseline: &PerformanceProfile,
+    fresh: &PerformanceProfile,
+    desired_name: &str,
+    edits: &[(Feature, Option<Value>)],
+    gpu_binding: Option<&DeviceBinding>,
+) -> Result<PerformanceProfile, String> {
     if baseline.id != fresh.id || baseline.binding != fresh.binding {
         return Err(msg("preset.err.binding_changed", &[]));
     }
@@ -167,6 +180,26 @@ pub fn merge(
             setting.validate()?;
             result.settings.push(setting);
         }
+    }
+    let needs_nvidia = result.settings.iter().any(|s| s.feature.needs_nvidia());
+    if needs_nvidia
+        && (result.binding.nvidia_uuid.is_none()
+            || result.binding.nvidia_driver.is_none()
+            || result.binding.nvidia_vbios.is_none())
+        && let Some(gpu) = gpu_binding
+    {
+        if result.binding.nvidia_uuid.is_none() {
+            result.binding.nvidia_uuid = gpu.nvidia_uuid.clone();
+        }
+        if result.binding.nvidia_driver.is_none() {
+            result.binding.nvidia_driver = gpu.nvidia_driver.clone();
+        }
+        if result.binding.nvidia_vbios.is_none() {
+            result.binding.nvidia_vbios = gpu.nvidia_vbios.clone();
+        }
+    }
+    if gpu_binding.is_some() {
+        result.binding = result.binding.for_settings(&result.settings);
     }
     result.validate()?;
     Ok(result)
@@ -324,5 +357,60 @@ mod tests {
         assert!(merge(&base, &fresh, "My rename", &edits).is_err());
         fresh.settings[2].value = Value::Integer(24);
         assert!(merge(&base, &fresh, &base.name, &edits).is_err());
+    }
+
+    #[test]
+    fn cpu_only_preset_accepts_new_nvidia_setting_with_live_gpu_binding() {
+        let cpu_only = PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "mein-preset".into(),
+            name: "Mein Preset".into(),
+            binding: DeviceBinding {
+                manufacturer: "HP".into(),
+                board: "8E35".into(),
+                bios: "F.13".into(),
+                cpu_names: vec!["AMD Ryzen 9 8940HX".into()],
+                nvidia_uuid: None,
+                nvidia_driver: None,
+                nvidia_vbios: None,
+            },
+            settings: vec![Setting {
+                feature: Feature::CpuTemperatureLimitC,
+                value: Value::Integer(95),
+            }],
+        };
+        let live_gpu = DeviceBinding {
+            manufacturer: "HP".into(),
+            board: "8E35".into(),
+            bios: "F.13".into(),
+            cpu_names: vec!["AMD Ryzen 9 8940HX".into()],
+            nvidia_uuid: Some("GPU-3200".into()),
+            nvidia_driver: Some("621.40".into()),
+            nvidia_vbios: Some("98.06.2a.40.da".into()),
+        };
+        let merged = merge_with_binding(
+            &cpu_only,
+            &cpu_only,
+            "Mein Preset",
+            &[(Feature::GpuMaxClockMhz, Some(Value::Integer(2400)))],
+            Some(&live_gpu),
+        )
+        .expect("adding an NVIDIA setting to a CPU-only preset must succeed");
+        assert_eq!(merged.binding.nvidia_uuid.as_deref(), Some("GPU-3200"));
+        assert_eq!(merged.binding.nvidia_driver.as_deref(), Some("621.40"));
+        assert_eq!(
+            merged.binding.nvidia_vbios.as_deref(),
+            Some("98.06.2a.40.da")
+        );
+
+        let stripped = merge_with_binding(
+            &merged,
+            &merged,
+            "Mein Preset",
+            &[(Feature::GpuMaxClockMhz, None)],
+            Some(&live_gpu),
+        )
+        .expect("removing the NVIDIA setting must succeed");
+        assert_eq!(stripped.binding.nvidia_uuid, None);
     }
 }

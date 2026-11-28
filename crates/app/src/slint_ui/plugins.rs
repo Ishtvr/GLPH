@@ -1,11 +1,11 @@
 //! Host-side plugin registry, instant-apply lifecycle, and Slint model sync.
 use super::*;
-use omen_core::plugins::{
-    HP_LIGHTING_PLUGIN_ID, InstalledPlugin, LocalizedText, NavIcon, PLUGIN_API_VERSION,
+use glph_core::plugins::{
+    HP_OMEN_CONTROL_PLUGIN_ID, InstalledPlugin, LocalizedText, NavIcon, PLUGIN_API_VERSION,
     PLUGIN_SCHEMA, PluginCapability, PluginCategory, PluginManifest, PluginRuntime, PluginStatus,
     PluginUiSurface, UiSurfaceKind, VendorFilter,
 };
-use omen_platform::plugin_store::{InstallOutcome, PluginStore};
+use glph_platform::plugin_store::{InstallOutcome, PluginStore};
 use std::{path::PathBuf, time::Duration};
 
 pub(super) struct PluginHostState {
@@ -51,8 +51,8 @@ fn to_row_data(
     let (status_kind, status_text) = match &plugin.status {
         PluginStatus::Active => (0, t("plugins.status_active")),
         PluginStatus::Inactive => (1, t("plugins.status_inactive")),
-        PluginStatus::Incompatible(_) => (2, t("plugins.status_inactive")),
-        PluginStatus::Error(_) => (3, t("plugins.status_inactive")),
+        PluginStatus::Incompatible(_) => (2, t("plugins.status_incompatible")),
+        PluginStatus::Error(_) => (3, t("plugins.status_error")),
     };
     let category_label = plugin
         .manifest
@@ -92,25 +92,27 @@ fn to_row_data(
 }
 
 pub(super) fn ui_test_fixture_plugins() -> Vec<InstalledPlugin> {
-    let lighting_manifest = PluginManifest {
+    let omen_manifest = PluginManifest {
         schema: PLUGIN_SCHEMA,
-        id: HP_LIGHTING_PLUGIN_ID.into(),
+        id: HP_OMEN_CONTROL_PLUGIN_ID.into(),
         name: LocalizedText {
-            de: "HP OMEN Tastaturbeleuchtung".into(),
-            en: "HP OMEN Keyboard Lighting".into(),
+            de: "HP OMEN Steuerung".into(),
+            en: "HP OMEN Control".into(),
         },
         description: LocalizedText {
-            de: "4-Zonen-RGB-Steuerung, Helligkeit und Tasten-Vorschau für HP OMEN Notebooks."
+            de: "4-Zonen-Tastaturbeleuchtung sowie originale HP OMEN Leistungspläne (Quiet, Balanced, Performance & Unleashed)."
                 .into(),
-            en: "4-zone RGB lighting, brightness, and keyboard preview for HP OMEN laptops.".into(),
+            en: "4-zone RGB keyboard lighting and original HP OMEN performance plans (Quiet, Balanced, Performance & Unleashed)."
+                .into(),
         },
         version: "2.0.0".into(),
         api_version: PLUGIN_API_VERSION,
-        author: "PerformanceHub".into(),
+        author: "GLPH".into(),
         category: PluginCategory::Lighting,
         runtime: PluginRuntime::HostSurface,
         capabilities: vec![
             PluginCapability::HardwareHpLighting,
+            PluginCapability::HardwareHpModes,
             PluginCapability::UiSidebarPage,
         ],
         vendor_filter: Some(VendorFilter {
@@ -118,20 +120,20 @@ pub(super) fn ui_test_fixture_plugins() -> Vec<InstalledPlugin> {
             require_hp_wmi: true,
         }),
         ui_surface: PluginUiSurface {
-            kind: UiSurfaceKind::Lighting4Zone,
+            kind: UiSurfaceKind::HpOmenSuite,
             nav_label: LocalizedText {
-                de: "Beleuchtung".into(),
-                en: "Lighting".into(),
+                de: "HP OMEN".into(),
+                en: "HP OMEN".into(),
             },
-            nav_icon: NavIcon::Keyboard,
+            nav_icon: NavIcon::Omen,
             nav_order: 10,
         },
         entry: None,
     };
     vec![InstalledPlugin {
-        id: HP_LIGHTING_PLUGIN_ID.into(),
-        folder_name: HP_LIGHTING_PLUGIN_ID.into(),
-        manifest: Some(lighting_manifest),
+        id: HP_OMEN_CONTROL_PLUGIN_ID.into(),
+        folder_name: HP_OMEN_CONTROL_PLUGIN_ID.into(),
+        manifest: Some(omen_manifest),
         status: PluginStatus::Active,
         enabled: true,
         can_toggle: true,
@@ -146,7 +148,7 @@ impl Host {
         PluginStore::user_data()
     }
 
-    pub(super) fn current_inventory(&self) -> omen_core::Inventory {
+    pub(super) fn current_inventory(&self) -> glph_core::Inventory {
         self.shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -156,11 +158,13 @@ impl Host {
     }
 
     pub(super) fn lighting_plugin_active(&self) -> bool {
-        self.plugins
-            .borrow()
-            .installed
-            .iter()
-            .any(|p| p.status.is_active() && p.surface_kind() == Some(UiSurfaceKind::Lighting4Zone))
+        self.plugins.borrow().installed.iter().any(|p| {
+            p.status.is_active()
+                && matches!(
+                    p.surface_kind(),
+                    Some(UiSurfaceKind::Lighting4Zone | UiSurfaceKind::HpOmenSuite)
+                )
+        })
     }
 
     pub(super) fn teardown_lighting_plugin(&self) {
@@ -180,10 +184,11 @@ impl Host {
             d.set_lighting_dirty(false);
             d.set_lighting_error("".into());
             d.set_lighting_ready(false);
-            if d.get_page() == 3 {
+            if d.get_page() == 3 && matches!(d.get_active_plugin_surface_kind(), 0 | 3) {
                 d.set_page(0);
                 d.set_active_plugin_id("".into());
                 d.set_active_plugin_title("".into());
+                d.set_active_plugin_surface_kind(0);
             }
         }
     }
@@ -223,6 +228,7 @@ impl Host {
                 surface_kind: match p.surface_kind() {
                     Some(UiSurfaceKind::Lighting4Zone) => 0,
                     Some(UiSurfaceKind::SensorBoard) => 1,
+                    Some(UiSurfaceKind::HpOmenSuite) => 3,
                     _ => 2,
                 },
             })
@@ -238,10 +244,28 @@ impl Host {
         d.set_plugins_summary(tf("plugins.summary", &[&total, &active]).into());
 
         if self.test {
-            d.set_plugins_dir(r"%USERPROFILE%\.performance-hub\plugins".into());
+            d.set_plugins_dir(r"%USERPROFILE%\.glph\plugins".into());
         } else if let Ok(store) = self.plugin_store() {
             d.set_plugins_dir(store.plugins_dir().to_string_lossy().as_ref().into());
         }
+    }
+
+    pub(super) fn apply_loaded_plugins(
+        &self,
+        scanned: Vec<InstalledPlugin>,
+        highlight_id: Option<String>,
+    ) {
+        {
+            let mut state = self.plugins.borrow_mut();
+            state.installed = scanned;
+            if let Some(id) = highlight_id {
+                state.highlighted_id = Some(id);
+            }
+        }
+        if !self.lighting_plugin_active() {
+            self.teardown_lighting_plugin();
+        }
+        self.sync_plugin_models();
     }
 
     pub(super) fn load_plugins(&self, highlight_id: Option<String>) {
@@ -257,22 +281,21 @@ impl Host {
             self.sync_plugin_models();
             return;
         }
+        let has_cached_inventory = self
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if !has_cached_inventory {
+            let _ = self.aux.send(Aux::LoadPlugins(highlight_id, true));
+            return;
+        }
         let inv = self.current_inventory();
         let scanned = self
             .plugin_store()
             .map(|store| store.scan(&inv))
             .unwrap_or_default();
-        {
-            let mut state = self.plugins.borrow_mut();
-            state.installed = scanned;
-            if let Some(id) = highlight_id {
-                state.highlighted_id = Some(id);
-            }
-        }
-        if !self.lighting_plugin_active() {
-            self.teardown_lighting_plugin();
-        }
-        self.sync_plugin_models();
+        self.apply_loaded_plugins(scanned, highlight_id);
     }
 
     pub(super) fn arm_plugin_highlight(host: &Rc<Self>, id: String) {
@@ -369,7 +392,7 @@ impl Host {
         let res = self
             .plugin_store()
             .and_then(|store| store.ensure_plugins_dir())
-            .and_then(|dir| omen_platform::open_plugins_folder(&dir));
+            .and_then(|dir| glph_platform::open_plugins_folder(&dir));
         if let Err(e) = res {
             self.status(&crate::i18n::error_message(&e), true);
         }
@@ -471,7 +494,10 @@ impl Host {
         let Some((folder_name, display_name, surface_kind)) = target else {
             return;
         };
-        if surface_kind == Some(UiSurfaceKind::Lighting4Zone) {
+        if matches!(
+            surface_kind,
+            Some(UiSurfaceKind::Lighting4Zone | UiSurfaceKind::HpOmenSuite)
+        ) {
             self.teardown_lighting_plugin();
         }
         match self
@@ -503,14 +529,19 @@ impl Host {
         let Some((title, surface)) = entry else {
             return;
         };
+        let surface_kind = match surface {
+            Some(UiSurfaceKind::Lighting4Zone) => 0,
+            Some(UiSurfaceKind::SensorBoard) => 1,
+            Some(UiSurfaceKind::HpOmenSuite) => 3,
+            _ => 2,
+        };
         if let Some(w) = self.window.upgrade() {
             let d = w.global::<Workbench>();
             d.set_active_plugin_id(id.into());
             d.set_active_plugin_title(title.into());
+            d.set_active_plugin_surface_kind(surface_kind);
         }
-        if surface == Some(UiSurfaceKind::Lighting4Zone) {
-            self.navigate(3);
-        }
+        self.navigate(3);
     }
 
     pub(super) fn sync_settings_dirty(&self) {
@@ -520,12 +551,12 @@ impl Host {
         let d = w.global::<Workbench>();
         let (general_dirty, appearance_dirty, hardware_dirty) =
             if let Some((base, options, appearance, gpu_tgp_max_w, startup)) =
-                self.settings_target()
+                self.settings_draft_state()
             {
                 (
                     base.options != options || base.run_entry.is_some() != startup,
                     base.appearance != appearance,
-                    base.gpu_tgp_max_w != gpu_tgp_max_w,
+                    gpu_tgp_max_w != Ok(base.gpu_tgp_max_w),
                 )
             } else {
                 let any_err = !d.get_gpu_tgp_max_error().is_empty();

@@ -16,7 +16,7 @@
 //! - Restarting `ACPI\NVDA0820\NPCF` via native `cfgmgr32.dll` (`CM_Disable_DevNode` +
 //!   `CM_Enable_DevNode`) applies or reverts the setting immediately without a reboot.
 use crate::profile_store::{NvpcfPptOriginal, ProfileStore};
-use omen_core::{
+use glph_core::{
     Inventory,
     features::Feature,
     hp_mode::HpMode,
@@ -539,16 +539,18 @@ pub fn ensure_mode(
         drop(key);
         restart_nvpcf_device()
     }) {
-        if let Ok(rollback_key) = RegKey::open(KEY_SET_VALUE) {
-            let _ = rollback_key.apply_state(current);
-        }
+        let rollback_ok = RegKey::open(KEY_SET_VALUE)
+            .and_then(|rollback_key| rollback_key.apply_state(current))
+            .is_ok();
         if let Ok(dev_inst) = locate_nvpcf_devnode() {
             // SAFETY: Best-effort re-enable if disable succeeded before failure.
             unsafe {
                 CM_Enable_DevNode(dev_inst, 0);
             }
         }
-        if created_backup {
+        // Only clear the durable original backup when registry rollback
+        // actually succeeded; otherwise retain it for explicit recovery.
+        if created_backup && rollback_ok {
             let _ = store.save_nvpcf_ppt_original(None);
         }
         return Err(error);
@@ -616,7 +618,7 @@ pub fn restore_if_saved(inventory: &Inventory, store: &ProfileStore) -> Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omen_core::profiles::{DeviceBinding, PROFILE_SCHEMA, Setting};
+    use glph_core::profiles::{DeviceBinding, PROFILE_SCHEMA, Setting};
 
     fn preset(settings: Vec<Setting>) -> PerformanceProfile {
         PerformanceProfile {

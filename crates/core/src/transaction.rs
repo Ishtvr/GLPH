@@ -561,11 +561,27 @@ fn apply_inner<B: Backend>(
                     continue;
                 }
             };
-            original[index] = fresh;
-            transaction.original = original.clone();
-            if let Err(reason) = journal.update_original(&transaction) {
+            if let Err(reason) = (Setting {
+                feature: fresh.feature,
+                value: fresh.value.clone(),
+            })
+            .validate()
+            {
+                skipped.push(Skipped {
+                    feature: setting.feature,
+                    reason,
+                });
+                continue;
+            }
+            let mut candidate_original = original.clone();
+            candidate_original[index] = fresh;
+            let mut candidate_tx = transaction.clone();
+            candidate_tx.original = candidate_original.clone();
+            if let Err(reason) = journal.update_original(&candidate_tx) {
                 return Err(rollback(backend, journal, &original, &attempted, reason));
             }
+            original = candidate_original;
+            transaction = candidate_tx;
             adopted.push(Skipped {
                 feature: setting.feature,
                 reason: error,
@@ -618,6 +634,9 @@ fn apply_inner<B: Backend>(
             return Err(crate::message::msg("transaction.err.context_final", &[]));
         }
         for setting in &profile.settings {
+            if skipped.iter().any(|s| s.feature == setting.feature) {
+                continue;
+            }
             backend
                 .capability(setting.feature)
                 .check(setting, &context, startup)?;
@@ -701,7 +720,11 @@ fn apply_inner<B: Backend>(
                         .iter()
                         .position(|s| s.feature == setting.feature)
                     {
-                        let _ = restore_one(backend, &original[index]);
+                        if let Err(restore_err) = restore_one(backend, &original[index]) {
+                            let error = format!("{reason}; {restore_err}");
+                            return Err(rollback(backend, journal, &original, &attempted, error));
+                        }
+                        attempted.retain(|i| *i != index);
                     }
                     skipped.push(Skipped {
                         feature: setting.feature,

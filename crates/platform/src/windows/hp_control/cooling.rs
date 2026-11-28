@@ -7,7 +7,7 @@ use crate::{
     cooling_store::{CoolingJournal, bounded_bytes},
     profile_store,
 };
-use omen_core::cooling_override::{
+use glph_core::cooling_override::{
     self as policy, Acknowledgement, Checkpoint, MaximumAction, Mode, Phase, RecoveryReadiness,
     RestoreAction,
 };

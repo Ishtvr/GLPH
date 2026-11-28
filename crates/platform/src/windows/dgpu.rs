@@ -1,6 +1,7 @@
 //! Power state of the NVIDIA dGPU as Windows records it in the device tree.
 //! Reading this property never touches the device, unlike an NVAPI or NVML
 //! query, which wakes a GPU that has powered down in hybrid mode.
+use std::sync::Mutex;
 use windows_sys::Win32::Devices::{
     DeviceAndDriverInstallation::{
         CM_GETIDLIST_FILTER_CLASS, CM_GETIDLIST_FILTER_PRESENT, CM_Get_DevNode_PropertyW,
@@ -12,7 +13,21 @@ use windows_sys::Win32::Devices::{
 
 /// Device setup class of display adapters.
 const DISPLAY_CLASS: &str = "{4d36e968-e325-11ce-bfc1-08002be10318}";
-const NVIDIA_PREFIX: &str = "PCI\\VEN_10DE&";
+const NVIDIA_PREFIX_ASCII: &[u8] = b"PCI\\VEN_10DE&";
+
+/// Cached `DEVINST` of the single NVIDIA display adapter so steady-state polls
+/// query `DEVPKEY_Device_PowerData` directly with zero PnP list enumeration or
+/// heap allocations. Invalidated automatically if the devnode disappears (e.g.
+/// after a PnP restart or driver update).
+static CACHED_NVIDIA_DEVNODE: Mutex<Option<u32>> = Mutex::new(None);
+
+fn starts_with_nvidia_prefix(id_utf16: &[u16]) -> bool {
+    id_utf16.len() >= NVIDIA_PREFIX_ASCII.len()
+        && id_utf16
+            .iter()
+            .zip(NVIDIA_PREFIX_ASCII)
+            .all(|(&w, &b)| w <= 0x7f && (w as u8).to_ascii_uppercase() == b)
+}
 
 /// `CM_POWER_DATA.PD_MostRecentPowerState` (a `DEVICE_POWER_STATE`) from the
 /// property bytes: the structure starts with its size, then this state.
@@ -61,16 +76,9 @@ fn display_adapters() -> Option<Vec<Vec<u16>>> {
     )
 }
 
-/// Whether the single NVIDIA display adapter is in D0. `None` when there is
-/// no such adapter, more than one, or Windows does not report a state: the
-/// caller then behaves as before this check existed.
-pub fn nvidia_gpu_awake() -> Option<bool> {
+fn locate_nvidia_devnode() -> Option<u32> {
     let adapters = display_adapters()?;
-    let mut nvidia = adapters.iter().filter(|id| {
-        String::from_utf16_lossy(id)
-            .to_ascii_uppercase()
-            .starts_with(NVIDIA_PREFIX)
-    });
+    let mut nvidia = adapters.iter().filter(|id| starts_with_nvidia_prefix(id));
     let (id, None) = (nvidia.next()?, nvidia.next()) else {
         return None;
     };
@@ -80,6 +88,10 @@ pub fn nvidia_gpu_awake() -> Option<bool> {
     {
         return None;
     }
+    Some(node)
+}
+
+fn query_power_state(node: u32) -> Result<Option<bool>, u32> {
     let mut data = [0u8; 128];
     let mut size = data.len() as u32;
     let mut kind = 0;
@@ -94,10 +106,31 @@ pub fn nvidia_gpu_awake() -> Option<bool> {
             0,
         )
     };
-    if result != CR_SUCCESS || kind != DEVPROP_TYPE_BINARY || size as usize > data.len() {
-        return None;
+    if result != CR_SUCCESS {
+        return Err(result);
     }
-    awake(recent_state(&data[..size as usize])?)
+    if kind != DEVPROP_TYPE_BINARY || size as usize > data.len() {
+        return Ok(None);
+    }
+    Ok(recent_state(&data[..size as usize]).and_then(awake))
+}
+
+/// Whether the single NVIDIA display adapter is in D0. `None` when there is
+/// no such adapter, more than one, or Windows does not report a state: the
+/// caller then behaves as before this check existed.
+pub fn nvidia_gpu_awake() -> Option<bool> {
+    let cached = CACHED_NVIDIA_DEVNODE.lock().ok().and_then(|guard| *guard);
+    if let Some(node) = cached {
+        if let Ok(state) = query_power_state(node) {
+            return state;
+        }
+    }
+    let located = locate_nvidia_devnode();
+    if let Ok(mut guard) = CACHED_NVIDIA_DEVNODE.lock() {
+        *guard = located;
+    }
+    let node = located?;
+    query_power_state(node).ok().flatten()
 }
 
 #[cfg(test)]

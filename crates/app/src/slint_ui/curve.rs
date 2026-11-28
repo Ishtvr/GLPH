@@ -1,9 +1,21 @@
 //! Presentation adapter for the existing platform-independent curve editor.
 use super::*;
-use omen_core::{
+use glph_core::{
     curve_editor::DragMode,
     curve_input::{self, Key, Modifiers},
 };
+
+fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, next: Vec<T>) {
+    if model.row_count() == next.len() {
+        for (idx, item) in next.into_iter().enumerate() {
+            if model.row_data(idx).as_ref() != Some(&item) {
+                model.set_row_data(idx, item);
+            }
+        }
+    } else {
+        model.set_vec(next);
+    }
+}
 
 /// An actual path, rather than rotated rectangles (rotation is unavailable in
 /// Slint's software renderer). One fixed viewbox scales with the input plot.
@@ -27,7 +39,7 @@ fn path(points: &[Point], view: Viewport) -> String {
 /// Checking a new curve field does not populate its initial empty UI value.
 /// Start that placeholder at the driver's factory curve; existing nonempty
 /// targets still undergo the editor's complete grid/range validation.
-fn gpu_editor(state: omen_core::vf::VfState, value: Option<&Value>) -> Result<Curve, String> {
+fn gpu_editor(state: glph_core::vf::VfState, value: Option<&Value>) -> Result<Curve, String> {
     let value = value.filter(|v| !matches!(v, Value::VfCurve(points) if points.is_empty()));
     Curve::gpu(state, value)
 }
@@ -213,19 +225,17 @@ impl Host {
                     .map_or(i == curve.selected, |(a, b)| (a..=b).contains(&i)),
             })
             .collect::<Vec<_>>();
-        d.set_nodes(Rc::new(VecModel::from(nodes)).into());
+        sync_model(&self.curve_nodes, nodes);
         // Grid lines and labels sit at round data values, mapped exactly like
         // the points and the path; spacing follows the actual plot size.
         let (width, height) = plot_size(d.get_plot_width(), d.get_plot_height());
-        d.set_x_ticks(Rc::new(VecModel::from(ticks(v.lo.x, v.hi.x, width, X_TICK_SPACING))).into());
-        d.set_y_ticks(
-            Rc::new(VecModel::from(ticks(
-                v.lo.y,
-                v.hi.y,
-                height,
-                Y_TICK_SPACING,
-            )))
-            .into(),
+        sync_model(
+            &self.curve_x_ticks,
+            ticks(v.lo.x, v.hi.x, width, X_TICK_SPACING),
+        );
+        sync_model(
+            &self.curve_y_ticks,
+            ticks(v.lo.y, v.hi.y, height, Y_TICK_SPACING),
         );
         show_readout(&d, editor);
         d.set_can_undo(curve.can_undo());
@@ -234,13 +244,13 @@ impl Host {
         d.set_curve_x_label(xunit.into());
         d.set_curve_y_label(yunit.into());
 
-        d.set_point_labels(strings(
-            curve
-                .points
-                .iter()
-                .enumerate()
-                .map(|(i, p)| format!("{} · {} {xunit}", i + 1, p.x)),
-        ));
+        let labels: Vec<slint::SharedString> = curve
+            .points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{} · {} {xunit}", i + 1, p.x).into())
+            .collect();
+        sync_model(&self.curve_point_labels, labels);
         d.set_point_index(curve.selected as i32);
         if let Some(p) = curve.points.get(curve.selected) {
             d.set_point_x(p.x.to_string().into());
@@ -252,13 +262,13 @@ impl Host {
             return;
         };
         let d = w.global::<Workbench>();
-        if action == "close" {
+        if action == "close" || action == "discard" {
             if let Some(mut editor) = self.curve.borrow_mut().take() {
                 editor.curve.cancel_gesture();
                 if editor.curve.kind == Kind::Gpu {
-                    *self.gpu_draft.borrow_mut() = Some(editor.curve);
+                    *self.gpu_draft.borrow_mut() = None;
                 } else {
-                    *self.fan_draft.borrow_mut() = Some(editor.curve);
+                    *self.fan_draft.borrow_mut() = None;
                 }
             }
             d.set_curve_open(false);
@@ -272,6 +282,46 @@ impl Host {
             return;
         }
         if action == "save" {
+            let commit_result = (|| -> Result<(), String> {
+                let mut current = self.curve.borrow_mut();
+                let Some(e) = current.as_mut() else {
+                    return Ok(());
+                };
+                e.finish_gesture(false);
+                if let Some(selected_pt) = e.curve.points.get(e.curve.selected).copied() {
+                    let raw_x = d.get_point_x();
+                    let raw_y = d.get_point_y();
+                    let y_changed = raw_y.trim() != selected_pt.y.to_string();
+                    let x_changed =
+                        e.curve.kind != Kind::Gpu && raw_x.trim() != selected_pt.x.to_string();
+                    if y_changed || x_changed {
+                        if e.curve.kind == Kind::Gpu && e.curve.selection().is_some() {
+                            let mhz: i32 = raw_y.trim().parse().map_err(|_| t("curve.err_freq"))?;
+                            e.curve.flatten_selection_to(mhz)?;
+                        } else {
+                            let x = if e.curve.kind == Kind::Gpu {
+                                selected_pt.x
+                            } else {
+                                raw_x.trim().parse().map_err(|_| t("curve.err_temp"))?
+                            };
+                            let y = raw_y.trim().parse().map_err(|_| {
+                                t(if e.curve.kind == Kind::Gpu {
+                                    "curve.err_freq"
+                                } else {
+                                    "curve.err_percent"
+                                })
+                            })?;
+                            e.curve.set(e.curve.selected, Point { x, y }, false)?;
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(e) = commit_result {
+                self.status(&crate::i18n::error_message(&e), true);
+                self.draw_curve();
+                return;
+            }
             let value = self.curve.borrow().as_ref().map(|e| e.curve.value());
             match value {
                 Some(Ok(Value::VfCurve(points))) => {
@@ -318,12 +368,13 @@ impl Host {
                 "flatten" => {
                     let mhz = d
                         .get_point_y()
+                        .trim()
                         .parse()
-                        .map_err(|_| t("preset.co_steps_invalid"))?;
+                        .map_err(|_| t("curve.err_freq"))?;
                     if e.curve.selection().is_some() {
                         e.curve.flatten_selection_to(mhz)?;
                     } else if e.selection_mode {
-                        return Err(omen_core::message::msg("curve.err.selection_required", &[]));
+                        return Err(glph_core::message::msg("curve.err.selection_required", &[]));
                     } else {
                         e.curve.plateau(mhz)?;
                     }
@@ -355,7 +406,7 @@ impl Host {
                         .map_err(|_| t("curve.invalid_range"))?;
                     e.selection_mode = true;
                     if !e.curve.select_voltage_range(from, to) {
-                        return Err(omen_core::message::msg("curve.err.empty_selection", &[]));
+                        return Err(glph_core::message::msg("curve.err.empty_selection", &[]));
                     }
                 }
                 "insert" => e.curve.insert()?,
@@ -366,15 +417,22 @@ impl Host {
                     e.view.zoom(&e.curve, p, false, action == "zoom-in");
                 }
                 "set" => {
-                    let p = Point {
-                        x: d.get_point_x()
+                    let x = if e.curve.kind == Kind::Gpu {
+                        e.curve.points[e.curve.selected].x
+                    } else {
+                        d.get_point_x()
+                            .trim()
                             .parse()
-                            .map_err(|_| t("preset.co_steps_invalid"))?,
-                        y: d.get_point_y()
-                            .parse()
-                            .map_err(|_| t("preset.co_steps_invalid"))?,
+                            .map_err(|_| t("curve.err_temp"))?
                     };
-                    e.curve.set(e.curve.selected, p, false)?;
+                    let y = d.get_point_y().trim().parse().map_err(|_| {
+                        t(if e.curve.kind == Kind::Gpu {
+                            "curve.err_freq"
+                        } else {
+                            "curve.err_percent"
+                        })
+                    })?;
+                    e.curve.set(e.curve.selected, Point { x, y }, false)?;
                 }
                 _ => (),
             }
@@ -474,7 +532,7 @@ impl Host {
                 Command::Edit(Key::Flatten)
                     if e.selection_mode && e.curve.selection().is_none() =>
                 {
-                    Err(omen_core::message::msg("curve.err.selection_required", &[]))
+                    Err(glph_core::message::msg("curve.err.selection_required", &[]))
                 }
                 Command::Edit(key) => curve_input::edit(&mut e.curve, key, modifiers).map(|_| ()),
                 Command::Revert => e.curve.revert().map(|_| ()),
@@ -625,7 +683,7 @@ fn plot_size(width: f32, height: f32) -> (f32, f32) {
 /// with the same `(value - lo) / span` mapping as points and path.
 fn ticks(lo: i32, hi: i32, pixels: f32, spacing: i32) -> Vec<AxisTick> {
     let span = (hi - lo).max(1);
-    let step = omen_core::curve_view::tick_step(span, pixels.round() as i32, spacing).max(1) as i32;
+    let step = glph_core::curve_view::tick_step(span, pixels.round() as i32, spacing).max(1) as i32;
     let first = lo.div_euclid(step) * step + if lo.rem_euclid(step) == 0 { 0 } else { step };
     (0..)
         .map(|i| first + i * step)
@@ -903,11 +961,11 @@ mod tests {
     use super::*;
     #[test]
     fn checking_an_empty_curve_field_opens_factory_without_replacing_saved_targets() {
-        let state = omen_core::vf::VfState {
+        let state = glph_core::vf::VfState {
             nodes: [(1100, 100), (1300, 100), (1400, 0), (1400, -200)]
                 .iter()
                 .enumerate()
-                .map(|(i, &(mhz, delta))| omen_core::vf::VfNode {
+                .map(|(i, &(mhz, delta))| glph_core::vf::VfNode {
                     index: i as u16,
                     voltage_uv: 800000 + i as u32 * 100000,
                     frequency_khz: mhz * 1000,
@@ -928,7 +986,7 @@ mod tests {
         assert!(editor.value().is_ok());
         // This presentation fallback never makes an empty Apply target valid.
         assert!(
-            omen_core::profiles::Setting {
+            glph_core::profiles::Setting {
                 feature: Feature::GpuVfCurve,
                 value: empty
             }
@@ -943,16 +1001,16 @@ mod tests {
                 .unwrap(),
             saved
         );
-        let partial = Value::VfCurve(vec![omen_core::profiles::VfPoint {
+        let partial = Value::VfCurve(vec![glph_core::profiles::VfPoint {
             voltage_mv: 800,
             frequency_mhz: 1100,
         }]);
         assert!(gpu_editor(state, Some(&partial)).is_err());
     }
     fn editor() -> Editor {
-        let state = omen_core::vf::VfState {
+        let state = glph_core::vf::VfState {
             nodes: (0..6)
-                .map(|i| omen_core::vf::VfNode {
+                .map(|i| glph_core::vf::VfNode {
                     index: i,
                     voltage_uv: 800_000 + u32::from(i) * 50_000,
                     frequency_khz: (1000 + u32::from(i) * 100) * 1000,
@@ -1113,9 +1171,9 @@ mod tests {
 
     #[test]
     fn offsets_are_shown_against_the_driver_default_not_the_loaded_preset() {
-        let state = omen_core::vf::VfState {
+        let state = glph_core::vf::VfState {
             nodes: (0..4)
-                .map(|i| omen_core::vf::VfNode {
+                .map(|i| glph_core::vf::VfNode {
                     index: i,
                     voltage_uv: 800_000 + u32::from(i) * 50_000,
                     // The live curve carries an applied +100 MHz offset.

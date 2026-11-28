@@ -8,7 +8,7 @@ use super::{
     hp::{HpBios, Read},
     nvidia::GpuTemperature,
 };
-use omen_core::{
+use glph_core::{
     Inventory,
     cooling::FirmwareIrTemperature,
     fan::{self, FanCurve, Smoother},
@@ -28,8 +28,10 @@ use windows_sys::Win32::{
             TH32CS_SNAPPROCESS,
         },
         Threading::{
-            CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, GetCurrentProcess, GetProcessTimes,
-            OpenEventW, ReleaseMutex, ResetEvent, SetEvent, WaitForSingleObject,
+            CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, GetCurrentProcess, GetCurrentThread,
+            GetProcessTimes, GetThreadPriority, OpenEventW, ReleaseMutex, ResetEvent,
+            SYNCHRONIZATION_SYNCHRONIZE, SetEvent, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            WaitForSingleObject,
         },
     },
 };
@@ -42,6 +44,10 @@ const GPU_IDLE_C: i32 = 60;
 const GPU_IDLE_POLL: Duration = Duration::from_secs(30);
 /// The chassis sensor is a firmware call; the OMEN Hub reads it every 30 s.
 const IR_POLL: Duration = Duration::from_secs(10);
+/// Vendor Hub process scan cadence (allocation-free UTF-16 check).
+const HUB_POLL: Duration = Duration::from_secs(10);
+/// Cross-session single-authority cooling owner mutex (Session 0 vs Session 1).
+const GLOBAL_FAN_OWNER: &str = "Global\\GLPH.FanControllerOwner";
 
 /// How the GPU temperature of one cycle is obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,10 +215,48 @@ fn release_maximum(
     )
 }
 /// While the original Hub runs it owns the fans; the service waits.
-const HUB_PROCESSES: [&str; 2] = [
-    "omencommandcenterbackground.exe",
-    "hp.omen.application.background.tasks.container.exe",
+const HUB_PROCESSES: [&[u8]; 2] = [
+    b"omencommandcenterbackground.exe",
+    b"hp.omen.application.background.tasks.container.exe",
 ];
+
+fn utf16_eq_ascii_ignore_case(wide: &[u16], ascii_lower: &[u8]) -> bool {
+    if wide.len() != ascii_lower.len() {
+        return false;
+    }
+    wide.iter()
+        .zip(ascii_lower.iter())
+        .all(|(&w, &a)| w <= 0x7F && (w as u8).to_ascii_lowercase() == a)
+}
+
+/// Cross-session single-authority guard ensuring Session-0 `GLPHService`
+/// and the legacy Session-1 `fan-service` task never write fans concurrently.
+struct GlobalFanOwner {
+    mutex: HANDLE,
+}
+impl GlobalFanOwner {
+    fn acquire() -> Result<Self, String> {
+        let mutex = super::control_lease::create_or_open_mutex(GLOBAL_FAN_OWNER)?;
+        // SAFETY: Valid SDDL mutex handle, non-blocking ownership check.
+        let wait = unsafe { WaitForSingleObject(mutex, 0) };
+        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+            unsafe {
+                CloseHandle(mutex);
+            }
+            return Err("Another GLPH fan controller is already active".into());
+        }
+        Ok(Self { mutex })
+    }
+}
+impl Drop for GlobalFanOwner {
+    fn drop(&mut self) {
+        // SAFETY: This thread acquired `self.mutex`.
+        unsafe {
+            ReleaseMutex(self.mutex);
+            CloseHandle(self.mutex);
+        }
+    }
+}
 
 /// One controller per interactive user/session, with an interruptible wait.
 /// Installers request a graceful stop so CCD originals can be released before
@@ -223,7 +267,7 @@ struct Lifecycle {
 }
 fn object_name(kind: &str) -> Result<Vec<u16>, String> {
     Ok(
-        format!("Local\\OmenHubPP.Fan.{kind}.{}", super::current_user_sid()?)
+        format!("Local\\GLPH.Fan.{kind}.{}", super::current_user_sid()?)
             .encode_utf16()
             .chain(Some(0))
             .collect(),
@@ -231,9 +275,14 @@ fn object_name(kind: &str) -> Result<Vec<u16>, String> {
 }
 impl Lifecycle {
     fn start() -> Result<Self, String> {
+        let sid = super::current_user_sid()?;
         let name = object_name("Owner")?;
-        // SAFETY: Terminated per-user name, default security, no initial owner.
-        let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        // Per-user explicit DACL + Medium integrity label so an elevated
+        // `glph-fan.exe` still allows the same interactive user to signal Stop.
+        let mutex_sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100001;;;{sid})");
+        let mutex_sec = super::control_lease::SddlSecurity::parse(&mutex_sddl)?;
+        // SAFETY: Terminated per-user name, explicit per-user security, no initial owner.
+        let mutex = unsafe { CreateMutexW(mutex_sec.as_ptr(), 0, name.as_ptr()) };
         if mutex.is_null() {
             return Err(std::io::Error::last_os_error().to_string());
         }
@@ -243,17 +292,27 @@ impl Lifecycle {
             unsafe {
                 CloseHandle(mutex);
             }
-            return Err(
-                "A PerformanceHub fan controller is already running in this session".into(),
-            );
+            return Err("A GLPH fan controller is already running in this session".into());
         }
         let mut owner = Self {
             mutex,
             stop: std::ptr::null_mut(),
         };
         let name = object_name("Stop")?;
-        // SAFETY: Manual-reset event, fixed name and default security.
-        owner.stop = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+        let stop_sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100002;;;{sid})");
+        let stop_sec = super::control_lease::SddlSecurity::parse(&stop_sddl)?;
+        // SAFETY: Manual-reset event, fixed per-user name and explicit per-user DACL.
+        owner.stop = unsafe { CreateEventW(stop_sec.as_ptr(), 1, 0, name.as_ptr()) };
+        if owner.stop.is_null() {
+            // Reopen if an older instance still holds the named stop event.
+            owner.stop = unsafe {
+                OpenEventW(
+                    SYNCHRONIZATION_SYNCHRONIZE | EVENT_MODIFY_STATE,
+                    0,
+                    name.as_ptr(),
+                )
+            };
+        }
         if owner.stop.is_null() {
             return Err(std::io::Error::last_os_error().to_string());
         }
@@ -358,8 +417,10 @@ fn hub_running() -> Option<bool> {
                 .iter()
                 .position(|c| *c == 0)
                 .unwrap_or(entry.szExeFile.len());
-            let name = String::from_utf16_lossy(&entry.szExeFile[..length]).to_lowercase();
-            found = HUB_PROCESSES.contains(&name.as_str());
+            let slice = &entry.szExeFile[..length];
+            found = HUB_PROCESSES
+                .iter()
+                .any(|target| utf16_eq_ascii_ignore_case(slice, target));
             ok = Process32NextW(snapshot, &mut entry) != 0;
         }
         // A failure in the middle of enumeration must not masquerade as an
@@ -373,7 +434,7 @@ fn hub_running() -> Option<bool> {
 /// Gives every pinned program its affinity back when the service ends,
 /// including an early error return.
 struct Pinning {
-    enforcer: omen_core::ccd::Enforcer,
+    enforcer: glph_core::ccd::Enforcer,
     processes: super::ccd::WindowsProcesses,
 }
 impl Drop for Pinning {
@@ -426,19 +487,155 @@ pub fn run(
     })
 }
 
+const THREAD_PRIORITY_ERROR: i32 = i32::MAX;
+
+/// Session-1 foreground CCD pinning helper. Runs in the interactive user
+/// session (e.g. `performance-hub.exe --tray`) because Session-0 Windows
+/// services are isolated from the desktop foreground window.
+pub struct ForegroundCcdPinner {
+    masks: Result<Vec<usize>, String>,
+    pinning: Pinning,
+}
+
+impl Default for ForegroundCcdPinner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ForegroundCcdPinner {
+    pub fn new() -> Self {
+        Self {
+            masks: super::ccd::ccd_masks(),
+            pinning: Pinning {
+                enforcer: glph_core::ccd::Enforcer::default(),
+                processes: super::ccd::WindowsProcesses::default(),
+            },
+        }
+    }
+
+    /// Evaluates the current interactive foreground window and applies/releases
+    /// the saved CCD affinity mask. Returns the number of currently pinned programs.
+    pub fn tick(&mut self, selection: Option<u8>) -> usize {
+        let target = match (&self.masks, selection) {
+            (Ok(masks), Some(sel)) => glph_core::ccd::affinity(sel, masks).unwrap_or(None),
+            _ => None,
+        };
+        let Pinning {
+            enforcer,
+            processes,
+        } = &mut self.pinning;
+        enforcer.tick(processes, target);
+        enforcer.pinned()
+    }
+}
+
+struct BelowNormalThreadGuard {
+    previous: i32,
+}
+impl BelowNormalThreadGuard {
+    fn enter() -> Self {
+        // SAFETY: Adjusts only the current cooling worker thread priority so
+        // periodic hardware polling never preempts foreground games or audio.
+        let previous = unsafe { GetThreadPriority(GetCurrentThread()) };
+        if previous != THREAD_PRIORITY_ERROR && previous > THREAD_PRIORITY_BELOW_NORMAL {
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            Self { previous }
+        } else {
+            Self {
+                previous: THREAD_PRIORITY_ERROR,
+            }
+        }
+    }
+}
+impl Drop for BelowNormalThreadGuard {
+    fn drop(&mut self) {
+        if self.previous != THREAD_PRIORITY_ERROR {
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), self.previous);
+            }
+        }
+    }
+}
+
+/// Session-0 Windows Service cooling loop (runs under `LocalSystem` before user
+/// logon). Skips interactive foreground CCD pinning (handled in Session 1 by
+/// [`ForegroundCcdPinner`]) and reads the chassis IR limit from the caller's
+/// machine-wide config (`C:\ProgramData\PerformanceHub\service-config.json`).
+/// When `is_suspended()` returns `true`, cooling pauses cleanly without
+/// triggering a 100 % `release_maximum()` fan blast into standby.
+#[allow(clippy::too_many_arguments)]
+pub fn run_session0_cooling(
+    inventory: &Inventory,
+    mode: impl FnMut() -> FanMode,
+    load: impl FnMut() -> Result<Option<Vec<FanPoint>>, String>,
+    ir_limit: impl FnMut() -> u8,
+    is_suspended: impl FnMut() -> bool,
+    report: impl FnMut(&FanServiceStatus),
+    stop: impl FnMut(Duration) -> Result<bool, String>,
+) -> Result<(), String> {
+    let _prio = BelowNormalThreadGuard::enter();
+    run_loop(
+        inventory,
+        mode,
+        load,
+        || Ok(None),
+        ir_limit,
+        is_suspended,
+        false,
+        report,
+        stop,
+    )
+}
+
 /// Same production loop with a bounded stop source for qualification. Stopping
 /// releases CCD affinities and ceases firmware heartbeat/level writes.
 pub fn run_until(
     inventory: &Inventory,
+    mode: impl FnMut() -> FanMode,
+    load: impl FnMut() -> Result<Option<Vec<FanPoint>>, String>,
+    ccd: impl FnMut() -> Result<Option<u8>, String>,
+    report: impl FnMut(&FanServiceStatus),
+    stop: impl FnMut(Duration) -> Result<bool, String>,
+) -> Result<(), String> {
+    let _prio = BelowNormalThreadGuard::enter();
+    run_loop(
+        inventory,
+        mode,
+        load,
+        ccd,
+        || {
+            crate::profile_store::ProfileStore::user_data()
+                .ok()
+                .and_then(|s| s.chassis_max_temp_c().ok())
+                .flatten()
+                .unwrap_or(fan::IR_EMERGENCY_C)
+        },
+        || false,
+        true,
+        report,
+        stop,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop(
+    inventory: &Inventory,
     mut mode: impl FnMut() -> FanMode,
     mut load: impl FnMut() -> Result<Option<Vec<FanPoint>>, String>,
     mut ccd: impl FnMut() -> Result<Option<u8>, String>,
+    mut ir_limit: impl FnMut() -> u8,
+    mut is_suspended: impl FnMut() -> bool,
+    enable_ccd_pinning: bool,
     mut report: impl FnMut(&FanServiceStatus),
     mut stop: impl FnMut(Duration) -> Result<bool, String>,
 ) -> Result<(), String> {
     if inventory.manufacturer != "HP" || inventory.board != "8E35" || inventory.bios != "F.13" {
         return Err("Fan control is qualified only for HP8E35/F.13".into());
     }
+    let _global_owner = GlobalFanOwner::acquire()?;
     let instance = ProcessIdentity::current()?;
     let bios = HpBios::new(inventory).map_err(|e| e.to_string())?;
     // Idle BIOS/Hub-waiting states do not open a kernel reader or NVIDIA DLL.
@@ -446,16 +643,22 @@ pub fn run_until(
     let mut gpu: Option<GpuTemperature> = None;
     let mut last_gpu: Option<(i32, Instant)> = None;
     let mut last_ir: Option<(u8, Instant)> = None;
+    let mut last_hub: Option<(bool, Instant)> = None;
     let mut smoother = (Smoother::default(), Smoother::default());
     let mut last_heartbeat: Option<Instant> = None;
     let mut last_heartbeat_unix_ms = None;
     let mut last_written_mode = None;
+    let mut last_written_levels: Option<(u8, u8)> = None;
     let mut write_was_blocked = false;
     let mut control = fan::SoftwareControl::default();
     let mut protection = 0u8;
-    let ccd_masks = super::ccd::ccd_masks();
+    let ccd_masks = if enable_ccd_pinning {
+        super::ccd::ccd_masks()
+    } else {
+        Err("Session-0 service delegates foreground CCD pinning to Session 1".into())
+    };
     let mut pinning = Pinning {
-        enforcer: omen_core::ccd::Enforcer::default(),
+        enforcer: glph_core::ccd::Enforcer::default(),
         processes: super::ccd::WindowsProcesses::default(),
     };
     let result = (|| -> Result<(), String> {
@@ -464,20 +667,24 @@ pub fn run_until(
                 return Ok(());
             }
             let started = Instant::now();
-            // CCD pinning is independent of the fans and of the original Hub. An
+            // CCD pinning runs only in interactive Session-1 contexts. An
             // unreadable selection or topology releases every pinned program.
-            let target = match (&ccd_masks, ccd()) {
-                (Ok(masks), Ok(Some(selection))) => {
-                    omen_core::ccd::affinity(selection, masks).unwrap_or(None)
-                }
-                _ => None,
+            let ccd_pinned = if enable_ccd_pinning {
+                let target = match (&ccd_masks, ccd()) {
+                    (Ok(masks), Ok(Some(selection))) => {
+                        glph_core::ccd::affinity(selection, masks).unwrap_or(None)
+                    }
+                    _ => None,
+                };
+                let Pinning {
+                    enforcer,
+                    processes,
+                } = &mut pinning;
+                enforcer.tick(processes, target);
+                enforcer.pinned()
+            } else {
+                0
             };
-            let Pinning {
-                enforcer,
-                processes,
-            } = &mut pinning;
-            enforcer.tick(processes, target);
-            let ccd_pinned = enforcer.pinned();
             let heartbeat_for_idle = last_heartbeat_unix_ms;
             let idle = |state: &'static str, detail: String| {
                 let updated_unix_ms = unix_ms();
@@ -499,6 +706,24 @@ pub fn run_until(
                     updated_unix_ms,
                 }
             };
+            if is_suspended() {
+                // Entering standby: release sensor handles and pause cleanly
+                // without blasting 100 % fans via `release_maximum()`.
+                cpu = None;
+                gpu = None;
+                last_heartbeat = None;
+                last_written_mode = None;
+                last_written_levels = None;
+                last_hub = None;
+                report(&idle(
+                    "suspended",
+                    "System is entering standby; cooling loop paused".into(),
+                ));
+                if stop(Duration::from_secs(2))? {
+                    return Ok(());
+                }
+                continue;
+            }
             let pause = |control: &mut fan::SoftwareControl,
                          detail: String|
              -> Result<FanServiceStatus, String> {
@@ -506,7 +731,7 @@ pub fn run_until(
                 if release == CoolingRelease::Vendor {
                     return Ok(idle(
                         "waiting_for_hub",
-                        omen_core::message::msg("fan.status.hub_running", &[]),
+                        glph_core::message::msg("fan.status.hub_running", &[]),
                     ));
                 }
                 if control.handover_pending() {
@@ -515,26 +740,35 @@ pub fn run_until(
                         gpu_level: fan::MAX_LEVEL,
                         ..idle(
                             "handover_pending",
-                            omen_core::message::msg("fan.status.handover", &[]),
+                            glph_core::message::msg("fan.status.handover", &[]),
                         )
                     })
                 } else {
                     Ok(idle("bios", detail))
                 }
             };
-            // Pause our controller by sending nothing. A BIOS handover cannot be
-            // asserted from this status: ownership has no qualified readback.
-            let vendor = hub_running()
-                .ok_or("Original controller enumeration failed; ownership is unknown")?;
+            // Pause our controller by sending nothing. Throttled to HUB_POLL
+            // (10 s) in steady state using an allocation-free UTF-16 scan.
+            let vendor = if let Some((cached, at)) = last_hub
+                && at.elapsed() < HUB_POLL
+            {
+                cached
+            } else {
+                let live = hub_running()
+                    .ok_or("Original controller enumeration failed; ownership is unknown")?;
+                last_hub = Some((live, Instant::now()));
+                live
+            };
             if vendor {
                 control.vendor_active();
                 last_heartbeat = None;
                 last_written_mode = None;
+                last_written_levels = None;
                 cpu = None;
                 gpu = None;
                 report(&idle(
                     "waiting_for_hub",
-                    omen_core::message::msg("fan.status.hub_running", &[]),
+                    glph_core::message::msg("fan.status.hub_running", &[]),
                 ));
                 if stop(Duration::from_secs(2))? {
                     return Ok(());
@@ -544,11 +778,12 @@ pub fn run_until(
             let mode = mode();
             if mode == FanMode::Bios {
                 last_heartbeat = None;
+                last_written_levels = None;
                 cpu = None;
                 gpu = None;
                 report(&pause(
                     &mut control,
-                    omen_core::message::msg("fan.status.bios", &[]),
+                    glph_core::message::msg("fan.status.bios", &[]),
                 )?);
                 if stop(Duration::from_secs(2))? {
                     return Ok(());
@@ -561,11 +796,12 @@ pub fn run_until(
                 Ok(Some(curve)) => Some(curve),
                 Ok(None) => {
                     last_heartbeat = None;
+                    last_written_levels = None;
                     cpu = None;
                     gpu = None;
                     report(&pause(
                         &mut control,
-                        omen_core::message::msg("fan.status.no_curve", &[]),
+                        glph_core::message::msg("fan.status.no_curve", &[]),
                     )?);
                     if stop(Duration::from_secs(2))? {
                         return Ok(());
@@ -575,11 +811,12 @@ pub fn run_until(
                 Err(_) if max => None,
                 Err(e) => {
                     last_heartbeat = None;
+                    last_written_levels = None;
                     cpu = None;
                     gpu = None;
                     report(&pause(
                         &mut control,
-                        omen_core::message::msg("fan.status.invalid_curve", &[&e]),
+                        glph_core::message::msg("fan.status.invalid_curve", &[&e]),
                     )?);
                     if stop(Duration::from_secs(2))? {
                         return Ok(());
@@ -599,12 +836,31 @@ pub fn run_until(
             if !max && cpu.is_none() {
                 cpu = CpuHardwareReader::new(inventory).ok();
             }
-            let cpu_c = cpu
-                .as_mut()
-                .and_then(|r| r.temperature_sample().ok())
-                .and_then(|s| s.temperature_c);
-            let gpu_plan = if max {
-                GpuRead::Asleep
+            let cpu_c = match cpu.as_mut().map(|r| r.temperature_sample()) {
+                Some(Ok(sample)) => sample.temperature_c,
+                Some(Err(_)) => {
+                    // Drop a stale/broken driver handle (e.g. after S0ix or driver
+                    // reload) so the next tick cleanly reopens CpuHardwareReader
+                    // instead of latching emergency full cooling indefinitely.
+                    cpu = None;
+                    None
+                }
+                None => None,
+            };
+            let gpu_paused = ControlLease::gpu_pause_active();
+            let gpu_plan = if max || gpu_paused {
+                if gpu_paused {
+                    // Release NVML/NVAPI handles immediately before a PnP restart.
+                    gpu = None;
+                    match last_gpu {
+                        Some((temperature, at)) if at.elapsed() < Duration::from_secs(60) => {
+                            GpuRead::Rest(temperature)
+                        }
+                        _ => GpuRead::Asleep,
+                    }
+                } else {
+                    GpuRead::Asleep
+                }
             } else {
                 gpu_read(
                     super::dgpu::nvidia_gpu_awake(),
@@ -663,14 +919,26 @@ pub fn run_until(
             if stop(Duration::ZERO)? {
                 return Ok(());
             }
-            if hub_running().ok_or("Original controller enumeration failed before fan write")? {
+            // Re-verify vendor absence on initial arm or once per HUB_POLL window.
+            let vendor_before_write = if last_heartbeat.is_none()
+                || last_hub.is_none_or(|(_, at)| at.elapsed() >= HUB_POLL)
+            {
+                let live = hub_running()
+                    .ok_or("Original controller enumeration failed before fan write")?;
+                last_hub = Some((live, Instant::now()));
+                live
+            } else {
+                last_hub.is_some_and(|(cached, _)| cached)
+            };
+            if vendor_before_write {
                 control.vendor_active();
                 last_heartbeat = None;
                 last_written_mode = None;
+                last_written_levels = None;
                 drop(write_lease);
                 report(&idle(
                     "waiting_for_hub",
-                    omen_core::message::msg("fan.status.hub_running", &[]),
+                    glph_core::message::msg("fan.status.hub_running", &[]),
                 ));
                 if stop(CYCLE.saturating_sub(started.elapsed()))? {
                     return Ok(());
@@ -694,11 +962,7 @@ pub fn run_until(
             // Maximum is unconditional and works without loading sensor drivers.
             // A curve may never lower cooling when its GPU reader is unavailable;
             // a powered-down dGPU is not a failed reader and produces no heat.
-            let ir_limit_c = crate::profile_store::ProfileStore::user_data()
-                .ok()
-                .and_then(|s| s.chassis_max_temp_c().ok())
-                .flatten()
-                .unwrap_or(fan::IR_EMERGENCY_C);
+            let ir_limit_c = ir_limit();
             let full = !max
                 && (write_was_blocked
                     || (gpu_c.is_none() && !gpu_asleep)
@@ -715,9 +979,15 @@ pub fn run_until(
             let gpu_t = gpu_c.or(cpu_t);
             let cpu_level = smoother.0.step(target(cpu_t));
             let gpu_level = smoother.1.step(target(gpu_t));
-            control.arm();
-            bios.set_fan_levels(cpu_level, gpu_level)
-                .map_err(|e| e.to_string())?;
+            let levels_changed = last_written_levels != Some((cpu_level, gpu_level))
+                || last_written_mode != Some(mode)
+                || write_was_blocked;
+            if levels_changed {
+                control.arm();
+                bios.set_fan_levels(cpu_level, gpu_level)
+                    .map_err(|e| e.to_string())?;
+                last_written_levels = Some((cpu_level, gpu_level));
+            }
             last_written_mode = Some(mode);
             write_was_blocked = false;
             drop(write_lease);
@@ -770,7 +1040,7 @@ pub fn run_until(
             process_started: instance.started,
             last_heartbeat_unix_ms,
             state: "handover_pending",
-            detail: omen_core::message::msg("fan.status.handover", &[]),
+            detail: glph_core::message::msg("fan.status.handover", &[]),
             cpu_c: None,
             gpu_c: None,
             ir_c: None,

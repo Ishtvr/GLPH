@@ -10,32 +10,67 @@ export component KeyboardPreview inherits Rectangle {
     callback selected-group(int);
     height: min(480px, self.width * 0.33);
     horizontal-stretch: 1;
-    background: Theme.surface;
-    border-radius: 8px;
+    background: Theme.surface-fill;
+    border-radius: 10px;
+    border-width: Theme.card-border-width;
+    border-color: Theme.surface-border;
+    clip: true;
+
+    if Theme.has-surface-texture: Image {
+        x: 1px;
+        y: 1px;
+        width: max(0px, parent.width - 2px);
+        height: max(0px, parent.height - 2px);
+        source: Theme.surface-texture;
+        image-fit: fill;
+        accessible-role: none;
+    }
+
+    Rectangle {
+        x: 10px;
+        y: 1px;
+        width: max(0px, parent.width - 20px);
+        height: 1px;
+        background: Theme.surface-top-sheen;
+    }
+
     for cap in root.keys: key-cap := Rectangle {
+        private property <bool> is-selected: cap.group == root.selected;
         accessible-role: none;
         accessible-label: cap.label;
         x: 10px + cap.x * (parent.width - 20px) / 20.5;
         y: 10px + cap.y * (parent.height - 20px) / 6.5;
         width: cap.w * (parent.width - 20px) / 20.5 - 3px;
         height: cap.h * (parent.height - 20px) / 6.5 - 3px;
-        background: Theme.control;
-        border-radius: 4px;
-        border-width: 1px;
-        border-color: cap.group == root.selected ? Theme.accent : Theme.line;
+        background: Theme.control-fill;
+        border-radius: 5px;
+        border-width: self.is-selected ? 2px : 1px;
+        border-color: self.is-selected ? Theme.accent-border : Theme.control-border;
+        clip: true;
         Rectangle {
-            x: 1px;
-            y: 1px;
-            width: parent.width - 2px;
-            height: parent.height - 2px;
-            border-radius: 3px;
-            background: root.colors[cap.zone].with-alpha(0.22);
+            x: key-cap.is-selected ? 3px : 1px;
+            y: key-cap.is-selected ? 3px : 1px;
+            width: max(0px, parent.width - (key-cap.is-selected ? 6px : 2px));
+            height: max(0px, parent.height - (key-cap.is-selected ? 6px : 2px));
+            border-radius: 2px;
+            background: root.colors[cap.zone].with-alpha(key-cap.is-selected ? 0.30 : 0.22);
+        }
+
+        if key-cap.is-selected: Rectangle {
+            x: 3px;
+            y: 3px;
+            width: max(0px, parent.width - 6px);
+            height: max(0px, parent.height - 6px);
+            border-radius: 2px;
+            border-width: 1px;
+            border-color: Theme.on-accent.with-alpha(0.35);
+            background: Theme.accent.with-alpha(0.10);
         }
 
         Rectangle {
-            x: 4px;
-            y: parent.height - 4px;
-            width: max(0px, parent.width - 8px);
+            x: 5px;
+            y: parent.height - (key-cap.is-selected ? 6px : 4px);
+            width: max(0px, parent.width - 10px);
             height: 2px;
             border-radius: 1px;
             background: root.colors[cap.zone];

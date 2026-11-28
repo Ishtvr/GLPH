@@ -1,11 +1,11 @@
 //! NVIDIA controls through public NVML contracts. Never calls private NVAPI IDs.
 mod power;
 use super::nvidia::{system_library, text_buffer};
-use libloading::Library;
-use omen_core::{
+use glph_core::{
     features::Feature,
     profiles::{Setting, Value},
 };
+use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::{CString, c_char, c_void},
@@ -22,6 +22,9 @@ type DeviceTextFn = unsafe extern "C" fn(Handle, *mut c_char, u32) -> i32;
 type SystemTextFn = unsafe extern "C" fn(*mut c_char, u32) -> i32;
 type OffsetFn = unsafe extern "C" fn(Handle, *mut ClockOffset) -> i32;
 type ThermalFn = unsafe extern "C" fn(Handle, i32, *mut u32) -> i32;
+type LockedClocksSetFn = unsafe extern "C" fn(Handle, u32, u32) -> i32;
+type LockedClocksResetFn = unsafe extern "C" fn(Handle) -> i32;
+type MaxClockInfoFn = unsafe extern "C" fn(Handle, i32, *mut u32) -> i32;
 
 // nvmlClockOffset_v1_t: NVIDIA/go-nvml, 24-byte C layout, version in bits 24..31.
 // This version convention differs from NVAPI's bits 16..31.
@@ -62,7 +65,7 @@ pub struct GpuControlsReport {
     pub temperature_c: Option<u32>,
     pub slowdown_temperature_c: Option<u32>,
     pub clock_setter_export: bool,
-    pub power_limit: Result<omen_core::gpu_power::PowerLimitState, String>,
+    pub power_limit: Result<glph_core::gpu_power::PowerLimitState, String>,
     pub power_limit_bounds_mw: Result<(u32, u32), String>,
     pub power_limit_setter_export: bool,
 }
@@ -78,6 +81,9 @@ pub(super) struct NvidiaControl {
     driver: SystemTextFn,
     get_offsets: Option<OffsetFn>,
     set_offsets: Option<OffsetFn>,
+    set_locked_clocks: Option<LockedClocksSetFn>,
+    reset_locked_clocks: Option<LockedClocksResetFn>,
+    max_clock_info: Option<MaxClockInfoFn>,
     temperature: Option<ThermalFn>,
     threshold: Option<ThermalFn>,
     power: power::PowerControl,
@@ -113,6 +119,9 @@ impl NvidiaControl {
         let driver = symbol(&library, b"nvmlSystemGetDriverVersion\0")?;
         let get_offsets = symbol(&library, b"nvmlDeviceGetClockOffsets\0").ok();
         let set_offsets = symbol(&library, b"nvmlDeviceSetClockOffsets\0").ok();
+        let set_locked_clocks = symbol(&library, b"nvmlDeviceSetGpuLockedClocks\0").ok();
+        let reset_locked_clocks = symbol(&library, b"nvmlDeviceResetGpuLockedClocks\0").ok();
+        let max_clock_info = symbol(&library, b"nvmlDeviceGetMaxClockInfo\0").ok();
         let temperature = symbol(&library, b"nvmlDeviceGetTemperature\0").ok();
         let threshold = symbol(&library, b"nvmlDeviceGetTemperatureThreshold\0").ok();
         let power = power::PowerControl::load(&library);
@@ -128,6 +137,9 @@ impl NvidiaControl {
             driver,
             get_offsets,
             set_offsets,
+            set_locked_clocks,
+            reset_locked_clocks,
+            max_clock_info,
             temperature,
             threshold,
             power,
@@ -241,21 +253,80 @@ impl NvidiaControl {
         })
     }
 
-    pub fn power_limit(&self) -> Result<omen_core::gpu_power::PowerLimitState, String> {
+    pub fn power_limit(&self) -> Result<glph_core::gpu_power::PowerLimitState, String> {
         self.power.read(self.handle)
+    }
+    pub fn power_bounds_mw(&self) -> Result<(u32, u32), String> {
+        self.power.bounds(self.handle)
+    }
+    pub fn clock_setter_export(&self) -> bool {
+        self.set_offsets.is_some()
+    }
+    pub fn locked_clocks_available(&self) -> bool {
+        self.set_locked_clocks.is_some() && self.reset_locked_clocks.is_some()
+    }
+    pub fn max_graphics_clock_mhz(&self) -> Option<u32> {
+        let mut value = 0u32;
+        // SAFETY: Public NVML_CLOCK_GRAPHICS (0), live handle, exact u32 output.
+        let result = unsafe { self.max_clock_info?(self.handle, 0, &mut value) };
+        (result == 0
+            && (glph_core::profiles::GPU_MAX_CLOCK_MIN_MHZ as u32
+                ..=glph_core::profiles::GPU_MAX_CLOCK_MAX_MHZ as u32)
+                .contains(&value))
+        .then_some(value)
+    }
+    /// Applies a public NVML upper graphics clock ceiling (`min = 0, max = max_mhz`)
+    /// with zero GPU restart and zero private NVAPI calls.
+    pub fn set_locked_clocks(&self, max_mhz: u32) -> Result<(), String> {
+        let min_allowed = glph_core::profiles::GPU_MAX_CLOCK_MIN_MHZ as u32;
+        let max_allowed = glph_core::profiles::GPU_MAX_CLOCK_MAX_MHZ as u32;
+        if !(min_allowed..=max_allowed).contains(&max_mhz) {
+            return Err(format!(
+                "GPU max clock cap {max_mhz} MHz is outside {min_allowed}..={max_allowed} MHz"
+            ));
+        }
+        let setter = self
+            .set_locked_clocks
+            .ok_or("NVML locked-clocks SET is unavailable")?;
+        // SAFETY: Public NVML contract; min=0 keeps normal idle downclocking, max caps boost.
+        status("locked clocks SET", unsafe {
+            setter(self.handle, 0, max_mhz)
+        })
+    }
+    /// Releases any public NVML graphics clock ceiling back to stock boost behavior.
+    pub fn reset_locked_clocks(&self) -> Result<(), String> {
+        let reset = self
+            .reset_locked_clocks
+            .ok_or("NVML locked-clocks RESET is unavailable")?;
+        // SAFETY: Public NVML contract on live device handle.
+        status("locked clocks RESET", unsafe { reset(self.handle) })
     }
     pub fn power_limit_setter(&self) -> bool {
         self.power.can_set()
     }
     pub fn set_power_limit(
         &self,
-        expected: &omen_core::gpu_power::PowerLimitState,
+        expected: &glph_core::gpu_power::PowerLimitState,
         requested_mw: i64,
     ) -> Result<(), String> {
         self.power.write(self.handle, expected, requested_mw)
     }
 
     pub fn thermal_guard(&self, model_threshold_c: u32) -> Result<(), String> {
+        self.thermal_guard_if_raising(model_threshold_c, true)
+    }
+
+    /// Directional thermal guard: never blocks undervolts, negative clock offsets,
+    /// clock caps, or power reductions even when the GPU is already hot; only
+    /// guards writes that raise positive OC or power headroom.
+    pub fn thermal_guard_if_raising(
+        &self,
+        model_threshold_c: u32,
+        raising: bool,
+    ) -> Result<(), String> {
+        if !raising {
+            return Ok(());
+        }
         let temperature = self
             .thermal(self.temperature, 0)
             .ok_or("No GPU temperature for write validation")?;

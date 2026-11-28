@@ -1,8 +1,10 @@
 //! Values behind the dashboard quick switches: who controls the fans and the
 //! BIOS graphics mode (MUX). Stored keys stay stable across releases.
+use serde::{Deserialize, Serialize};
 
 /// Fan control chosen on the dashboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FanMode {
     /// Pause our loop after safe release; firmware ownership is not readable.
     #[default]

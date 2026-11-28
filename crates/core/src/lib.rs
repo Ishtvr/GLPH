@@ -1,4 +1,4 @@
-//! Hardware-independent policy for PerformanceHub. No OS access or firmware writes.
+//! Hardware-independent policy for GLPH (GamingLaptopPerformanceHub). No OS access or firmware writes.
 pub mod app_settings;
 pub mod appearance;
 pub mod battery;
@@ -30,13 +30,15 @@ pub mod preset;
 pub mod profiles;
 pub mod quick_switch;
 pub mod readback;
+pub mod service;
 pub mod supervisor;
+pub mod telemetry_history;
 pub mod transaction;
 pub mod vf;
 
 use serde::{Deserialize, Serialize};
 
-pub const APP_NAME: &str = "PerformanceHub";
+pub const APP_NAME: &str = "GLPH";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Inventory {
@@ -63,6 +65,9 @@ pub struct GpuSample {
     pub temperature_c: Option<i32>,
     pub clock_mhz: Option<u32>,
     pub power_w: Option<f64>,
+    /// GPU core utilization percentage (`0..=100`) from NVML.
+    #[serde(default)]
+    pub utilization_percent: Option<u8>,
     #[serde(default)]
     pub enforced_limit_w: Option<f64>,
     pub default_limit_w: Option<f64>,
@@ -75,8 +80,6 @@ pub struct GpuSample {
 pub struct CpuSample {
     /// Busy CPU time over the sampling interval; this is not package wattage.
     pub busy_percent: Option<f64>,
-    /// Average CurrentMhz reported by Windows. Not a measured boost/effective clock.
-    pub windows_clock_mhz: Option<u32>,
     pub logical_processors: Option<u32>,
     /// Requires a verified CPU-family-specific hardware reader; never estimated from load.
     pub package_power_w: Option<f64>,
@@ -84,6 +87,8 @@ pub struct CpuSample {
     /// An ACPI thermal zone is never substituted.
     pub temperature_c: Option<f64>,
     /// Explicit provenance/interval for optional, verified hardware readings.
+    /// Effective clocks come strictly from direct hardware counters (APERF/MPERF),
+    /// never from Windows power-manager estimates.
     pub hardware: Option<CpuHardwareSample>,
     pub warnings: Vec<String>,
 }

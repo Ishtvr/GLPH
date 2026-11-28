@@ -76,6 +76,7 @@ impl Enforcer {
     /// vanished programs are skipped, never retried in a loop).
     pub fn tick(&mut self, processes: &mut impl Processes, target: Option<usize>) -> Vec<String> {
         let mut errors = vec![];
+        let mut failed_this_tick = vec![];
         if target != self.target {
             // A new selection moves every pinned program; "all" releases them.
             let keys: Vec<_> = self.originals.keys().copied().collect();
@@ -83,7 +84,13 @@ impl Enforcer {
                 let mask = target.unwrap_or(self.originals[&key]);
                 if let Err(e) = processes.set_affinity(key, mask) {
                     errors.push(e);
-                    self.originals.remove(&key);
+                    failed_this_tick.push(key);
+                    // Only drop the saved original when the process has vanished
+                    // or is permanently unreadable; retain it on transient errors
+                    // so a later release/shutdown can still restore it.
+                    if processes.affinity(key).is_err() {
+                        self.originals.remove(&key);
+                    }
                 }
             }
             if target.is_none() {
@@ -97,6 +104,9 @@ impl Enforcer {
         let Some(key) = processes.foreground() else {
             return errors;
         };
+        if failed_this_tick.contains(&key) {
+            return errors;
+        }
         match processes.affinity(key) {
             // Already inside the selection (pinned before, or restricted by
             // the program itself): leave it alone.
@@ -278,5 +288,28 @@ mod tests {
         assert!(enforcer.tick(&mut fake, Some(CCDS[0])).is_empty());
         assert_eq!(enforcer.pinned(), MAX_TRACKED);
         assert_eq!(fake.masks[&key(extra_pid)], CCDS[0]);
+    }
+
+    #[test]
+    fn transient_set_affinity_error_retains_original_for_later_release() {
+        let mut fake = Fake::default();
+        fake.masks.insert(key(1), 0xffff_ffff);
+        let mut enforcer = Enforcer::default();
+        fake.foreground = Some(key(1));
+        assert!(enforcer.tick(&mut fake, Some(CCDS[0])).is_empty());
+        assert_eq!(enforcer.pinned(), 1);
+        // Transiently block set_affinity while process 1 is still alive/readable.
+        fake.protected.push(key(1));
+        assert_eq!(enforcer.tick(&mut fake, Some(CCDS[1])).len(), 1);
+        assert_eq!(
+            enforcer.pinned(),
+            1,
+            "alive process must retain its saved original"
+        );
+        // Once writable again, release restores the original mask.
+        fake.protected.clear();
+        enforcer.release(&mut fake);
+        assert_eq!(fake.masks[&key(1)], 0xffff_ffff);
+        assert_eq!(enforcer.pinned(), 0);
     }
 }

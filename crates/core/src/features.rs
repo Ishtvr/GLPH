@@ -94,6 +94,8 @@ pub enum Feature {
     /// Whole-watt GPU Power Limit (Direct TGP) target stored in mW.
     /// Applied via reversible flashless VBIOS Policy[2] override and verified via NVML.
     GpuDynamicBoostLimitMw,
+    /// Public NVML maximum graphics clock ceiling in MHz (instant, zero GPU restart).
+    GpuMaxClockMhz,
     /// CPU maximum boost frequency ceiling (Fmax) in MHz (`RSMU 0x70 / 0x6E`).
     CpuBoostLimitMhz,
     /// Serialized legacy input only; never a current feature.
@@ -239,6 +241,7 @@ impl Feature {
             Self::KeyboardEffect => (Category::Omen, ValueKind::Choice, Unit::None),
             Self::HpSharedPowerMw => (Category::Omen, ValueKind::Integer, Unit::Milliwatt),
             Self::GpuDynamicBoostLimitMw => (Category::Gpu, ValueKind::Integer, Unit::Milliwatt),
+            Self::GpuMaxClockMhz => (Category::Gpu, ValueKind::Integer, Unit::Mhz),
             Self::CpuBoostLimitMhz => (Category::Cpu, ValueKind::Integer, Unit::Mhz),
         };
         Descriptor {
@@ -333,6 +336,7 @@ impl Feature {
             Self::KeyboardEffect,
             Self::HpSharedPowerMw,
             Self::GpuDynamicBoostLimitMw,
+            Self::GpuMaxClockMhz,
             Self::CpuBoostLimitMhz,
         ]
     }

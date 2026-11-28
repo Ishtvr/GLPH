@@ -16,11 +16,15 @@ mod elevation;
 #[cfg(windows)]
 mod fan_watch;
 #[cfg(windows)]
+mod gpu_crash_guard;
+#[cfg(windows)]
 mod i18n;
 #[cfg(windows)]
 mod inventory;
 #[cfg(windows)]
 mod keyboard_ui;
+#[cfg(windows)]
+mod material_textures;
 #[cfg(windows)]
 mod native_ui;
 #[cfg(windows)]
@@ -89,7 +93,7 @@ fn main() {
                 .encode_utf16()
                 .chain(Some(0))
                 .collect();
-            let title: Vec<u16> = omen_core::APP_NAME.encode_utf16().chain(Some(0)).collect();
+            let title: Vec<u16> = glph_core::APP_NAME.encode_utf16().chain(Some(0)).collect();
             // SAFETY: Strings are terminated and remain alive for the modal call.
             unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
@@ -125,7 +129,22 @@ fn run() -> Result<(), String> {
     let args = {
         let mut args = args;
         i18n::configure(&mut args)?;
-        runtime_priority::configure()?;
+        let is_background_child = args.first().is_some_and(|a| {
+            matches!(
+                a.as_str(),
+                "cpu-sensor-child"
+                    | "gpu-sensor-worker"
+                    | "gpu-telemetry-read"
+                    | "gpu-limit-read"
+                    | "inventory"
+                    | "fan-service"
+            )
+        });
+        if is_background_child {
+            runtime_priority::configure_background()?;
+        } else {
+            runtime_priority::configure()?;
+        }
         args
     };
     // GDI scaling renders text and shapes at the monitor resolution while the
@@ -194,7 +213,7 @@ fn run() -> Result<(), String> {
         };
         // Opening the dashboard needs local preferences, not a synchronous
         // Task Scheduler COM connection. --show also overrides tray startup.
-        let stored = omen_platform::profile_store::ProfileStore::user_data()
+        let stored = glph_platform::profile_store::ProfileStore::user_data()
             .and_then(|store| store.app_settings())
             .unwrap_or_default();
         return ui::run(tray || (args.is_empty() && stored.start_in_tray));
@@ -312,7 +331,7 @@ fn run() -> Result<(), String> {
                         existing.ends_with(" --tray"),
                     ))
                 }),
-                _ => return Err(omen_core::message::msg("cli.unknown", &[])),
+                _ => return Err(glph_core::message::msg("cli.unknown", &[])),
             };
             if let Some(entry) = entry {
                 autostart::set_entry(entry.as_deref())?;
@@ -320,7 +339,7 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("cpu-sensor-status") if args.len() == 1 => {
-            let record = omen_platform::profile_store::ProfileStore::user_data()?.cpu_error()?;
+            let record = glph_platform::profile_store::ProfileStore::user_data()?.cpu_error()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({"last_cpu_error":record}))
@@ -339,13 +358,13 @@ fn run() -> Result<(), String> {
         }
         Some("diagnose") if args.len() == 1 => {
             #[cfg(windows)]
-            let mut cpu = omen_platform::Cpu::new();
-            let inventory = omen_platform::inventory();
+            let mut cpu = glph_platform::Cpu::new();
+            let inventory = glph_platform::inventory();
             #[cfg(windows)]
-            let mut nvidia = omen_platform::Nvidia::new();
-            let mut snapshot = omen_core::Snapshot {
+            let mut nvidia = glph_platform::Nvidia::new();
+            let mut snapshot = glph_core::Snapshot {
                 inventory,
-                power: omen_platform::power_status(),
+                power: glph_platform::power_status(),
                 ..Default::default()
             };
             #[cfg(windows)]
@@ -365,8 +384,13 @@ fn run() -> Result<(), String> {
         Some("inventory") if args.len() == 1 => {
             println!(
                 "{}",
-                serde_json::to_string(&omen_platform::inventory()).map_err(|e| e.to_string())?
+                serde_json::to_string(&glph_platform::inventory()).map_err(|e| e.to_string())?
             );
+        }
+        #[cfg(windows)]
+        Some("gpu-sensor-worker") if args.len() == 3 => {
+            let parent = args[2].parse::<u32>().map_err(|e| e.to_string())?;
+            return telemetry_worker::worker_child(&args[1], parent);
         }
         #[cfg(windows)]
         Some("gpu-telemetry-read") if args.len() == 1 => {
@@ -378,10 +402,13 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("gpu-limit-read") if args.len() == 1 => {
+            if glph_platform::ControlLease::gpu_pause_active() {
+                return Err("GPU telemetry is paused for a hardware transaction".into());
+            }
             // Yield while a foreground control (e.g. dGPU TGP restart) holds the lease.
-            let _lease = omen_platform::ControlLease::acquire_background()?;
+            let _lease = glph_platform::ControlLease::acquire_background()?;
             // One short NVML session per read, in this disposable process.
-            let reading = omen_platform::GpuLimitProbe::new()?.read()?;
+            let reading = glph_platform::GpuLimitProbe::new()?.read()?;
             println!(
                 "{}",
                 serde_json::to_string(&reading).map_err(|e| e.to_string())?
@@ -389,13 +416,13 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("hp-control-guardian") if args.len() == 1 => {
-            omen_platform::hp_control::run_guardian_process()?;
+            glph_platform::hp_control::run_guardian_process()?;
         }
         #[cfg(windows)]
         Some("hp-control-status") if args.len() == 1 => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&omen_platform::hp_control::inspect(
+                serde_json::to_string_pretty(&glph_platform::hp_control::inspect(
                     &inventory::read()
                 ))
                 .map_err(|e| e.to_string())?
@@ -403,7 +430,7 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("hp-control-qualify") if args == ["hp-control-qualify", "--confirm-service-test"] => {
-            let report = omen_platform::hp_control::qualify(&inventory::read())?;
+            let report = glph_platform::hp_control::qualify(&inventory::read())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
@@ -415,14 +442,14 @@ fn run() -> Result<(), String> {
         Some("hp-control-recover") if args.len() == 1 => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&omen_platform::hp_control::recover_controller()?)
+                serde_json::to_string_pretty(&glph_platform::hp_control::recover_controller()?)
                     .map_err(|e| e.to_string())?
             );
         }
         #[cfg(windows)]
         Some("hp-read") if args.len() == 1 => {
-            let inventory = omen_platform::inventory();
-            let status = omen_platform::read_hp_gpu_status(&inventory)?;
+            let inventory = glph_platform::inventory();
+            let status = glph_platform::read_hp_gpu_status(&inventory)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&status).map_err(|e| e.to_string())?
@@ -430,7 +457,7 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("fan-read") if args.len() == 1 => {
-            let report = omen_platform::read_hp_fans(&omen_platform::inventory())?;
+            let report = glph_platform::read_hp_fans(&glph_platform::inventory())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
@@ -438,7 +465,7 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("cooling-read") if args.len() == 1 => {
-            let report = omen_platform::read_cooling_snapshot(&omen_platform::inventory())?;
+            let report = glph_platform::read_cooling_snapshot(&glph_platform::inventory())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
@@ -449,12 +476,12 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("hp-performance-read") if args.len() == 1 => {
-            let inventory = omen_platform::inventory();
+            let inventory = glph_platform::inventory();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "gpu_status": omen_platform::read_hp_gpu_status(&inventory),
-                    "system_design": omen_platform::read_hp_system_design(&inventory),
+                    "gpu_status": glph_platform::read_hp_gpu_status(&inventory),
+                    "system_design": glph_platform::read_hp_system_design(&inventory),
                     "hardware_applied": false
                 }))
                 .map_err(|e| e.to_string())?
@@ -462,8 +489,8 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("cpu-hardware-read") if args.len() == 1 => {
-            let inventory = omen_platform::inventory();
-            let mut reader = omen_platform::CpuHardwareReader::new(&inventory)?;
+            let inventory = glph_platform::inventory();
+            let mut reader = glph_platform::CpuHardwareReader::new(&inventory)?;
             let baseline = reader.sample()?;
             std::thread::sleep(std::time::Duration::from_millis(1100));
             let measured = reader.sample()?;
@@ -471,8 +498,8 @@ fn run() -> Result<(), String> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "board":inventory.board,"bios":inventory.bios,
-                    "driver_sha256":omen_platform::CPU_DRIVER_SHA256,
-                    "module_sha256":omen_platform::CPU_MODULE_SHA256,
+                    "driver_sha256":glph_platform::CPU_DRIVER_SHA256,
+                    "module_sha256":glph_platform::CPU_MODULE_SHA256,
                     "baseline":baseline,"measured":measured,
                 }))
                 .map_err(|e| e.to_string())?
@@ -480,16 +507,16 @@ fn run() -> Result<(), String> {
         }
         #[cfg(windows)]
         Some("keyboard-read") if args.len() == 1 => {
-            let inventory = omen_platform::inventory();
-            let state = omen_platform::read_hp_keyboard_state(&inventory)?;
+            let inventory = glph_platform::inventory();
+            let state = glph_platform::read_hp_keyboard_state(&inventory)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?
             );
         }
         Some("plan") if args.len() == 2 => {
-            let profile = omen_core::Profile::parse(&args[1])?;
-            let plan = omen_core::preview_profile(&omen_platform::inventory(), profile);
+            let profile = glph_core::Profile::parse(&args[1])?;
+            let plan = glph_core::preview_profile(&glph_platform::inventory(), profile);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?
@@ -500,13 +527,13 @@ fn run() -> Result<(), String> {
             println!("{}", i18n::tf("cli.help", &[&env!("CARGO_PKG_VERSION")]));
             #[cfg(not(windows))]
             println!(
-                "PerformanceHub {}: native UI and hardware controls require Windows x64.",
+                "GLPH {}: native UI and hardware controls require Windows x64.",
                 env!("CARGO_PKG_VERSION")
             );
         }
         _ => {
             #[cfg(windows)]
-            return Err(omen_core::message::msg("cli.unknown", &[]));
+            return Err(glph_core::message::msg("cli.unknown", &[]));
             #[cfg(not(windows))]
             return Err("Use --help for supported commands".into());
         }

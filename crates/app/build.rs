@@ -32,19 +32,19 @@ fn main() {
         version: parts,
         prerelease: !env!("CARGO_PKG_VERSION_PRE").is_empty(),
         strings: &[
-            ("FileDescription", "Omen Hub++"),
+            ("FileDescription", "GamingLaptopPerformanceHub (GLPH)"),
             ("FileVersion", version),
-            ("InternalName", "omen-hub-pp"),
+            ("InternalName", "glph"),
             (
                 "LegalCopyright",
-                "Omen Hub++ contributors; third-party notices included",
+                "GLPH (GamingLaptopPerformanceHub) contributors; third-party notices included",
             ),
-            ("OriginalFilename", "omen-hub-pp.exe"),
-            ("ProductName", "Omen Hub++"),
+            ("OriginalFilename", "glph.exe"),
+            ("ProductName", "GLPH"),
             ("ProductVersion", version),
         ],
     }));
-    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("omen-hub-pp.res");
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("glph.res");
     fs::write(&output, win_resource::res_file(&resources)).expect("Write resource file");
     // link.exe and lld-link convert a .res input with their built-in cvtres.
     println!("cargo:rustc-link-arg-bins={}", output.display());

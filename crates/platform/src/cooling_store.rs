@@ -1,6 +1,6 @@
 //! Durable cooling responsibility, separate from the service's STOP ledger.
 //! Callers serialize mutations with the hardware lease. Paths never come from a record.
-use omen_core::cooling_override::Checkpoint;
+use glph_core::cooling_override::Checkpoint;
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
@@ -91,7 +91,7 @@ impl CoolingJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omen_core::{
+    use glph_core::{
         cooling_override::{HelperIdentity, Phase},
         ownership::{Identity, Owner, Snapshot, State, Subject},
     };

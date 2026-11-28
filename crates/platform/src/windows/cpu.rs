@@ -1,15 +1,14 @@
-//! Public read-only Windows CPU telemetry. No drivers or vendor SDK initialization.
-use omen_core::{
+//! Public read-only Windows CPU load timing (`GetSystemTimes`).
+//! CPU temperature and effective clocks are NEVER read from Windows APIs;
+//! they come exclusively from direct hardware counters via `cpu_hardware`.
+use glph_core::{
     CpuSample,
     cpu::{CpuTimes, busy_percent},
 };
 use std::time::{Duration, Instant};
 use windows_sys::Win32::{
     Foundation::FILETIME,
-    System::{
-        Power::{CallNtPowerInformation, PROCESSOR_POWER_INFORMATION, ProcessorInformation},
-        Threading::{GetActiveProcessorCount, GetSystemTimes},
-    },
+    System::Threading::{GetActiveProcessorCount, GetSystemTimes},
 };
 
 fn ticks(value: FILETIME) -> u64 {
@@ -38,9 +37,10 @@ fn system_times() -> Result<CpuTimes, String> {
 
 pub struct Cpu {
     count: u32,
+    supported: bool,
     previous: Option<CpuTimes>,
+    last_busy_percent: Option<f64>,
     sampled_at: Instant,
-    clocks: Vec<PROCESSOR_POWER_INFORMATION>,
 }
 impl Default for Cpu {
     fn default() -> Self {
@@ -54,15 +54,12 @@ impl Cpu {
         let supported = (1..=64).contains(&count);
         Self {
             count,
-            previous: if supported { system_times().ok() } else { None },
-            sampled_at: Instant::now(),
+            supported,
             // Beyond one group GetSystemTimes does not report a global total.
             // Until a group-aware adapter exists, avoid showing a misleading partial result.
-            clocks: if supported {
-                vec![PROCESSOR_POWER_INFORMATION::default(); count as usize]
-            } else {
-                vec![]
-            },
+            previous: if supported { system_times().ok() } else { None },
+            last_busy_percent: None,
+            sampled_at: Instant::now(),
         }
     }
     pub fn sample(&mut self) -> CpuSample {
@@ -70,7 +67,7 @@ impl Cpu {
             logical_processors: (self.count != 0).then_some(self.count),
             ..Default::default()
         };
-        if self.clocks.is_empty() {
+        if !self.supported {
             sample.warnings.push("CPU telemetry currently requires a single processor group (1–64 logical processors)".into());
             return sample;
         }
@@ -79,6 +76,7 @@ impl Cpu {
                 Ok(current) => {
                     if let Some(previous) = self.previous.replace(current) {
                         sample.busy_percent = busy_percent(previous, current);
+                        self.last_busy_percent = sample.busy_percent;
                         if sample.busy_percent.is_none() {
                             sample.warnings.push("CPU timing counters reset or were inconsistent; taking a fresh baseline".into());
                         }
@@ -86,42 +84,30 @@ impl Cpu {
                 }
                 Err(error) => {
                     self.previous = None;
+                    self.last_busy_percent = None;
                     sample.warnings.push(error);
                 }
             }
             self.sampled_at = Instant::now();
-        }
-        self.clocks.fill(PROCESSOR_POWER_INFORMATION::default());
-        // SAFETY: ProcessorInformation is a GET with null input. The allocated
-        // output holds one SDK-defined structure for every logical processor.
-        let status = unsafe {
-            CallNtPowerInformation(
-                ProcessorInformation,
-                std::ptr::null(),
-                0,
-                self.clocks.as_mut_ptr().cast(),
-                std::mem::size_of_val(self.clocks.as_slice()) as u32,
-            )
-        };
-        if status == 0 {
-            let count = self.clocks.iter().filter(|cpu| cpu.CurrentMhz > 0).count();
-            if count == self.clocks.len() {
-                let total: u64 = self
-                    .clocks
-                    .iter()
-                    .map(|cpu| u64::from(cpu.CurrentMhz))
-                    .sum();
-                sample.windows_clock_mhz = Some((total / count as u64) as u32);
-            } else {
-                sample
-                    .warnings
-                    .push("Windows CPU clock response was incomplete".into());
-            }
         } else {
-            sample
-                .warnings
-                .push(format!("Windows CPU clock unavailable: {status:#x}"));
+            // Preserve the most recent valid reading during rapid polls (e.g. live
+            // poll-rate changes) so UI telemetry never flashes blank (`—`).
+            sample.busy_percent = self.last_busy_percent;
         }
         sample
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rapid_sample_within_200ms_preserves_last_busy_percent() {
+        let mut cpu = Cpu::new();
+        cpu.last_busy_percent = Some(42.5);
+        cpu.sampled_at = Instant::now();
+        let sample = cpu.sample();
+        assert_eq!(sample.busy_percent, Some(42.5));
     }
 }

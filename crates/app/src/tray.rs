@@ -2,7 +2,7 @@
 //! recreates its notification area. Failed registration gets a bounded retry,
 //! never a permanent idle timer or a hidden, unreachable dashboard.
 use crate::native_ui::{app_icon, wide};
-use omen_core::APP_NAME;
+use glph_core::APP_NAME;
 use std::cell::Cell;
 use windows_sys::Win32::{
     Foundation::HWND,

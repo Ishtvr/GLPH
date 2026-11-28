@@ -193,7 +193,7 @@ fn spawn_read(job: &ReadJob, read: ReadCommand) -> Result<(OwnedHandle, File), S
             ptr::null(),
             ptr::null(),
             1,
-            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | EXTENDED_STARTUPINFO_PRESENT,
             ptr::null(),
             ptr::null(),
             &startup.StartupInfo,
@@ -215,10 +215,11 @@ fn spawn_read(job: &ReadJob, read: ReadCommand) -> Result<(OwnedHandle, File), S
     }
 }
 
-fn child_status(process: &OwnedHandle) -> Result<Option<u32>, String> {
-    // SAFETY: This is the owned handle of the child created above.
+fn wait_child_exit(process: &OwnedHandle, timeout: Duration) -> Result<Option<u32>, String> {
+    let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+    // SAFETY: Owned child process handle; event-driven wait with bounded timeout.
     unsafe {
-        match WaitForSingleObject(process.as_raw_handle(), 0) {
+        match WaitForSingleObject(process.as_raw_handle(), ms) {
             WAIT_TIMEOUT => Ok(None),
             WAIT_OBJECT_0 => {
                 let mut code = 0;
@@ -235,6 +236,7 @@ fn child_status(process: &OwnedHandle) -> Result<Option<u32>, String> {
 #[derive(Clone, Copy)]
 pub enum ReadCommand {
     Inventory,
+    #[allow(dead_code)]
     GpuTelemetry,
     /// Enforced GPU power limit and draw for "Keep preset".
     GpuLimit,
@@ -260,23 +262,25 @@ pub fn capture<T: DeserializeOwned>(command: ReadCommand) -> Result<T, String> {
         let _ = tx.send(result);
     });
     let deadline = Instant::now() + READ_TIMEOUT;
-    let status = loop {
-        match child_status(&child) {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            result => {
-                // Dropping this private job terminates only our fixed read child
-                // and closes its writer. Do not wait indefinitely on teardown.
-                drop(job);
-                return Err(match result {
-                    Err(error) => error,
-                    _ => "Isolated read exceeded the 5-second deadline".into(),
-                });
-            }
+    let status = match wait_child_exit(&child, READ_TIMEOUT) {
+        Ok(Some(status)) => status,
+        result => {
+            // Dropping this private job terminates only our fixed read child
+            // and closes its writer. Do not wait indefinitely on teardown.
+            drop(job);
+            return Err(match result {
+                Err(error) => error,
+                _ => "Isolated read exceeded the 5-second deadline".into(),
+            });
         }
     };
+    // Child has already exited; grant a short floor so the pipe drain thread
+    // can deliver its buffer even when the child finished right near the deadline.
+    let drain_wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(250));
     let bytes = rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .recv_timeout(drain_wait)
         .map_err(|_| "Isolated read output did not finish within the 5-second deadline")?
         .map_err(|e| e.to_string())?;
     if status != 0 {

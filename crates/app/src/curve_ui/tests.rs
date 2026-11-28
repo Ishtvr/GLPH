@@ -1,6 +1,6 @@
 //! Native controls with synthetic data only: no driver, profile store or helper.
 use super::*;
-use omen_core::{
+use glph_core::{
     curve_editor::DragMode,
     curve_view::Viewport,
     vf::{VfNode, VfState},

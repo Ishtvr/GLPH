@@ -4,12 +4,12 @@ use crate::{
     native_ui::{self as ui, text},
     theme,
 };
-use omen_core::{
+use glph_core::{
     features::Feature,
     keyboard::KeyboardState,
     profiles::{PerformanceProfile, Value},
 };
-use omen_platform::{DirectLighting, profile_store::ProfileStore};
+use glph_platform::{DirectLighting, profile_store::ProfileStore};
 use std::{
     cell::{Cell, RefCell},
     path::Path,
@@ -554,7 +554,7 @@ fn run_window(
                 .iter()
                 .find(|s| s.feature == Feature::KeyboardEffect)
         })
-        .is_none_or(|s| s.value == Value::Choice(omen_core::profiles::Choice::Static));
+        .is_none_or(|s| s.value == Value::Choice(glph_core::profiles::Choice::Static));
     let state = Box::new(State {
         theme: theme::Theme::new(),
         tx,

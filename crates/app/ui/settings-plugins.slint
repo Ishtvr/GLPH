@@ -39,7 +39,7 @@ component PluginTableRow inherits Rectangle {
     callback toggled(string, bool);
     callback remove-clicked(string);
 
-    background: root.item.highlighted ? Theme.hover : row-area.has-hover ? Theme.hover.with-alpha(0.45) : transparent;
+    background: root.item.highlighted ? Theme.control-hover-fill : row-area.has-hover ? Theme.hover.with-alpha(0.45) : transparent;
     height: main-layout.preferred-height;
 
     if root.item.highlighted: Rectangle {
@@ -47,11 +47,12 @@ component PluginTableRow inherits Rectangle {
         y: 0px;
         width: 2px;
         height: parent.height;
-        background: Theme.accent;
+        background: Theme.accent-fill;
     }
 
     row-area := TouchArea {
-        enabled: false;
+        enabled: true;
+        mouse-cursor: default;
     }
 
     main-layout := VerticalLayout {
@@ -75,9 +76,10 @@ component PluginTableRow inherits Rectangle {
                     height: 32px;
                     y: (parent.height - self.height) / 2;
                     border-radius: 6px;
-                    background: Theme.control;
+                    background: Theme.control-fill;
                     border-width: 1px;
-                    border-color: Theme.line;
+                    border-color: Theme.control-border;
+                    clip: true;
                     horizontal-stretch: 0;
                     Image {
                         width: 18px;
@@ -132,12 +134,13 @@ component PluginTableRow inherits Rectangle {
                 overflow: elide;
             }
 
-            // Col 3: Status pill "(aktiv)" / "(inaktiv)"
+            // Col 3: Status pill "(aktiv)" / "(inaktiv)" / "Inkompatibel" / "Fehler"
             VerticalLayout {
-                width: 104px;
+                width: 116px;
                 horizontal-stretch: 0;
                 alignment: center;
                 StatusPill {
+                    width: 116px;
                     text: root.item.status-text;
                     kind: root.item.status-kind;
                 }
@@ -164,6 +167,10 @@ component PluginTableRow inherits Rectangle {
                     toggled(next) => { root.toggled(root.item.id, next); }
                 }
 
+                if !root.item.can-remove: Rectangle {
+                    width: 28px;
+                }
+
                 if root.item.can-remove: ActionButton {
                     fixed-width: true;
                     control-width: 28px;
@@ -184,7 +191,7 @@ component PluginTableRow inherits Rectangle {
 
         // Expandable inline detail drawer (0ms crisp reveal, shows full untruncated metadata)
         if root.show-details: Rectangle {
-            background: Theme.canvas.with-alpha(0.55);
+            background: Theme.chart-plot-fill;
             height: detail-box.preferred-height;
             detail-box := VerticalLayout {
                 padding-left: 60px;
@@ -248,12 +255,15 @@ export component PluginTable inherits SettingsCard {
     callback open-folder-clicked();
 
     VerticalLayout {
+        padding: 1px;
         spacing: 0px;
 
-        // Table Header Row
+        // Table Header Row (rounded top corners prevent software-renderer corner bleed)
         Rectangle {
             height: 36px;
-            background: Theme.control.with-alpha(0.55);
+            border-top-left-radius: 9px;
+            border-top-right-radius: 9px;
+            background: Theme.chart-plot-fill;
             HorizontalLayout {
                 padding-left: 16px;
                 padding-right: 16px;
@@ -282,7 +292,7 @@ export component PluginTable inherits SettingsCard {
                 }
 
                 Text {
-                    width: 104px;
+                    width: 116px;
                     horizontal-stretch: 0;
                     text: Theme.tr("plugins.col_status");
                     color: Theme.muted;

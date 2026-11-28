@@ -1,6 +1,6 @@
 //! Fixed public NVML power-limit ABI. No private voltage/TGP commands.
 use super::{Handle, Library, status, symbol};
-use omen_core::gpu_power::PowerLimitState;
+use glph_core::gpu_power::PowerLimitState;
 use std::time::{Duration, Instant};
 
 type Get = unsafe extern "C" fn(Handle, *mut u32) -> i32;

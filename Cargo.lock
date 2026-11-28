@@ -1561,6 +1561,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "glph"
+version = "2.0.0-alpha.1"
+dependencies = [
+ "glph-core",
+ "glph-platform",
+ "png",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "slint",
+ "slint-build",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "glph-core"
+version = "2.0.0-alpha.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "glph-platform"
+version = "2.0.0-alpha.1"
+dependencies = [
+ "glph-core",
+ "libloading",
+ "quick-xml 0.38.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "windows",
+ "windows-sys 0.61.2",
+ "wmi",
+ "zip",
+]
+
+[[package]]
+name = "glph-service"
+version = "2.0.0-alpha.1"
+dependencies = [
+ "glph-core",
+ "glph-platform",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "glutin"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3087,30 +3137,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "omen-core"
-version = "2.0.0-alpha.1"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "omen-platform"
-version = "2.0.0-alpha.1"
-dependencies = [
- "libloading",
- "omen-core",
- "quick-xml 0.38.4",
- "serde",
- "serde_json",
- "sha2",
- "windows",
- "windows-sys 0.61.2",
- "wmi",
- "zip",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3236,20 +3262,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "performance-hub"
-version = "2.0.0-alpha.1"
-dependencies = [
- "omen-core",
- "omen-platform",
- "raw-window-handle",
- "serde",
- "serde_json",
- "slint",
- "slint-build",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "petgraph"

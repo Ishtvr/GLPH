@@ -4,13 +4,13 @@ use crate::{
     i18n::{t, tf},
     native_ui::{input, positioned_control as control, text, token, wide},
 };
-use omen_core::{
+use glph_core::{
     curve_editor::{Curve, Kind, Point},
     features::Feature,
     profiles::{DeviceBinding, PROFILE_SCHEMA, PerformanceProfile, Setting, Value},
     transaction::Backend,
 };
-use omen_platform::{Controller, profile_store::ProfileStore};
+use glph_platform::{Controller, profile_store::ProfileStore};
 use std::{
     cell::{Cell, RefCell},
     path::Path,
@@ -189,7 +189,7 @@ fn load_fans() -> Result<View, String> {
 enum Request {
     Load(Option<String>),
     LoadFans,
-    SaveFans(Vec<omen_core::profiles::FanPoint>),
+    SaveFans(Vec<glph_core::profiles::FanPoint>),
     Save {
         baseline: Box<Option<PerformanceProfile>>,
         binding: Box<DeviceBinding>,
@@ -214,7 +214,7 @@ fn worker(hwnd: usize, rx: mpsc::Receiver<Request>, tx: mpsc::Sender<Update>) {
                 Request::SaveFans(points) => {
                     let store = ProfileStore::user_data()?;
                     store.save_active_fan_curve(&points)?;
-                    if !omen_platform::fan_service_installed() {
+                    if !glph_platform::fan_service_installed() {
                         crate::elevation::run(None, crate::elevation::Action::FanService, || {
                             false
                         })?;
@@ -303,7 +303,7 @@ fn worker(hwnd: usize, rx: mpsc::Receiver<Request>, tx: mpsc::Sender<Update>) {
                     };
                     let status = if let Some(points) = active {
                         store.save_active_fan_curve(&points)?;
-                        if !omen_platform::fan_service_installed() {
+                        if !glph_platform::fan_service_installed() {
                             crate::elevation::run(
                                 None,
                                 crate::elevation::Action::FanService,
@@ -1478,7 +1478,7 @@ fn run_editor(
     draft: Option<(HWND, Curve, DeviceBinding)>,
 ) -> Result<Option<Value>, String> {
     if let Some(id) = &id {
-        omen_core::profiles::validate_id(id)?;
+        glph_core::profiles::validate_id(id)?;
     }
     let (tx, requests) = mpsc::channel();
     let (updates, rx) = mpsc::channel();
@@ -1634,7 +1634,7 @@ fn run_editor(
                             let start = curve.points.clone();
                             curve.drag_gpu(
                                 &start,
-                                omen_core::curve_editor::DragMode::CurrentOffset,
+                                glph_core::curve_editor::DragMode::CurrentOffset,
                                 120,
                             )?;
                             let index = curve

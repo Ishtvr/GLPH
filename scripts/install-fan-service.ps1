@@ -7,9 +7,9 @@ param([ValidateSet('Install','Inspect','Remove')][string]$Mode = 'Install',[stri
 $ErrorActionPreference = 'Stop'
 $fanIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $fanSid = $fanIdentity.User.Value
-$fanTask = 'OmenHubPP-Fan-' + $fanSid
-$fanRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramFiles 'OmenHubPlusPlus'))
-$fanBinary = Join-Path $fanRoot 'Omen Hub++ Fan.exe'
+$fanTask = 'GLPH-Fan-' + $fanSid
+$fanRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramFiles 'GLPH'))
+$fanBinary = Join-Path $fanRoot 'glph-fan.exe'
 $fanReceipt = Join-Path $fanRoot ('fan-service-' + $fanSid + '.json')
 $fanExisting = Get-ScheduledTask -TaskName $fanTask -ErrorAction SilentlyContinue
 
@@ -34,12 +34,12 @@ if (-not ([Security.Principal.WindowsPrincipal]::new($fanIdentity)).IsInRole([Se
 }
 # A pending coupled recovery must keep both protected binaries and tasks intact.
 # Serialize against the native qualification owner before any installer action.
-$recoveryGate = [Threading.Mutex]::new($false, 'Global\OmenHubPP.HpControllerOwner')
+$recoveryGate = [Threading.Mutex]::new($false, 'Global\GLPH.HpControllerOwner')
 $recoveryGateOwned = $false
 try {
     try { $recoveryGateOwned = $recoveryGate.WaitOne(0) }
     catch [Threading.AbandonedMutexException] { $recoveryGateOwned = $true }
-    if (-not $recoveryGateOwned) { throw 'An Omen Hub++ controller session is active; installation/removal was blocked.' }
+    if (-not $recoveryGateOwned) { throw 'A GLPH controller session is active; installation/removal was blocked.' }
     foreach ($recoveryFile in @('controller-ownership.json','controller-cooling.json')) {
         $recoveryPath = Join-Path $fanRoot $recoveryFile
         if (Test-Path -LiteralPath $recoveryPath) {
@@ -92,7 +92,15 @@ if ($Mode -eq 'Remove') {
     [pscustomobject]@{ Removed = $true; TaskName = $fanTask; SoftwareFanCommandsStopped = $true; BiosHandoverVerified = $false } | ConvertTo-Json
     return
 }
-$fanSource = if([string]::IsNullOrWhiteSpace($SourceBinary)){Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\Omen Hub++.exe'}else{[IO.Path]::GetFullPath($SourceBinary)}
+$fanSource = if ([string]::IsNullOrWhiteSpace($SourceBinary)) {
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        throw 'SourceBinary must be specified when install-fan-service.ps1 runs inline.'
+    }
+    $rel = Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\glph.exe'
+    if (Test-Path -LiteralPath $rel -PathType Leaf) { $rel } else { Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\glph.exe' }
+} else {
+    [IO.Path]::GetFullPath($SourceBinary)
+}
 if (-not (Test-Path -LiteralPath $fanSource -PathType Leaf)) { throw 'Build the release executable before installing the fan service.' }
 $fanSourceHash = (Get-FileHash -LiteralPath $fanSource -Algorithm SHA256).Hash
 New-Item -ItemType Directory -Force -Path $fanRoot | Out-Null
@@ -111,7 +119,9 @@ foreach ($fanPrincipal in @($fanAdmins,$fanSystem)) {
 }
 $fanAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($fanUser,[Security.AccessControl.FileSystemRights]::ReadAndExecute,$fanInheritance,$fanPropagation,[Security.AccessControl.AccessControlType]::Allow))
 Set-Acl -LiteralPath $fanRoot -AclObject $fanAcl
-Copy-Item -LiteralPath $fanSource -Destination $fanBinary -Force
+if (-not [IO.Path]::GetFullPath($fanSource).Equals($fanBinary, [StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $fanSource -Destination $fanBinary -Force
+}
 if ((Get-FileHash -LiteralPath $fanBinary -Algorithm SHA256).Hash -ne $fanSourceHash) { throw 'Installed fan executable hash differs from the release.' }
 $fanFileAcl = [Security.AccessControl.FileSecurity]::new()
 $fanFileAcl.SetAccessRuleProtection($false,$false)
@@ -125,7 +135,7 @@ $fanPrincipal = New-ScheduledTaskPrincipal -UserId $fanSid -LogonType Interactiv
 $fanSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 $fanRegistered = $false
 try {
-    Register-ScheduledTask -TaskName $fanTask -Action $fanAction -Trigger $fanTrigger -Principal $fanPrincipal -Settings $fanSettings -Description 'Omen Hub++: saved fan curve and foreground CCD selection; Auto pauses software fan commands.' -Force | Out-Null
+    Register-ScheduledTask -TaskName $fanTask -Action $fanAction -Trigger $fanTrigger -Principal $fanPrincipal -Settings $fanSettings -Description 'GLPH: saved fan curve and foreground CCD selection; Auto pauses software fan commands.' -Force | Out-Null
     $fanRegistered = $true
     $fanScheduler = New-Object -ComObject 'Schedule.Service'
     $fanScheduler.Connect()

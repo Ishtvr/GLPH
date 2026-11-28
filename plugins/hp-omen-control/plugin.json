@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "id": "hp-omen-control",
+  "name": {
+    "de": "HP OMEN Steuerung",
+    "en": "HP OMEN Control"
+  },
+  "description": {
+    "de": "4-Zonen-Tastaturbeleuchtung sowie originale HP OMEN Leistungspläne (Quiet, Balanced, Performance & Unleashed).",
+    "en": "4-zone RGB keyboard lighting and original HP OMEN performance plans (Quiet, Balanced, Performance & Unleashed)."
+  },
+  "version": "2.0.0",
+  "api_version": 1,
+  "author": "GLPH",
+  "category": "lighting",
+  "runtime": "host_surface",
+  "capabilities": [
+    "hardware.hp_lighting",
+    "hardware.hp_modes",
+    "ui.sidebar_page"
+  ],
+  "vendor_filter": {
+    "manufacturers": ["HP"],
+    "require_hp_wmi": true
+  },
+  "ui_surface": {
+    "kind": "hp-omen-suite",
+    "nav_label": {
+      "de": "HP OMEN",
+      "en": "HP OMEN"
+    },
+    "nav_icon": "omen",
+    "nav_order": 10
+  }
+}

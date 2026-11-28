@@ -1,7 +1,7 @@
 //! CCD topology from the L3 cache domains, and the process access the
 //! background service uses to pin the foreground program (documented
 //! GetLogicalProcessorInformationEx / Get- and SetProcessAffinityMask).
-use omen_core::ccd::{ProcessKey, Processes};
+use glph_core::ccd::{ProcessKey, Processes};
 use std::ptr;
 use windows_sys::Win32::{
     Foundation::{CloseHandle, FILETIME, HANDLE},

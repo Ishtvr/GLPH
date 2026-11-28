@@ -29,9 +29,9 @@ export component BrightnessSlider inherits Rectangle {
     private property <float> fraction: clamp((root.value - root.minimum) / max(1, root.maximum - root.minimum), 0, 1);
     Rectangle {
         x: 8px;
-        y: (parent.height - 3px) / 2;
+        y: (parent.height - 4px) / 2;
         width: parent.width - 16px;
-        height: 3px;
+        height: 4px;
         border-radius: 2px;
         background: Theme.line;
         visible: !root.hue-track;
@@ -49,13 +49,17 @@ export component BrightnessSlider inherits Rectangle {
 
     Rectangle {
         x: 8px;
-        y: (parent.height - 3px) / 2;
+        y: (parent.height - 4px) / 2;
         width: (parent.width - 16px) * root.fraction;
-        height: 3px;
-        background: Theme.accent;
+        height: 4px;
+        border-radius: 2px;
+        clip: true;
+        background: Theme.accent-fill;
         visible: root.show-fill;
     }
 
+    // Solid color thumb keeps crisp circular border-radius in both software & FemtoVG renderers,
+    // with an inner specular highlight dot for Metallic / Glass / Glossy / Neon looks.
     Rectangle {
         x: (parent.width - 16px) * root.fraction;
         y: (parent.height - 16px) / 2;
@@ -63,8 +67,20 @@ export component BrightnessSlider inherits Rectangle {
         height: 16px;
         border-radius: 8px;
         background: root.enabled ? Theme.accent : Theme.quiet;
-        border-width: focus.has-focus ? 2px : 0px;
-        border-color: Theme.ink;
+        border-width: focus.has-focus ? 2px : 1px;
+        border-color: focus.has-focus ? Theme.ink
+                    : root.enabled && (Theme.accent-look == 1 || Theme.accent-look == 2 || Theme.accent-look == 3 || Theme.accent-look == 6)
+                      ? Theme.accent-hi
+                    : Theme.accent;
+        Rectangle {
+            visible: root.enabled && (Theme.accent-look == 1 || Theme.accent-look == 2 || Theme.accent-look == 3 || Theme.accent-look == 6);
+            x: 4px;
+            y: 2px;
+            width: 8px;
+            height: 4px;
+            border-radius: 2px;
+            background: #FFFFFF70;
+        }
     }
 
     area := TouchArea {
@@ -111,10 +127,21 @@ export component LineEdit inherits Rectangle {
     horizontal-stretch: 1;
     min-height: Theme.control-height;
     max-height: Theme.control-height;
-    background: root.enabled ? Theme.control : Theme.surface;
+    background: root.enabled ? Theme.control-fill : Theme.surface-fill;
     border-radius: 6px;
-    border-width: 1px;
-    border-color: root.enabled && input.has-focus ? Theme.accent : Theme.line;
+    clip: true;
+    border-width: root.enabled && input.has-focus ? 1.5px : Theme.card-border-width;
+    border-color: root.enabled && input.has-focus ? Theme.accent : Theme.control-border;
+
+    Rectangle {
+        visible: root.enabled;
+        x: 6px;
+        y: 1px;
+        width: max(0px, parent.width - 12px);
+        height: 1px;
+        background: Theme.surface-top-sheen;
+    }
+
     Text {
         x: 12px;
         width: max(0px, parent.width - 24px - root.unit-space);
@@ -236,15 +263,30 @@ export component ToggleSwitch inherits Rectangle {
         width: 40px;
         height: 22px;
         border-radius: 11px;
+        clip: true;
         border-width: 1px;
+        // Keep solid color base so pill corners remain razor-round in all renderers,
+        // layered with specular sheen strip for Metallic / Glass / Glossy / Neon looks.
         background: !root.enabled ? Theme.surface
                   : root.checked ? Theme.accent
                   : area.has-hover ? Theme.hover : Theme.control;
         border-color: !root.enabled ? Theme.line
-                    : root.checked ? Theme.accent : Theme.muted;
-        animate background, border-color {
+                    : root.checked ? Theme.accent-border : Theme.control-border;
+        animate background {
             duration: Theme.reduce-motion ? 0ms : 150ms;
             easing: ease;
+        }
+
+        Rectangle {
+            visible: root.enabled && (root.checked
+                ? (Theme.accent-look == 1 || Theme.accent-look == 2 || Theme.accent-look == 3 || Theme.accent-look == 6)
+                : (Theme.background-look == 1 || Theme.background-look == 2 || Theme.background-look == 3 || Theme.background-look == 6));
+            x: 3px;
+            y: 1px;
+            width: parent.width - 6px;
+            height: 8px;
+            border-radius: 4px;
+            background: root.checked ? #FFFFFF38 : #FFFFFF20;
         }
 
         thumb := Rectangle {
@@ -311,9 +353,10 @@ export component CheckBox inherits Rectangle {
         width: 17px;
         height: 17px;
         border-radius: 4px;
-        background: root.checked ? Theme.accent : Theme.control;
+        clip: true;
+        background: root.checked ? Theme.accent-fill : Theme.control-fill;
         border-width: 1px;
-        border-color: root.enabled ? root.checked ? Theme.accent : Theme.muted : Theme.quiet;
+        border-color: root.enabled ? (root.checked ? Theme.accent-border : Theme.control-border) : Theme.quiet;
         Path {
             visible: root.checked;
             x: 3px;
@@ -352,6 +395,7 @@ export component CheckBox inherits Rectangle {
 export component ComboBox inherits Rectangle {
     in property <[string]> model;
     in property <bool> enabled: true;
+    in property <length> control-width: Theme.field-width;
     in-out property <int> current-index;
     out property <string> current-value: root.model[root.current-index];
     private property <bool> opened;
@@ -366,17 +410,28 @@ export component ComboBox inherits Rectangle {
     accessible-value: root.current-value;
     accessible-action-expand => { root.open(); }
     min-width: 80px;
-    preferred-width: Theme.field-width;
-    max-width: Theme.field-width;
+    preferred-width: root.control-width;
+    max-width: root.control-width;
     horizontal-stretch: 0;
     vertical-stretch: 0;
     preferred-height: Theme.control-height;
     min-height: Theme.control-height;
     max-height: Theme.control-height;
-    background: !root.enabled ? Theme.surface : touch.has-hover ? Theme.hover : Theme.control;
+    background: !root.enabled ? Theme.surface-fill : touch.has-hover ? Theme.control-hover-fill : Theme.control-fill;
     border-radius: 6px;
-    border-width: 1px;
-    border-color: (focus.has-focus || root.opened) && root.enabled ? Theme.accent : Theme.line;
+    clip: true;
+    border-width: (focus.has-focus || root.opened) && root.enabled ? 1.5px : Theme.card-border-width;
+    border-color: (focus.has-focus || root.opened) && root.enabled ? Theme.accent : Theme.control-border;
+
+    Rectangle {
+        visible: root.enabled;
+        x: 6px;
+        y: 1px;
+        width: max(0px, parent.width - 12px);
+        height: 1px;
+        background: Theme.surface-top-sheen;
+    }
+
     function choose(index: int) {
         if root.enabled && root.model.length > 0 {
             root.current-index = clamp(index, 0, root.model.length - 1);
@@ -455,10 +510,11 @@ export component ComboBox inherits Rectangle {
                 return accept;
             }
             Rectangle {
-                background: Theme.surface;
-                border-radius: 6px;
-                border-width: 1px;
-                border-color: Theme.line;
+                background: Theme.popup-fill;
+                border-radius: 8px;
+                border-width: Theme.card-border-width;
+                border-color: Theme.popup-border;
+                clip: true;
             }
 
             list := ScrollView {
@@ -482,7 +538,7 @@ export component ComboBox inherits Rectangle {
                         changed item-height => { self.reveal(); }
                         changed page-height => { self.reveal(); }
                         height: max(Theme.control-height, choice.preferred-height + 16px);
-                        background: index == root.pending-index ? Theme.hover : hit.has-hover ? Theme.control : transparent;
+                        background: index == root.pending-index ? Theme.control-hover-fill : hit.has-hover ? Theme.control-fill : transparent;
                         border-radius: 4px;
                         accessible-role: list-item;
                         accessible-label: value;

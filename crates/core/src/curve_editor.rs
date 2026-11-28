@@ -198,8 +198,8 @@ impl Curve {
         let mut lo = Point { x: 0, y: 0 };
         let mut hi = Point { x: 110, y: 100 };
         if let Some(gpu) = &self.gpu {
-            let node = &gpu.nodes[index];
-            let base = i64::from(node.frequency_khz) - i64::from(node.delta_khz);
+            let bases = gpu.base_frequencies_khz()?;
+            let base = i64::from(bases[index]);
             // Ceil the minimum, floor the maximum; never round across a bound.
             let min = (base + i64::from(gpu.minimum_delta_khz) + 999)
                 .div_euclid(1000)
@@ -539,11 +539,32 @@ impl Curve {
             if divisor == 0 {
                 return Ok(false);
             }
+            let gpu = self
+                .gpu
+                .as_ref()
+                .ok_or_else(|| msg("curve.err.driver_limits", &[]))?;
+            let bases = gpu.base_frequencies_khz()?;
             let mut points = start.to_vec();
-            for p in &mut points {
+            for (i, p) in points.iter_mut().enumerate() {
                 let change = i64::from(delta) * i64::from(p.x - start[pivot].x) / divisor;
-                p.y = i32::try_from(i64::from(p.y) + change)
-                    .map_err(|_| msg("curve.err.frequency_range", &[]))?;
+                let base = i64::from(bases[i]);
+                let min_y = (base + i64::from(gpu.minimum_delta_khz) + 999)
+                    .div_euclid(1000)
+                    .max(1);
+                let max_y = (base + i64::from(gpu.maximum_delta_khz)).div_euclid(1000);
+                let target = (i64::from(p.y) + change).clamp(min_y, max_y);
+                p.y = i32::try_from(target).map_err(|_| msg("curve.err.frequency_range", &[]))?;
+            }
+            // Enforce non-decreasing monotonicity while staying within the
+            // monotonically non-decreasing driver [min_y, max_y] envelope.
+            if delta >= 0 {
+                for i in 1..points.len() {
+                    points[i].y = points[i].y.max(points[i - 1].y);
+                }
+            } else {
+                for i in (0..points.len().saturating_sub(1)).rev() {
+                    points[i].y = points[i].y.min(points[i + 1].y);
+                }
             }
             return self.replace(points);
         }
@@ -552,6 +573,7 @@ impl Curve {
             .gpu
             .as_ref()
             .ok_or_else(|| msg("curve.err.driver_limits", &[]))?;
+        let bases = gpu.base_frequencies_khz()?;
         // Shift offsets use the NVIDIA driver default curve, the reference the
         // chart shows. The curve loaded at opening (a saved preset) must not
         // come back after a reset (user report, 22 November 2026).
@@ -570,8 +592,7 @@ impl Curve {
         let mut lo = i64::MIN;
         let mut hi = i64::MAX;
         for (i, p) in basis.iter().enumerate().take(last + 1).skip(first) {
-            let n = &gpu.nodes[i];
-            let base = i64::from(n.frequency_khz) - i64::from(n.delta_khz);
+            let base = i64::from(bases[i]);
             lo = lo.max(
                 (base + i64::from(gpu.minimum_delta_khz) + 999)
                     .div_euclid(1000)
@@ -866,8 +887,13 @@ mod tests {
             c.points.iter().map(|p| p.y).collect::<Vec<_>>(),
             [1000, 1266, 1533, 1800]
         );
+        c.drag_gpu(&start, DragMode::Tilt, 500).unwrap();
+        assert_eq!(
+            c.points.iter().map(|p| p.y).collect::<Vec<_>>(),
+            [1000, 1366, 1733, 2000]
+        );
         let before = c.points.clone();
-        assert!(c.drag_gpu(&start, DragMode::Tilt, 500).is_err());
+        assert!(c.drag_gpu(&start[..3], DragMode::Tilt, 5).is_err());
         assert_eq!(c.points, before);
         assert!(c.drag_gpu(&start[..3], DragMode::CurrentOffset, 5).is_err());
         assert_eq!(c.points, before);
@@ -988,5 +1014,17 @@ mod tests {
         }
         assert!(curve.insert_at(Point { x: 1, y: 50 }).is_err());
         assert!(curve.value().is_ok());
+    }
+    #[test]
+    fn gpu_tilt_drag_clamps_to_driver_bounds_and_monotonicity_without_error() {
+        let mut c = editor();
+        c.select(3, false);
+        let start = c.points.clone();
+        c.drag_gpu(&start, DragMode::Tilt, 5_000).unwrap();
+        assert!(c.value().is_ok());
+        assert!(c.points.windows(2).all(|w| w[0].y <= w[1].y));
+        c.drag_gpu(&start, DragMode::Tilt, -5_000).unwrap();
+        assert!(c.value().is_ok());
+        assert!(c.points.windows(2).all(|w| w[0].y <= w[1].y));
     }
 }

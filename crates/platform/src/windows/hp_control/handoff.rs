@@ -1,7 +1,7 @@
 //! Explicit, bounded migration qualification. Not used by dashboard or logon.
 use super::cooling::Cooling;
 use super::*;
-use omen_core::{
+use glph_core::{
     cooling_override::{Checkpoint, RecoveryReadiness},
     ownership::{Backend, Journal, Record},
 };
@@ -111,7 +111,7 @@ pub fn recover_controller() -> Result<RecoveryReport, String> {
         })
         .ok_or("Recovery identity is unavailable")?
         .clone();
-    let observed = omen_core::guardian::Observation::coupled(
+    let observed = glph_core::guardian::Observation::coupled(
         &owner,
         &identity,
         service.as_ref(),

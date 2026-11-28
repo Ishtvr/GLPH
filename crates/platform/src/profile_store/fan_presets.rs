@@ -2,7 +2,7 @@
 //! The caller owns the hardware lease and checks protected cooling duties.
 //! File persistence is not an acknowledgement of physical policy uptake.
 use super::*;
-use omen_core::{
+use glph_core::{
     fan_profile::{FanPreset, validate_curve},
     message::msg,
     profiles::FanPoint,
@@ -85,11 +85,11 @@ mod tests {
         let s = &f.store;
         let mut p = preset();
         s.save_fan_preset(&p, None).unwrap();
-        let snapshot = omen_core::profiles::PerformanceProfile {
+        let snapshot = glph_core::profiles::PerformanceProfile {
             schema: 1,
             id: "performance-test".into(),
             name: "Performance".into(),
-            binding: omen_core::profiles::DeviceBinding {
+            binding: glph_core::profiles::DeviceBinding {
                 manufacturer: "HP".into(),
                 board: "8E35".into(),
                 bios: "F.13".into(),
@@ -100,12 +100,12 @@ mod tests {
             },
             settings: vec![
                 Setting {
-                    feature: omen_core::features::Feature::CpuFanCurve,
-                    value: omen_core::profiles::Value::FanCurve(p.points.clone()),
+                    feature: glph_core::features::Feature::CpuFanCurve,
+                    value: glph_core::profiles::Value::FanCurve(p.points.clone()),
                 },
                 Setting {
-                    feature: omen_core::features::Feature::GpuFanCurve,
-                    value: omen_core::profiles::Value::FanCurve(p.points.clone()),
+                    feature: glph_core::features::Feature::GpuFanCurve,
+                    value: glph_core::profiles::Value::FanCurve(p.points.clone()),
                 },
             ],
         };
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(read_bytes(&f.root.join("fan-mode.json")).unwrap(), foreign);
     }
     fn direct_checkpoint(store: &mut ProfileStore, original: i64, target: i64, digest: &str) {
-        use omen_core::{
+        use glph_core::{
             features::Feature,
             profiles::{DeviceBinding, Value},
             transaction::{Captured, PendingTransaction},
@@ -293,7 +293,7 @@ mod tests {
     }
     #[test]
     fn interruption_after_direct_applied_is_not_mistaken_for_a_fan_only_duty() {
-        use omen_core::profiles::Value;
+        use glph_core::profiles::Value;
         let mut f = Fixture::new();
         let digest = "a".repeat(64);
         let s = &mut f.store;

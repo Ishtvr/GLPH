@@ -1,5 +1,5 @@
 //! Private same-image process protocol. No service/driver operations here.
-use omen_core::{
+use glph_core::{
     guardian::{Decision, Finish, LinkState, Observation, ParentState, Trigger, Watch},
     ownership::{Identity, Owner, Phase, Record},
 };
@@ -442,7 +442,7 @@ mod tests {
                 session: "a".repeat(64),
             },
             identity: Identity {
-                subject: omen_core::ownership::Subject::HpOmenCap,
+                subject: glph_core::ownership::Subject::HpOmenCap,
                 image_sha256: "b".repeat(64),
                 configuration_sha256: "c".repeat(64),
             },

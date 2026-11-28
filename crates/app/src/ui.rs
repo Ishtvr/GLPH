@@ -1,6 +1,6 @@
 //! Small native Win32 shell. Hardware queries stay on one worker thread.
 use crate::i18n::{t, tf};
-use omen_core::{
+use glph_core::{
     APP_NAME, CpuHardwareStatus, Snapshot,
     battery::{Selection, Switch},
     hp_mode::HpMode,
@@ -17,12 +17,179 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    System::LibraryLoader::GetModuleHandleW,
-    UI::{Shell::*, WindowsAndMessaging::*},
+    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+    UI::{
+        Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
+        Shell::*,
+        WindowsAndMessaging::*,
+    },
 };
 
+const EVENT_SYSTEM_FOREGROUND_CODE: u32 = 0x0003;
+const WINEVENT_OUTOFCONTEXT_FLAG: u32 = 0x0000;
+const WINEVENT_SKIPOWNPROCESS_FLAG: u32 = 0x0002;
+
+struct CcdHookState {
+    power: Arc<Mutex<Sampling>>,
+    pinner: Option<glph_platform::ForegroundCcdPinner>,
+}
+
+impl CcdHookState {
+    fn tick(&mut self) {
+        let suspended = !self
+            .power
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active();
+        if suspended {
+            if let Some(mut pinner) = self.pinner.take() {
+                let _ = pinner.tick(None);
+            }
+            return;
+        }
+        // Only run Session-1 CCD pinning when Session-0 PerformanceHubService
+        // owns cooling (fast QueryServiceStatusEx check, zero disk SHA-256).
+        let selection = if glph_platform::service_client::is_service_running_fast() {
+            glph_platform::profile_store::ProfileStore::user_data()
+                .ok()
+                .and_then(|store| store.ccd_selection().ok().flatten())
+        } else {
+            None
+        };
+        if let Some(sel) = selection {
+            let pinner = self
+                .pinner
+                .get_or_insert_with(glph_platform::ForegroundCcdPinner::new);
+            let _ = pinner.tick(Some(sel));
+        } else if let Some(mut pinner) = self.pinner.take() {
+            let _ = pinner.tick(None);
+        }
+    }
+}
+
+std::thread_local! {
+    static CCD_HOOK_STATE: RefCell<Option<CcdHookState>> = const { RefCell::new(None) };
+}
+
+unsafe extern "system" fn ccd_foreground_callback(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    CCD_HOOK_STATE.with(|slot| {
+        if let Ok(mut guard) = slot.try_borrow_mut()
+            && let Some(state) = guard.as_mut()
+        {
+            state.tick();
+        }
+    });
+}
+
+/// Event-driven Session-1 foreground CCD pinner using `SetWinEventHook`.
+/// Runs at `THREAD_PRIORITY_BELOW_NORMAL`, consumes 0 % CPU when idle, works
+/// even while the dashboard is hidden in the system tray, and cleanly releases
+/// all pinned process affinities on shutdown.
+struct Session1CcdWorker {
+    thread_id: u32,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Session1CcdWorker {
+    fn spawn(power: Arc<Mutex<Sampling>>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            crate::runtime_priority::configure_background_thread();
+            let tid = unsafe { GetCurrentThreadId() };
+            // Create the thread message queue before publishing `tid`.
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            unsafe {
+                PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_NOREMOVE);
+            }
+            let _ = tx.send(tid);
+            CCD_HOOK_STATE.with(|slot| {
+                *slot.borrow_mut() = Some(CcdHookState {
+                    power,
+                    pinner: None,
+                });
+            });
+            let hook = unsafe {
+                SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND_CODE,
+                    EVENT_SYSTEM_FOREGROUND_CODE,
+                    ptr::null_mut(),
+                    Some(ccd_foreground_callback),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT_FLAG | WINEVENT_SKIPOWNPROCESS_FLAG,
+                )
+            };
+            // Periodic 30 s safety tick picks up CCD config changes even when
+            // the foreground window has not changed.
+            let timer = unsafe { SetTimer(ptr::null_mut(), 0, 30_000, None) };
+            CCD_HOOK_STATE.with(|slot| {
+                if let Some(state) = slot.borrow_mut().as_mut() {
+                    state.tick();
+                }
+            });
+            while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
+                if msg.message == WM_TIMER {
+                    CCD_HOOK_STATE.with(|slot| {
+                        if let Some(state) = slot.borrow_mut().as_mut() {
+                            state.tick();
+                        }
+                    });
+                } else {
+                    unsafe {
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+            if timer != 0 {
+                unsafe {
+                    KillTimer(ptr::null_mut(), timer);
+                }
+            }
+            if !hook.is_null() {
+                unsafe {
+                    UnhookWinEvent(hook);
+                }
+            }
+            // Release all pinned process affinities on clean exit.
+            CCD_HOOK_STATE.with(|slot| {
+                if let Some(mut state) = slot.borrow_mut().take()
+                    && let Some(mut pinner) = state.pinner.take()
+                {
+                    let _ = pinner.tick(None);
+                }
+            });
+        });
+        let thread_id = rx.recv_timeout(Duration::from_secs(2)).unwrap_or(0);
+        Self {
+            thread_id,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Session1CcdWorker {
+    fn drop(&mut self) {
+        if self.thread_id != 0 {
+            unsafe {
+                PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
+            }
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Window class and single-instance kind of the dashboard.
-pub const CLASS: &str = "PerformanceHubWindow";
+pub const CLASS: &str = "GLPHWindow";
 pub const KIND: &str = "Dashboard";
 pub(crate) const UPDATE: u32 = WM_APP + 1;
 const TRAY: u32 = crate::tray::CALLBACK;
@@ -58,6 +225,8 @@ pub(crate) enum Request {
     Refresh,
     Visibility(bool),
     Power,
+    /// Live update of telemetry polling interval in milliseconds (no restart).
+    PollInterval(u32),
     /// An automatic battery switch failed in the apply queue.
     BatteryFailed,
     Stop,
@@ -67,6 +236,7 @@ pub(crate) enum Request {
 pub(crate) enum ControlRequest {
     ApplyPreset(String),
     ApplyMode(HpMode),
+    ApplyUnleashed(glph_core::hp_mode::HpUnleashedOptions),
     FanMode(FanMode),
     Graphics(GraphicsMode),
     Stop,
@@ -143,12 +313,43 @@ pub(crate) fn cpu_error_message(detail: &str) -> &'static str {
 }
 fn cpu_failed(snapshot: &mut Snapshot, detail: String) {
     let message = cpu_error_message(&detail);
-    if let Ok(store) = omen_platform::profile_store::ProfileStore::user_data() {
+    if let Ok(store) = glph_platform::profile_store::ProfileStore::user_data() {
         let _=store.save_cpu_error(&serde_json::json!({"schema":1,
             "recorded_at_unix_seconds":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t|t.as_secs()).ok(),
             "user_message":message,"detail":detail}));
     }
     snapshot.cpu_hardware_status = CpuHardwareStatus::Error(detail);
+}
+
+/// Returns whether a failed/disconnected CPU sensor bridge should automatically
+/// attempt bounded reconnects without bothering the user with a UAC loop.
+pub(crate) fn should_auto_restart_cpu(detail: &str, elevated: bool, was_active: bool) -> bool {
+    let permanent = detail.starts_with("This build has no staged signed CPU module")
+        || detail.contains("qualified only")
+        || detail.contains("family/model/stepping/package")
+        || detail.contains("requires Windows x64")
+        || detail.starts_with("PawnIO must already be installed and running")
+        || detail.contains("hash differs")
+        || detail.contains("version/response differs")
+        || detail.contains("Embedded CPU module differs")
+        || detail.contains("driver path");
+    if permanent {
+        return false;
+    }
+    let approval_denied = detail.starts_with(crate::cpu_sensor_bridge::APPROVAL_FAILED)
+        || detail.starts_with("CPU-Sensorfreigabe nicht erfolgt:")
+        || detail.starts_with("CPU driver access requires");
+    if approval_denied {
+        return false;
+    }
+    // When already elevated, restarting `cpu-sensor-child` is direct and never
+    // shows a UAC prompt, so any transient/disconnect error can recover safely.
+    elevated
+        && (was_active
+            || detail.contains("timed out")
+            || detail.contains("disconnected")
+            || detail.contains("closed")
+            || detail.contains("connect"))
 }
 
 /// Display name of a mode or preset for status lines.
@@ -158,7 +359,7 @@ fn selection_name(selection: &Selection) -> String {
             .iter()
             .find(|(_, m)| m == mode)
             .map_or_else(String::new, |(key, _)| t(key).to_owned()),
-        Selection::Preset(id) => omen_platform::profile_store::ProfileStore::user_data()
+        Selection::Preset(id) => glph_platform::profile_store::ProfileStore::user_data()
             .and_then(|store| store.load(id))
             .map_or_else(|_| id.clone(), |profile| profile.name),
     }
@@ -166,7 +367,7 @@ fn selection_name(selection: &Selection) -> String {
 /// Historical confirmation is explicitly labelled; reopening a window is
 /// neither a new Apply nor proof that firmware retained the entire preset.
 pub(crate) fn last_apply_status() -> Option<String> {
-    let store = omen_platform::profile_store::ProfileStore::user_data().ok()?;
+    let store = glph_platform::profile_store::ProfileStore::user_data().ok()?;
     let result = store.control_result().ok()?;
     if result["operation"] != "apply" {
         return None;
@@ -195,25 +396,25 @@ fn apply_selection(selection: &Selection) -> Result<serde_json::Value, String> {
 /// to after battery use; on battery it overrides the automatic battery preset
 /// until the charger is connected again.
 pub(crate) fn record_manual(selection: &Selection) {
-    if let Ok(store) = omen_platform::profile_store::ProfileStore::user_data() {
+    if let Ok(store) = glph_platform::profile_store::ProfileStore::user_data() {
         let mut state = battery_state(&store);
-        state.manual(selection, omen_platform::power_status().ac_connected);
+        state.manual(selection, glph_platform::power_status().ac_connected);
         let _ = store.save_battery_state(&state);
     }
 }
 /// The persisted switch state as it holds in the current boot: a battery
 /// session of an earlier boot ended with the restart.
-fn battery_state(store: &omen_platform::profile_store::ProfileStore) -> omen_core::battery::State {
-    store.battery_state().at_boot(omen_platform::boot_unix_s())
+fn battery_state(store: &glph_platform::profile_store::ProfileStore) -> glph_core::battery::State {
+    store.battery_state().at_boot(glph_platform::boot_unix_s())
 }
 /// What the automatic battery switch should do now (startup, debounced
 /// power event, resume). Reads the source once more after the debounce.
 pub(crate) fn battery_decision() -> Option<Switch> {
-    let store = omen_platform::profile_store::ProfileStore::user_data().ok()?;
+    let store = glph_platform::profile_store::ProfileStore::user_data().ok()?;
     let state = battery_state(&store);
     // The battery behaviour belongs to the preset in use on AC.
-    omen_core::battery::decide(
-        omen_platform::power_status().ac_connected,
+    glph_core::battery::decide(
+        glph_platform::power_status().ac_connected,
         store
             .battery_selection_for(state.ac_selection.as_ref())
             .as_ref(),
@@ -222,9 +423,9 @@ pub(crate) fn battery_decision() -> Option<Switch> {
 }
 /// Records a completed automatic switch.
 pub(crate) fn record_battery_switch(switch: &Switch) {
-    if let Ok(store) = omen_platform::profile_store::ProfileStore::user_data() {
+    if let Ok(store) = glph_platform::profile_store::ProfileStore::user_data() {
         let mut state = battery_state(&store);
-        state.switched_to(matches!(switch, Switch::ToBattery(_)));
+        state.switched_to_switch(switch);
         let _ = store.save_battery_state(&state);
     }
 }
@@ -257,7 +458,7 @@ pub(crate) fn execute_battery_switch(switch: &Switch, serial: bool) -> Result<St
             crate::elevation::run(id, action, || false)
         }
     };
-    let store = omen_platform::profile_store::ProfileStore::user_data()?;
+    let store = glph_platform::profile_store::ProfileStore::user_data()?;
     let undo = |id: &str| {
         if store
             .applied_settings()
@@ -327,6 +528,20 @@ fn battery_switch() -> Option<String> {
         Err(error) => battery_failure(&switch, &error),
     })
 }
+/// Pushes the current saved fan mode, fan curve, and chassis max-temp to a
+/// running Session-0 `PerformanceHubService` over its local Named Pipe.
+/// Returns `true` if the service is running and acknowledged the update.
+pub(crate) fn sync_cooling_to_service(store: &glph_platform::profile_store::ProfileStore) -> bool {
+    let config = glph_core::service::ServiceConfig {
+        schema: glph_core::service::SERVICE_CONFIG_SCHEMA,
+        fan_mode: store.fan_mode(),
+        fan_curve: store.active_fan_curve().ok().flatten(),
+        chassis_max_temp_c: store.chassis_max_temp_c().ok().flatten(),
+        paused: false,
+    };
+    glph_platform::service_client::sync_service_config_if_running(&config).unwrap_or(false)
+}
+
 /// Manual controls have their own sleeping worker: a slow GPU/inventory/CPU
 /// reader cannot sit ahead of Apply. The UI still serializes its controls and
 /// the cross-process foreground lease serializes actual hardware transactions.
@@ -358,16 +573,17 @@ pub(crate) fn control_worker(
                 }
             }
             ControlRequest::FanMode(mode) => {
-                // The switch is a user file the elevated fan service reads; only
-                // installing or updating the service needs Windows approval. An
-                // outdated service is updated even for Auto, because older builds
-                // read every value except "max" as "follow the curve".
+                // If the dedicated Session-0 PerformanceHubService is running,
+                // sync the new mode directly over its Named Pipe with zero UAC.
+                // Otherwise fall back to the legacy per-user fan task check.
                 let result =
-                    omen_platform::profile_store::ProfileStore::user_data().and_then(|store| {
+                    glph_platform::profile_store::ProfileStore::user_data().and_then(|store| {
                         let previous = store.fan_mode();
                         store.save_fan_mode(mode)?;
-                        if (mode.needs_service() || omen_platform::fan_service_present())
-                            && !omen_platform::fan_service_installed()
+                        let synced_service = sync_cooling_to_service(&store);
+                        if !synced_service
+                            && (mode.needs_service() || glph_platform::fan_service_present())
+                            && !glph_platform::fan_service_installed()
                             && let Err(error) = crate::elevation::run(
                                 None,
                                 crate::elevation::Action::FanService,
@@ -435,6 +651,32 @@ pub(crate) fn control_worker(
                     PostMessageW(hwnd as HWND, MODE_RESULT, 0, 0);
                 }
             }
+            ControlRequest::ApplyUnleashed(opts) => {
+                let result = crate::elevation::run(
+                    None,
+                    crate::elevation::Action::UnleashedMode(opts),
+                    || false,
+                );
+                if result.is_ok() {
+                    record_manual(&Selection::Mode(HpMode::Unleashed));
+                }
+                let label = t("mode.unleashed");
+                *mode_result.lock().unwrap_or_else(|e| e.into_inner()) = Some(ControlOutcome {
+                    failed: result.is_err(),
+                    message: match result {
+                        Ok(record) => {
+                            crate::elevation::mode_written_status(HpMode::Unleashed, &record)
+                        }
+                        Err(error) => tf(
+                            "mode.failed",
+                            &[&label, &crate::i18n::error_message(&error)],
+                        ),
+                    },
+                });
+                unsafe {
+                    PostMessageW(hwnd as HWND, MODE_RESULT, 0, 0);
+                }
+            }
             ControlRequest::Stop => break,
         }
     }
@@ -453,9 +695,11 @@ pub(crate) fn worker(
     power: Arc<Mutex<Sampling>>,
     automatic: Option<Box<dyn Fn(Switch) -> bool + Send>>,
 ) {
+    crate::runtime_priority::configure_background_thread();
+    let _ccd_worker = Session1CcdWorker::spawn(Arc::clone(&power));
     let mut snapshot = Snapshot {
         inventory: crate::inventory::read(),
-        power: omen_platform::power_status(),
+        power: glph_platform::power_status(),
         ..Default::default()
     };
     let mut visible = initially_visible;
@@ -464,9 +708,22 @@ pub(crate) fn worker(
     let mut cpu = None;
     let mut hardware: Option<crate::cpu_sensor_bridge::CpuSensorBridge> = None;
     let mut reopen_at = Instant::now();
+    let mut gpu_failures = 0u32;
+    let mut last_good_gpu: Option<(glph_core::GpuSample, Instant)> = None;
+    let mut gpu_transient_streak = 0u32;
+    let mut cpu_reopen_at = Instant::now();
+    let mut cpu_failures = 0u32;
+    let mut cpu_was_active = false;
+    let mut cpu_recoverable_streak = 0u32;
+    let mut last_good_cpu_hw: Option<glph_core::CpuHardwareSample> = None;
+    let initial_poll_ms = glph_platform::profile_store::ProfileStore::user_data()
+        .and_then(|store| store.app_settings())
+        .map(|s| s.telemetry_poll_ms)
+        .unwrap_or(glph_core::app_settings::TELEMETRY_POLL_DEFAULT_MS);
+    crate::telemetry_worker::set_live_poll_interval_ms(initial_poll_ms);
     let mut last_chassis_poll: Option<Instant> = None;
     // Startup check of the battery switch (a crash or restart on battery).
-    let mut evaluate_at = Some(Instant::now() + omen_core::battery::debounce(ac));
+    let mut evaluate_at = Some(Instant::now() + glph_core::battery::debounce(ac));
     // Failed automatic switches since the last power event.
     let mut retries = 0usize;
     // The sign-in task runs beside the dashboard start and names the preset
@@ -483,9 +740,9 @@ pub(crate) fn worker(
         let power_at_start = *power.lock().unwrap_or_else(|e| e.into_inner());
         let mut suspended = !power_at_start.active();
         if visible && !suspended {
-            snapshot.cpu = Some(cpu.get_or_insert_with(omen_platform::Cpu::new).sample());
+            snapshot.cpu = Some(cpu.get_or_insert_with(glph_platform::Cpu::new).sample());
             if let Some(reader) = hardware.as_mut() {
-                let result = reader.sample();
+                let result = reader.sample_classified();
                 if *power.lock().unwrap_or_else(|e| e.into_inner()) != power_at_start {
                     // A window notification is visible immediately, even when
                     // the worker was inside a read as Windows suspended it.
@@ -493,16 +750,32 @@ pub(crate) fn worker(
                     // baselines; never publish an interval across the transition.
                     cpu = None;
                     snapshot.cpu = None;
+                    last_good_cpu_hw = None;
+                    cpu_recoverable_streak = 0;
                     match reader.pause() {
                         Ok(()) => snapshot.cpu_hardware_status = CpuHardwareStatus::Paused,
                         Err(error) => {
                             hardware = None;
-                            cpu_failed(&mut snapshot, error);
+                            cpu_failed(&mut snapshot, error.clone());
+                            if should_auto_restart_cpu(
+                                &error,
+                                crate::single_instance::elevated(),
+                                cpu_was_active,
+                            ) {
+                                cpu_failures = cpu_failures.saturating_add(1);
+                                cpu_reopen_at = Instant::now()
+                                    + crate::telemetry_worker::retry_backoff(cpu_failures);
+                                start_cpu_reader = true;
+                            }
                         }
                     }
                 } else {
                     match result {
                         Ok(readout) => {
+                            cpu_failures = 0;
+                            cpu_recoverable_streak = 0;
+                            cpu_was_active = true;
+                            last_good_cpu_hw = Some(readout.clone());
                             if let Some(cpu) = snapshot.cpu.as_mut() {
                                 cpu.package_power_w = readout.package_power_w;
                                 cpu.temperature_c = readout.temperature_c;
@@ -511,9 +784,56 @@ pub(crate) fn worker(
                             }
                             snapshot.cpu_hardware_status = CpuHardwareStatus::Active;
                         }
-                        Err(error) => {
+                        Err(crate::cpu_sensor_bridge::SampleError::Recoverable(error)) => {
+                            // Keep the elevated child alive; `CpuSensorBridge`
+                            // cleared `prepared = false` so the next tick
+                            // re-prepares cleanly. Hold last good values for up
+                            // to 2 ticks to avoid `—` flicker on brief PCI lock
+                            // contention.
+                            cpu_recoverable_streak = cpu_recoverable_streak.saturating_add(1);
+                            if cpu_recoverable_streak <= 2
+                                && let Some(prev) = last_good_cpu_hw.as_ref()
+                            {
+                                if let Some(cpu) = snapshot.cpu.as_mut() {
+                                    cpu.package_power_w = prev.package_power_w;
+                                    cpu.temperature_c = prev.temperature_c;
+                                    cpu.hardware = Some(prev.clone());
+                                }
+                                snapshot.cpu_hardware_status = CpuHardwareStatus::Active;
+                            } else {
+                                last_good_cpu_hw = None;
+                                if cpu_recoverable_streak >= 5 {
+                                    hardware = None;
+                                    cpu_recoverable_streak = 0;
+                                    if should_auto_restart_cpu(
+                                        &error,
+                                        crate::single_instance::elevated(),
+                                        cpu_was_active,
+                                    ) {
+                                        cpu_failures = cpu_failures.saturating_add(1);
+                                        cpu_reopen_at = Instant::now()
+                                            + crate::telemetry_worker::retry_backoff(cpu_failures);
+                                        start_cpu_reader = true;
+                                    }
+                                }
+                                cpu_failed(&mut snapshot, error);
+                            }
+                        }
+                        Err(crate::cpu_sensor_bridge::SampleError::Transport(error)) => {
                             hardware = None;
-                            cpu_failed(&mut snapshot, error);
+                            last_good_cpu_hw = None;
+                            cpu_recoverable_streak = 0;
+                            cpu_failed(&mut snapshot, error.clone());
+                            if should_auto_restart_cpu(
+                                &error,
+                                crate::single_instance::elevated(),
+                                cpu_was_active,
+                            ) {
+                                cpu_failures = cpu_failures.saturating_add(1);
+                                cpu_reopen_at = Instant::now()
+                                    + crate::telemetry_worker::retry_backoff(cpu_failures);
+                                start_cpu_reader = true;
+                            }
                         }
                     }
                 }
@@ -521,17 +841,25 @@ pub(crate) fn worker(
         } else {
             cpu = None;
             snapshot.cpu = None;
+            last_good_cpu_hw = None;
+            cpu_recoverable_streak = 0;
         }
         suspended = !power.lock().unwrap_or_else(|e| e.into_inner()).active();
+        // Refresh AC/battery power status BEFORE checking whether to touch the
+        // dGPU so unplugging the charger never triggers one stale NVML wakeup.
+        snapshot.power = glph_platform::power_status();
         // On battery NVML/NVAPI queries would wake a sleeping dGPU from D3cold
         // (several watts); GPU telemetry pauses until the charger returns.
         let on_battery = snapshot.power.ac_connected == Some(false);
         // The same on AC in hybrid mode: the device tree tells without a
         // driver query whether the dGPU has powered down.
-        let gpu_asleep = visible && !suspended && omen_platform::nvidia_gpu_awake() == Some(false);
+        let gpu_asleep = visible && !suspended && glph_platform::nvidia_gpu_awake() == Some(false);
+        let gpu_paused = glph_platform::ControlLease::gpu_pause_active();
         if visible && !suspended && (on_battery || gpu_asleep) {
             nvidia = None;
             snapshot.gpu = None;
+            last_good_gpu = None;
+            gpu_transient_streak = 0;
             snapshot.warnings = vec![
                 t(if gpu_asleep {
                     "warning.gpu_asleep"
@@ -540,15 +868,44 @@ pub(crate) fn worker(
                 })
                 .into(),
             ];
-        } else if visible && !suspended && Instant::now() >= reopen_at {
-            let nvidia = nvidia.get_or_insert_with(crate::telemetry_worker::GpuTelemetry::new);
-            snapshot.gpu = nvidia.sample();
-            snapshot.warnings = nvidia.warnings().to_vec();
-            if nvidia.needs_reconnect() {
-                // Do not reuse lost handles. A 30-second cooldown avoids a retry loop.
-                reopen_at = Instant::now() + Duration::from_secs(30);
+        } else if visible && !suspended && gpu_paused {
+            // Release driver handles cleanly while a foreground PnP/TGP write runs.
+            nvidia = None;
+            gpu_transient_streak = gpu_transient_streak.saturating_add(1);
+            if gpu_transient_streak <= 2
+                && let Some((prev, at)) = last_good_gpu.as_ref()
+                && at.elapsed() <= Duration::from_secs(6)
+            {
+                snapshot.gpu = Some(prev.clone());
+            } else {
                 snapshot.gpu = None;
+                last_good_gpu = None;
+            }
+        } else if visible && !suspended && Instant::now() >= reopen_at {
+            let worker = nvidia.get_or_insert_with(crate::telemetry_worker::GpuTelemetry::new);
+            let sample = worker.sample();
+            snapshot.warnings = worker.warnings().to_vec();
+            if let Some(s) = sample {
+                gpu_failures = 0;
+                gpu_transient_streak = 0;
+                last_good_gpu = Some((s.clone(), Instant::now()));
+                snapshot.gpu = Some(s);
+            } else if worker.last_was_transient_busy()
+                && gpu_transient_streak < 2
+                && let Some((prev, at)) = last_good_gpu.as_ref()
+                && at.elapsed() <= Duration::from_secs(6)
+            {
+                gpu_transient_streak = gpu_transient_streak.saturating_add(1);
+                snapshot.gpu = Some(prev.clone());
+            } else if worker.needs_reconnect() {
+                // Do not reuse lost handles. Short bounded backoff (1s..10s).
+                gpu_failures = gpu_failures.saturating_add(1);
+                reopen_at = Instant::now() + crate::telemetry_worker::retry_backoff(gpu_failures);
+                snapshot.gpu = None;
+                last_good_gpu = None;
                 snapshot.warnings.push(t("warning.nvidia_lost").into());
+            } else {
+                snapshot.gpu = None;
             }
         } else if visible && !suspended {
             snapshot.gpu = None;
@@ -556,6 +913,8 @@ pub(crate) fn worker(
             // Release driver sessions and stop sensor polling while hidden/asleep.
             nvidia = None;
             snapshot.gpu = None;
+            last_good_gpu = None;
+            gpu_transient_streak = 0;
         }
         if nvidia.as_ref().is_some_and(|api| api.needs_reconnect()) {
             nvidia = None;
@@ -565,19 +924,27 @@ pub(crate) fn worker(
         if current_power != power_at_start || suspended {
             snapshot.cpu = None;
             snapshot.gpu = None;
+            last_good_gpu = None;
+            last_good_cpu_hw = None;
             cpu = None;
             nvidia = None;
         }
-        snapshot.power = omen_platform::power_status();
         snapshot.cpu_reader_pid = hardware.as_ref().map(|r| r.process_id());
         if visible && !suspended {
             let poll_due =
                 last_chassis_poll.is_none_or(|at| at.elapsed() >= Duration::from_secs(8));
             if poll_due {
                 last_chassis_poll = Some(Instant::now());
-                let chassis_c =
-                    omen_platform::read_hp_surface_temp_c(&snapshot.inventory).or_else(|| {
-                        omen_platform::profile_store::ProfileStore::user_data()
+                // Prefer the live IR sensor reading already sampled by the
+                // Session-0 service to avoid redundant ACPI WMI calls.
+                let service_ir = glph_platform::service_client::query_live_service_status()
+                    .ok()
+                    .flatten()
+                    .and_then(|st| st.ir_c);
+                let chassis_c = service_ir
+                    .or_else(|| glph_platform::read_hp_surface_temp_c(&snapshot.inventory))
+                    .or_else(|| {
+                        glph_platform::profile_store::ProfileStore::user_data()
                             .ok()
                             .and_then(|store| store.fan_status().ok().flatten())
                             .and_then(|v| v.get("ir_c").and_then(|n| n.as_u64()))
@@ -585,10 +952,10 @@ pub(crate) fn worker(
                     });
                 snapshot.chassis_temp_c = chassis_c;
                 snapshot.chassis_max_temp_c = chassis_c.map(|_| {
-                    omen_platform::profile_store::ProfileStore::user_data()
+                    glph_platform::profile_store::ProfileStore::user_data()
                         .ok()
                         .and_then(|store| store.chassis_max_temp_c().ok().flatten())
-                        .unwrap_or(omen_core::fan::IR_EMERGENCY_C)
+                        .unwrap_or(glph_core::fan::IR_EMERGENCY_C)
                 });
             }
         } else {
@@ -599,7 +966,7 @@ pub(crate) fn worker(
         publish(&snapshot);
         if snapshot.power.ac_connected != ac {
             ac = snapshot.power.ac_connected;
-            evaluate_at = Some(Instant::now() + omen_core::battery::debounce(ac));
+            evaluate_at = Some(Instant::now() + glph_core::battery::debounce(ac));
             retries = 0;
         }
         if settle_check.is_some_and(|at| Instant::now() >= at) {
@@ -628,32 +995,76 @@ pub(crate) fn worker(
             }
         }
         // CPU values need no separate switch: the first visible dashboard
-        // requests the session helper once. A cancelled or failed request is
-        // retried only through Aktualisieren, never in a prompt loop.
-        if start_cpu_reader && hardware.is_none() && visible && !suspended {
+        // requests the session helper once. Transient disconnects automatically
+        // reconnect with bounded backoff when elevated (zero UAC prompt loop).
+        if start_cpu_reader
+            && hardware.is_none()
+            && visible
+            && !suspended
+            && Instant::now() >= cpu_reopen_at
+        {
             start_cpu_reader = false;
             snapshot.cpu_hardware_status = CpuHardwareStatus::Starting;
             publish(&snapshot);
             match crate::cpu_sensor_bridge::CpuSensorBridge::start() {
                 Ok(reader) => {
                     hardware = Some(reader);
+                    cpu_failures = 0;
+                    cpu_recoverable_streak = 0;
                     cpu = None;
                     continue;
                 }
                 Err(e) => {
-                    cpu_failed(&mut snapshot, e);
+                    cpu_failed(&mut snapshot, e.clone());
+                    if should_auto_restart_cpu(
+                        &e,
+                        crate::single_instance::elevated(),
+                        cpu_was_active,
+                    ) && cpu_failures < 10
+                    {
+                        cpu_failures = cpu_failures.saturating_add(1);
+                        cpu_reopen_at =
+                            Instant::now() + crate::telemetry_worker::retry_backoff(cpu_failures);
+                        start_cpu_reader = true;
+                    }
                     publish(&snapshot);
                 }
             }
         }
-        let wait = [evaluate_at, settle_check]
+        let poll_interval =
+            Duration::from_millis(u64::from(crate::telemetry_worker::live_poll_interval_ms()));
+        // Fast 300 ms warmup tick right after baseline creation so initial CPU
+        // utilization / package power appear immediately even at 3 s / 5 s poll.
+        let needs_warmup = visible
+            && !suspended
+            && snapshot.cpu.as_ref().is_some_and(|c| {
+                c.busy_percent.is_none()
+                    || (matches!(snapshot.cpu_hardware_status, CpuHardwareStatus::Active)
+                        && c.package_power_w.is_none())
+            });
+        let reconnect_at = if visible && !suspended {
+            [
+                (start_cpu_reader && hardware.is_none()).then_some(cpu_reopen_at),
+                (nvidia.is_none() && reopen_at > Instant::now()).then_some(reopen_at),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+        } else {
+            None
+        };
+        let wait = [evaluate_at, settle_check, reconnect_at]
             .into_iter()
             .flatten()
             .min()
             .map(|at| at.saturating_duration_since(Instant::now()));
         let request = if (visible && !suspended) || wait.is_some() {
             let limit = if visible && !suspended {
-                Duration::from_secs(3)
+                if needs_warmup {
+                    Duration::from_millis(300).min(poll_interval)
+                } else {
+                    poll_interval
+                }
             } else {
                 Duration::MAX
             };
@@ -675,13 +1086,20 @@ pub(crate) fn worker(
                 visible = value;
                 if value {
                     reopen_at = Instant::now();
+                    cpu_reopen_at = Instant::now();
                 }
+            }
+            Some(Request::PollInterval(ms)) => {
+                crate::telemetry_worker::set_live_poll_interval_ms(ms);
             }
             Some(Request::Refresh) => {
                 cpu = None;
                 start_cpu_reader = hardware.is_none();
+                cpu_failures = 0;
+                cpu_reopen_at = Instant::now();
                 snapshot.inventory = crate::inventory::read();
                 nvidia = None;
+                gpu_failures = 0;
                 reopen_at = Instant::now();
             }
             Some(Request::Power) => {
@@ -689,18 +1107,19 @@ pub(crate) fn worker(
                 // not report a plug change made during sleep).
                 evaluate_at = Some(
                     Instant::now()
-                        + omen_core::battery::debounce(omen_platform::power_status().ac_connected),
+                        + glph_core::battery::debounce(glph_platform::power_status().ac_connected),
                 );
                 retries = 0;
                 cpu = None;
                 nvidia = None;
+                gpu_failures = 0;
                 reopen_at = Instant::now();
             }
             Some(Request::BatteryFailed) => {
                 // Firmware and drivers may not be ready right after a source
                 // change or resume: try again a few times, then rest until
                 // the next power event.
-                if let Some(delay) = omen_core::battery::RETRY_DELAYS.get(retries) {
+                if let Some(delay) = glph_core::battery::RETRY_DELAYS.get(retries) {
                     retries += 1;
                     evaluate_at = Some(Instant::now() + *delay);
                 }
@@ -714,7 +1133,17 @@ pub(crate) fn worker(
                 Ok(()) => snapshot.cpu_hardware_status = CpuHardwareStatus::Paused,
                 Err(e) => {
                     hardware = None;
-                    cpu_failed(&mut snapshot, e);
+                    cpu_failed(&mut snapshot, e.clone());
+                    if should_auto_restart_cpu(
+                        &e,
+                        crate::single_instance::elevated(),
+                        cpu_was_active,
+                    ) {
+                        cpu_failures = cpu_failures.saturating_add(1);
+                        cpu_reopen_at =
+                            Instant::now() + crate::telemetry_worker::retry_backoff(cpu_failures);
+                        start_cpu_reader = true;
+                    }
                 }
             }
         }
@@ -729,16 +1158,16 @@ fn graphics_name(mode: GraphicsMode) -> &'static str {
 }
 /// Whether the last graphics mode chosen in this boot still waits for a restart.
 fn restart_pending() -> bool {
-    omen_platform::profile_store::ProfileStore::user_data()
+    glph_platform::profile_store::ProfileStore::user_data()
         .ok()
         .and_then(|store| store.graphics_mode())
-        .is_some_and(|record| record.restart_pending(omen_platform::boot_unix_s()))
+        .is_some_and(|record| record.restart_pending(glph_platform::boot_unix_s()))
 }
 /// Shows the saved fan and graphics choices; without a record the graphics
 /// switch shows the default Hybrid.
 unsafe fn sync_switches(hwnd: HWND) {
     unsafe {
-        let store = omen_platform::profile_store::ProfileStore::user_data().ok();
+        let store = glph_platform::profile_store::ProfileStore::user_data().ok();
         let fan = store.as_ref().map(|s| s.fan_mode()).unwrap_or_default();
         let graphics = store.as_ref().and_then(|s| s.graphics_mode());
         crate::switch::select(GetDlgItem(hwnd, FAN_SWITCH as i32), fan.index());
@@ -746,7 +1175,7 @@ unsafe fn sync_switches(hwnd: HWND) {
             GetDlgItem(hwnd, MUX_SWITCH as i32),
             graphics.map(|r| r.mode).unwrap_or_default().index(),
         );
-        let pending = graphics.is_some_and(|r| r.restart_pending(omen_platform::boot_unix_s()));
+        let pending = graphics.is_some_and(|r| r.restart_pending(glph_platform::boot_unix_s()));
         SetWindowTextW(
             GetDlgItem(hwnd, MUX_NOTE),
             wide(if pending { t("mux.restart_note") } else { "" }).as_ptr(),
@@ -758,7 +1187,7 @@ unsafe fn reload_modes(hwnd: HWND, state: &State) {
         if state.profile.get().is_null() {
             return;
         }
-        let result = omen_platform::profile_store::ProfileStore::user_data().and_then(|s| s.list());
+        let result = glph_platform::profile_store::ProfileStore::user_data().and_then(|s| s.list());
         if let Ok(profiles) = result {
             let entries = profiles
                 .into_iter()
@@ -1059,7 +1488,7 @@ unsafe extern "system" fn window_proc(
                             MB_OK | MB_ICONERROR,
                         );
                     }
-                    if let Ok(store) = omen_platform::profile_store::ProfileStore::user_data() {
+                    if let Ok(store) = glph_platform::profile_store::ProfileStore::user_data() {
                         state.close_to_tray.set(store.close_to_tray());
                     }
                 }
@@ -1318,7 +1747,7 @@ fn run_window(
     // Show what was applied last instead of a default mode: a preset with
     // Dynamic Boost sets its own HP mode, so the mode list would mislead.
     let (preview_index, selected_custom) =
-        match omen_platform::profile_store::ProfileStore::user_data()
+        match glph_platform::profile_store::ProfileStore::user_data()
             .ok()
             .and_then(|store| store.ac_selection())
         {
@@ -1354,7 +1783,7 @@ fn run_window(
             last_apply_status().unwrap_or_else(|| t("mode.bios_unreadable").into()),
         ),
         close_to_tray: Cell::new(
-            omen_platform::profile_store::ProfileStore::user_data()
+            glph_platform::profile_store::ProfileStore::user_data()
                 .map_or(true, |s| s.close_to_tray()),
         ),
     });
@@ -1502,7 +1931,7 @@ mod tests {
     #[test]
     fn cpu_status_line_is_empty_while_measuring_and_explains_other_states() {
         let mut snapshot = Snapshot {
-            cpu: Some(omen_core::CpuSample::default()),
+            cpu: Some(glph_core::CpuSample::default()),
             cpu_hardware_status: CpuHardwareStatus::Active,
             ..Default::default()
         };
@@ -1519,12 +1948,11 @@ mod tests {
     }
 
     #[test]
-    fn measured_cpu_clocks_are_distinct_from_windows_mhz_and_hidden_after_pause() {
-        use omen_core::{CpuHardwareSample, CpuHardwareSource, CpuTemperatureKind, cpu::*};
+    fn measured_cpu_clocks_come_only_from_hardware_and_hide_after_pause() {
+        use glph_core::{CpuHardwareSample, CpuHardwareSource, CpuTemperatureKind, cpu::*};
         let mut snapshot = Snapshot {
-            cpu: Some(omen_core::CpuSample {
+            cpu: Some(glph_core::CpuSample {
                 busy_percent: Some(12.5),
-                windows_clock_mhz: Some(2401),
                 hardware: Some(CpuHardwareSample {
                     schema: 1,
                     source: CpuHardwareSource::PawnioAmdRapl,
@@ -1540,7 +1968,7 @@ mod tests {
             cpu_hardware_status: CpuHardwareStatus::Active,
             ..Default::default()
         };
-        assert!(!crate::dashboard::cpu_load_line(&snapshot).contains("2401"));
+        assert!(!crate::dashboard::cpu_load_line(&snapshot).contains("MHz"));
         assert_eq!(
             crate::dashboard::cpu_detail(&snapshot),
             t("dash.effective_clock_measuring")
@@ -1590,5 +2018,39 @@ mod tests {
                 .package_power_w,
             Some(35.0)
         );
+    }
+
+    #[test]
+    fn cpu_auto_restart_recovers_elevated_disconnects_never_uac_or_unsupported() {
+        assert!(should_auto_restart_cpu(
+            "CPU reader disconnected",
+            true,
+            true
+        ));
+        assert!(should_auto_restart_cpu(
+            "CPU reader timed out; old sensor values were discarded",
+            true,
+            false
+        ));
+        assert!(!should_auto_restart_cpu(
+            "CPU reader disconnected",
+            false,
+            true
+        ));
+        assert!(!should_auto_restart_cpu(
+            "CPU_SENSOR_APPROVAL_FAILED: 1223",
+            true,
+            true
+        ));
+        assert!(!should_auto_restart_cpu(
+            "CPU sensors are qualified only for HP8E35/F.13/Ryzen9 8940HX",
+            true,
+            true
+        ));
+        assert!(!should_auto_restart_cpu(
+            "PawnIO must already be installed and running",
+            true,
+            true
+        ));
     }
 }

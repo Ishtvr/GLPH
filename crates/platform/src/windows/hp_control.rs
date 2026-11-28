@@ -4,13 +4,13 @@ mod cooling;
 mod guard;
 mod handoff;
 mod oem_service;
-pub use guard::Report as GuardianReport;
-pub use handoff::{ScopedSession, qualify, recover_controller};
-pub use oem_service::{OemService, oem_service, set_oem_service_disabled};
-use omen_core::{
+use glph_core::{
     Inventory,
     ownership::{self, Identity, Owner, Snapshot, State, Subject},
 };
+pub use guard::Report as GuardianReport;
+pub use handoff::{ScopedSession, qualify, recover_controller};
+pub use oem_service::{OemService, oem_service, set_oem_service_disabled};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -476,7 +476,7 @@ pub struct Inspection {
     pub audit: Result<Option<(Snapshot, Configuration)>, String>,
     pub known_controller_processes: Result<Vec<String>, String>,
     pub recovery: Result<Option<ownership::Record>, String>,
-    pub cooling_recovery: Result<Option<omen_core::cooling_override::Checkpoint>, String>,
+    pub cooling_recovery: Result<Option<glph_core::cooling_override::Checkpoint>, String>,
     pub last_guardian: Result<Option<GuardianReport>, String>,
     pub automatic_takeover_enabled: bool,
     pub services_changed: bool,
@@ -640,7 +640,7 @@ pub fn fan_policy_change_allowed() -> Result<(), String> {
     let owner = crate::ownership_store::OwnershipJournal::at(root.clone())?.load()?;
     let cooling = crate::cooling_store::CoolingJournal::at(root)?.load()?;
     if owner.is_some_and(|r| !r.phase.complete()) || cooling.is_some_and(|r| !r.phase.complete()) {
-        return Err(omen_core::message::msg(
+        return Err(glph_core::message::msg(
             "fan_profile.err.protected_recovery",
             &[],
         ));
@@ -689,8 +689,8 @@ fn hardware_recovery_gate(pending: Result<bool, String>) -> Result<(), String> {
 
 /// Guard new CPU power writes only. Recovery intentionally does not use this
 /// preflight: returning captured originals must remain possible with HP active.
-pub fn check_cpu_power_settings(settings: &[omen_core::profiles::Setting]) -> Result<(), String> {
-    use omen_core::features::Feature;
+pub fn check_cpu_power_settings(settings: &[glph_core::profiles::Setting]) -> Result<(), String> {
+    use glph_core::features::Feature;
     if !settings.iter().any(|s| {
         matches!(
             s.feature,
@@ -707,8 +707,8 @@ pub fn check_cpu_power_settings(settings: &[omen_core::profiles::Setting]) -> Re
 /// A briefly stopped auto-start OEM service is not a qualified logon handover.
 /// Independent startup remains possible after the original service is absent,
 /// or stopped with start type Disabled (the "Disable HP OMEN Cap" setting).
-pub(super) fn cpu_power_startup_safe(feature: omen_core::features::Feature) -> bool {
-    use omen_core::features::Feature;
+pub(super) fn cpu_power_startup_safe(feature: glph_core::features::Feature) -> bool {
+    use glph_core::features::Feature;
     if !matches!(feature, Feature::CpuPptLimitMw | Feature::CpuSlowPptLimitMw) {
         return true;
     }
@@ -730,16 +730,16 @@ fn check_cpu_power_state(
 ) -> Result<(), String> {
     match current {
         Ok(None | Some(State::Stopped)) => Ok(()),
-        Ok(Some(_)) if writing => Err(omen_core::message::msg("hp_control.cpu_power_changed", &[])),
-        Err(error) if writing => Err(omen_core::message::msg(
+        Ok(Some(_)) if writing => Err(glph_core::message::msg("hp_control.cpu_power_changed", &[])),
+        Err(error) if writing => Err(glph_core::message::msg(
             "hp_control.write_unknown",
             &[&error],
         )),
-        Ok(Some(State::Running | State::Transitioning)) => Err(omen_core::message::msg(
+        Ok(Some(State::Running | State::Transitioning)) => Err(glph_core::message::msg(
             "hp_control.cpu_power_conflict",
             &[],
         )),
-        Err(error) => Err(omen_core::message::msg("hp_control.unknown", &[&error])),
+        Err(error) => Err(glph_core::message::msg("hp_control.unknown", &[&error])),
     }
 }
 

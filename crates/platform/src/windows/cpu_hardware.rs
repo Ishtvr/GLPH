@@ -3,7 +3,7 @@
 mod clocks;
 
 use clocks::ClockReader;
-use omen_core::{
+use glph_core::{
     CpuHardwareSample, CpuHardwareSource, CpuTemperatureKind, Inventory,
     cpu::{AmdPackageEnergy, amd_package_watts, amd_tctl_c},
 };
@@ -23,11 +23,25 @@ use windows_sys::Win32::{
         Services::*,
         SystemInformation::GetWindowsDirectoryW,
         Threading::{
-            CreateMutexW, GetCurrentProcessorNumber, GetCurrentThread, ReleaseMutex,
-            SetThreadAffinityMask, WaitForSingleObject,
+            GetCurrentProcessorNumber, GetCurrentThread, GetThreadPriority, ReleaseMutex,
+            SetThreadAffinityMask, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            WaitForSingleObject,
         },
     },
+    UI::Shell::{QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState},
 };
+
+/// Returns true when a fullscreen 3D game or presentation holds the display so
+/// we can skip the 32-core APERF/MPERF affinity sweep and avoid cross-core
+/// preemption micro-stutters.
+fn fullscreen_3d_active() -> bool {
+    let mut state = 0i32;
+    // SAFETY: Stack out-parameter for documented Shell user notification query.
+    if unsafe { SHQueryUserNotificationState(&mut state) } != 0 {
+        return false;
+    }
+    state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_BUSY
+}
 
 pub const CPU_MODULE_SHA256: &str =
     "dae74615761b78bdf064dfb3e136252ddcc6fc727d88f14738d0e5800d427a91";
@@ -52,6 +66,41 @@ impl Drop for Handle {
         }
     }
 }
+const THREAD_PRIORITY_ERROR: i32 = i32::MAX;
+
+/// Temporarily lowers the current worker thread priority to
+/// `THREAD_PRIORITY_BELOW_NORMAL` during hardware register sweeps so sensor
+/// polling never preempts foreground game, audio, or UI threads (zero micro-stutter).
+struct LowPriorityGuard {
+    previous: i32,
+}
+impl LowPriorityGuard {
+    fn enter() -> Self {
+        // SAFETY: Query/adjust only the current worker thread's own priority.
+        let previous = unsafe { GetThreadPriority(GetCurrentThread()) };
+        if previous != THREAD_PRIORITY_ERROR && previous > THREAD_PRIORITY_BELOW_NORMAL {
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            Self { previous }
+        } else {
+            Self {
+                previous: THREAD_PRIORITY_ERROR,
+            }
+        }
+    }
+}
+impl Drop for LowPriorityGuard {
+    fn drop(&mut self) {
+        if self.previous != THREAD_PRIORITY_ERROR {
+            // SAFETY: Restores the exact prior priority of this thread.
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), self.previous);
+            }
+        }
+    }
+}
+
 struct Affinity(usize);
 impl Affinity {
     fn cpu_zero() -> Result<Self, String> {
@@ -72,6 +121,22 @@ impl Affinity {
             return Err("CPU reader is not running on the requested logical processor".into());
         }
         Ok(guard)
+    }
+    /// Moves this already-guarded thread directly to the next logical processor
+    /// without restoring the original mask in between, halving Windows scheduler
+    /// affinity transitions during a full-CPU APERF/MPERF sweep.
+    pub(super) fn step_to(&mut self, processor: u32) -> Result<(), String> {
+        let mask = 1usize
+            .checked_shl(processor)
+            .ok_or("CPU affinity index is invalid")?;
+        let prev = unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
+        if prev == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if unsafe { GetCurrentProcessorNumber() } != processor {
+            return Err("CPU reader is not running on the requested logical processor".into());
+        }
+        Ok(())
     }
     fn restore(mut self) -> Result<(), String> {
         if unsafe { SetThreadAffinityMask(GetCurrentThread(), self.0) } == 0 {
@@ -205,7 +270,10 @@ pub(super) fn driver_identity() -> Result<(), String> {
         .position(|v| *v == 0)
         .ok_or("PawnIO driver path is unterminated")?;
     let mut path = String::from_utf16(&path_cells[..length]).map_err(|e| e.to_string())?;
-    if path.starts_with("\\SystemRoot\\") {
+    if path
+        .get(..12)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("\\SystemRoot\\"))
+    {
         let mut directory = [0u16; 512];
         let count = unsafe { GetWindowsDirectoryW(directory.as_mut_ptr(), directory.len() as u32) }
             as usize;
@@ -243,6 +311,7 @@ pub(super) fn driver_identity() -> Result<(), String> {
 pub struct CpuHardwareReader {
     driver: Handle,
     pci: Handle,
+    energy_units: Option<u64>,
     baseline: Option<(AmdPackageEnergy, Instant)>,
     clocks: ClockReader,
 }
@@ -309,13 +378,14 @@ impl CpuHardwareReader {
         {
             return Err("Signed CPU module load returned an unexpected output".into());
         }
-        let pci = unsafe { CreateMutexW(ptr::null(), 0, wide("Global\\Access_PCI").as_ptr()) };
-        if pci.is_null() {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
+        // Shared cross-session mutex: Session-0 GLPHService (LocalSystem) may
+        // create Global\Access_PCI at boot before Session-1 elevated GLPH runs.
+        // Using the explicit cross-session SDDL prevents ERROR_ACCESS_DENIED (5).
+        let pci = super::control_lease::create_or_open_mutex("Global\\Access_PCI")?;
         Ok(Self {
             driver,
             pci: Handle(pci),
+            energy_units: None,
             baseline: None,
             clocks: ClockReader::default(),
         })
@@ -326,6 +396,7 @@ impl CpuHardwareReader {
     /// Thermal control needs only Tctl. Optional clock/energy warnings must not
     /// invalidate a good temperature or wake every CPU for a fan-control tick.
     pub fn temperature_sample(&self) -> Result<CpuHardwareSample, String> {
+        let _low_prio = LowPriorityGuard::enter();
         let sample = CpuHardwareSample {
             schema: 1,
             source: CpuHardwareSource::PawnioAmdRapl,
@@ -353,14 +424,31 @@ impl CpuHardwareReader {
         amd_tctl_c(raw as u32).ok_or("CPU Tctl response is unavailable or implausible".into())
     }
     pub fn sample(&mut self) -> Result<CpuHardwareSample, String> {
+        let _low_prio = LowPriorityGuard::enter();
         let result = (|| {
-            let affinity = Affinity::cpu_zero()?;
-            let units = self.read(Read::EnergyUnits)?;
-            if units == 0 || units == u64::MAX {
-                return Err("CPU energy units are unavailable".into());
-            }
-            let counter = self.read(Read::PackageEnergy)? as u32;
-            let now = Instant::now();
+            // Read SMN Tctl outside CPU-0 affinity pinning so waiting on the
+            // shared PCI mutex never stalls while pinned to logical core 0.
+            let temperature_c = Some(self.temperature_c()?);
+            let (units, counter, now) = {
+                let affinity = Affinity::cpu_zero()?;
+                let units = match self.energy_units {
+                    Some(cached) => cached,
+                    None => {
+                        let read = self.read(Read::EnergyUnits)?;
+                        if read == 0 || read == u64::MAX {
+                            return Err("CPU energy units are unavailable".into());
+                        }
+                        self.energy_units = Some(read);
+                        read
+                    }
+                };
+                let counter = self.read(Read::PackageEnergy)? as u32;
+                let now = Instant::now();
+                // Restore original affinity before ClockReader starts so we
+                // never nest Affinity::pin(0) inside Affinity::cpu_zero().
+                affinity.restore()?;
+                (units, counter, now)
+            };
             let current = AmdPackageEnergy { counter, units };
             let previous = self.baseline.replace((current, now));
             let (package_power_w, power_interval_ms) = if let Some((old, time)) = previous {
@@ -370,7 +458,6 @@ impl CpuHardwareReader {
             } else {
                 (None, None)
             };
-            let temperature_c = Some(self.temperature_c()?);
             let mut warnings = if previous.is_some() && package_power_w.is_none() {
                 vec![
                     "CPU energy units, counter or interval changed; a fresh baseline is required"
@@ -379,13 +466,20 @@ impl CpuHardwareReader {
             } else {
                 vec![]
             };
-            let effective_clocks = match self.clocks.sample(&self.driver) {
-                Ok(clocks) => clocks,
-                Err(error) => {
-                    warnings.push(format!(
-                        "CPU effective clock measurement unavailable: {error}"
-                    ));
-                    None
+            // Skip the 32-core APERF/MPERF affinity sweep while a fullscreen 3D
+            // game is active so we never migrate across or preempt game cores.
+            let effective_clocks = if fullscreen_3d_active() {
+                self.clocks.reset();
+                None
+            } else {
+                match self.clocks.sample(&self.driver) {
+                    Ok(clocks) => clocks,
+                    Err(error) => {
+                        warnings.push(format!(
+                            "CPU effective clock measurement unavailable: {error}"
+                        ));
+                        None
+                    }
                 }
             };
             let sample = CpuHardwareSample {
@@ -398,11 +492,11 @@ impl CpuHardwareReader {
                 effective_clocks,
                 warnings,
             };
-            affinity.restore()?;
             sample.validate()?;
             Ok(sample)
         })();
         if result.is_err() {
+            self.energy_units = None;
             self.baseline = None;
             self.clocks = ClockReader::default();
         }

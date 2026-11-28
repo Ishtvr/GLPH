@@ -1,5 +1,5 @@
 //! Public Windows power subscriptions. This module never changes a power state.
-use omen_core::power::Event;
+use glph_core::power::Event;
 use std::{
     ptr,
     sync::atomic::{AtomicU8, Ordering},
@@ -49,7 +49,7 @@ impl Notifications {
             sleep: 0,
             scheme: 0,
         };
-        source_edge(omen_platform::power_status().ac_connected);
+        source_edge(glph_platform::power_status().ac_connected);
         // SAFETY: A live owned window receives notifications until Drop.
         unsafe {
             notifications.source = RegisterPowerSettingNotification(
@@ -116,7 +116,7 @@ fn setting(guid: &GUID, data: &[u8]) -> Option<Event> {
     } else if same_guid(guid, &GUID_ACDC_POWER_SOURCE) && value <= 2 {
         // The dedicated notification always counts: Windows sends it for a
         // source change only (and once on registration).
-        source_edge(omen_platform::power_status().ac_connected);
+        source_edge(glph_platform::power_status().ac_connected);
         Some(Event::SourceChanged)
     } else {
         None
@@ -131,7 +131,7 @@ pub unsafe fn decode(kind: u32, data: isize) -> Option<Event> {
         PBT_APMSUSPEND => Some(Event::Suspend),
         PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => Some(Event::Resume),
         PBT_APMPOWERSTATUSCHANGE => {
-            source_edge(omen_platform::power_status().ac_connected).then_some(Event::SourceChanged)
+            source_edge(glph_platform::power_status().ac_connected).then_some(Event::SourceChanged)
         }
         PBT_POWERSETTINGCHANGE if data != 0 => unsafe {
             let header = data as *const POWERBROADCAST_SETTING;

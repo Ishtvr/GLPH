@@ -7,8 +7,8 @@ use super::{
     gpu::NvidiaIdentity,
     nvidia::{system_library, text_buffer},
 };
+use glph_core::vf::{VfNode, VfState};
 use libloading::Library;
-use omen_core::vf::{VfNode, VfState};
 use std::{ffi::c_void, ptr};
 
 type Handle = *mut c_void;

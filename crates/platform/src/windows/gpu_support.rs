@@ -3,7 +3,7 @@
 //! readable VBIOS string; runtime NVML/NVAPI ABI checks, capture, readback and
 //! full restore protect every write independently of laptop vendor.
 use super::gpu::NvidiaIdentity;
-use omen_core::Inventory;
+use glph_core::Inventory;
 
 pub(super) fn driver_evidence(identity: &NvidiaIdentity) -> Result<(), String> {
     let name = identity.name.to_ascii_lowercase();
@@ -12,10 +12,10 @@ pub(super) fn driver_evidence(identity: &NvidiaIdentity) -> Result<(), String> {
         || name.contains("rtx")
         || name.contains("gtx");
     if !is_nvidia || identity.vbios.trim().is_empty() {
-        return Err(omen_core::message::msg("support.err.gpu_vbios", &[]));
+        return Err(glph_core::message::msg("support.err.gpu_vbios", &[]));
     }
     if identity.driver.trim().is_empty() {
-        return Err(omen_core::message::msg("support.err.driver", &[]));
+        return Err(glph_core::message::msg("support.err.driver", &[]));
     }
     Ok(())
 }

@@ -1,7 +1,7 @@
 //! Windows power-scheme and display settings, plus the CCD selection the
 //! background service enforces. Every control has an exact GET, so capture,
 //! readback and restore are complete.
-use omen_core::{
+use glph_core::{
     ccd,
     features::Feature,
     message::msg,
@@ -164,6 +164,9 @@ fn active_scheme() -> Result<u128, String> {
             PowerGetActiveScheme(ptr::null_mut(), &mut scheme),
             "Active power scheme",
         )?;
+        if scheme.is_null() {
+            return Err("Active power scheme pointer was null".into());
+        }
         let value = to_u128(&*scheme);
         LocalFree(scheme.cast());
         Ok(value)
@@ -238,9 +241,10 @@ fn overlay_guid(choice: Choice) -> Option<u128> {
 type GetOverlay = unsafe extern "system" fn(*mut GUID) -> u32;
 type SetOverlay = unsafe extern "system" fn(GUID) -> u32;
 fn overlay_api() -> Result<(libloading::Library, GetOverlay, GetOverlay, SetOverlay), String> {
-    // SAFETY: System DLL; symbol signatures match the shipped powrprof exports.
+    // SAFETY: Fixed System32 DLL loaded via LOAD_LIBRARY_SEARCH_SYSTEM32 so
+    // an elevated process is never vulnerable to working-directory DLL hijacking.
+    let library = super::nvidia::system_library("powrprof.dll")?;
     unsafe {
-        let library = libloading::Library::new("powrprof.dll").map_err(|e| e.to_string())?;
         let actual = *library
             .get::<GetOverlay>(b"PowerGetActualOverlayScheme\0")
             .map_err(|_| "Configured Windows power mode is not available on this system")?;
@@ -278,27 +282,34 @@ fn write_overlay(overlay: u128) -> Result<(), String> {
 /// panel. External monitors are never addressed by the refresh-rate control;
 /// with the panel inactive (lid closed, external only) there is no target.
 fn internal_display() -> Result<[u16; 32], String> {
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     // SAFETY: Sized buffers from GetDisplayConfigBufferSizes; every output
     // pointer is valid for the call and the header names its exact size.
     unsafe {
         let (mut paths, mut modes) = (0u32, 0u32);
-        check(
-            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes),
-            "Display configuration size",
-        )?;
-        let mut path_info: Vec<DISPLAYCONFIG_PATH_INFO> = vec![std::mem::zeroed(); paths as usize];
-        let mut mode_info: Vec<DISPLAYCONFIG_MODE_INFO> = vec![std::mem::zeroed(); modes as usize];
-        check(
-            QueryDisplayConfig(
+        let mut path_info: Vec<DISPLAYCONFIG_PATH_INFO> = Vec::new();
+        let mut mode_info: Vec<DISPLAYCONFIG_MODE_INFO> = Vec::new();
+        for attempt in 0..3 {
+            check(
+                GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes),
+                "Display configuration size",
+            )?;
+            path_info.resize(paths as usize, std::mem::zeroed());
+            mode_info.resize(modes as usize, std::mem::zeroed());
+            let code = QueryDisplayConfig(
                 QDC_ONLY_ACTIVE_PATHS,
                 &mut paths,
                 path_info.as_mut_ptr(),
                 &mut modes,
                 mode_info.as_mut_ptr(),
                 ptr::null_mut(),
-            ),
-            "Display configuration",
-        )?;
+            );
+            if code == ERROR_INSUFFICIENT_BUFFER && attempt < 2 {
+                continue;
+            }
+            check(code, "Display configuration")?;
+            break;
+        }
         for path in path_info.iter().take(paths as usize) {
             let technology = path.targetInfo.outputTechnology;
             if ![
@@ -391,7 +402,7 @@ pub fn capture(feature: Feature) -> Result<WindowsImage, String> {
     capture_for_scheme(feature, None)
 }
 
-pub fn requested_scheme(settings: &[omen_core::profiles::Setting]) -> Result<Option<u128>, String> {
+pub fn requested_scheme(settings: &[glph_core::profiles::Setting]) -> Result<Option<u128>, String> {
     let target = settings
         .iter()
         .find(|setting| setting.feature == Feature::WindowsPowerPlan)

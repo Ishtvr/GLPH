@@ -1,7 +1,7 @@
 //! One-shot cooling diagnostics. No writer, registry/profile fallback, vendor
 //! SDK, background loop or implicit elevation. All readers have fixed contracts.
 use super::{CpuHardwareReader, FanReport, Nvidia, power_status, read_hp_fans};
-use omen_core::{CpuHardwareSample, GpuSample, Inventory, PowerStatus, cooling::SampleWindow};
+use glph_core::{CpuHardwareSample, GpuSample, Inventory, PowerStatus, cooling::SampleWindow};
 use serde::Serialize;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 

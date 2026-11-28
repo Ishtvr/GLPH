@@ -46,19 +46,29 @@ export component ColorPicker inherits FocusScope {
         return reject;
     }
     Rectangle {
-        background: #00000099;
+        background: Theme.scrim;
         TouchArea {
             scroll-event(e) => { return accept; }
         }
     }
 
     panel := Rectangle {
-        width: min(520px,parent.width - 32px);
-        height: min(560px,parent.height - 32px);
-        background: Theme.canvas;
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: Theme.line;
+        width: min(520px, parent.width - 32px);
+        height: min(560px, parent.height - 32px);
+        background: Theme.popup-fill;
+        border-radius: 10px;
+        clip: true;
+        border-width: Theme.card-border-width;
+        border-color: Theme.popup-border;
+
+        Rectangle {
+            x: 10px;
+            y: 1px;
+            width: max(0px, parent.width - 20px);
+            height: 1px;
+            background: Theme.surface-top-sheen;
+        }
+
         VerticalLayout {
             padding: 16px;
             spacing: 12px;
@@ -173,10 +183,11 @@ export component ColorPicker inherits FocusScope {
                             y: floor(index / 8) * 36px;
                             width: (palette.width - 42px) / 8;
                             height: 30px;
-                            background: Theme.control;
+                            background: Theme.control-fill;
                             border-radius: 4px;
+                            clip: true;
                             border-width: palette-focus.has-focus && index == palette.focused ? 2px : 1px;
-                            border-color: palette-focus.has-focus && index == palette.focused ? Theme.accent : Theme.line;
+                            border-color: palette-focus.has-focus && index == palette.focused ? Theme.accent : Theme.control-border;
                             accessible-role: button;
                             accessible-label: Theme.tr("color.swatch") + " " + (index + 1);
                             accessible-value: ColorEditor.swatch-labels[index];

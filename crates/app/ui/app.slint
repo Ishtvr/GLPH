@@ -28,6 +28,8 @@ import {
 } from "primitives.slint";
 import { PluginRowData, PluginNavData, PluginTable } from "settings-plugins.slint";
 export { PluginRowData, PluginNavData } from "settings-plugins.slint";
+import { TelemetryPanel, TelemetryState, TelemetryTick } from "telemetry.slint";
+export { TelemetryState, TelemetryTick } from "telemetry.slint";
 
 export struct FieldData {
     index: int,
@@ -39,9 +41,10 @@ export struct FieldData {
     choices: [string],
     selected: int,
     info: string,
-    // kind 5: slider bounds in the row's unit (whole watts).
+    // kind 5: slider bounds and numeric value in the row's unit (locale-independent).
     slider-min: float,
     slider-max: float,
+    slider-value: float,
 }
 export struct GroupData { section-title: string, title: string, expanded: bool, is-per-core: bool, rows: [FieldData] }
 export struct CurveNode { x: float, y: float, reference-y: float, selected: bool }
@@ -55,6 +58,7 @@ export global Workbench {
     in property <bool> window-maximized;
     in property <bool> test-mode;
     in-out property <bool> busy;
+    in-out property <bool> operation-busy;
     in-out property <bool> apply-busy;
     in-out property <string> status;
     in property <string> identity;
@@ -143,11 +147,19 @@ export global Workbench {
     in-out property <string> lighting-brightness;
     in property <float> lighting-level;
     in property <[color]> zone-colors;
+    in-out property <int> omen-mode-index: 1;
+    in-out property <int> omen-unleashed-pl1: 80;
+    in-out property <int> omen-unleashed-tpp: 72;
+    in-out property <int> omen-unleashed-gps: 87;
+    in-out property <bool> omen-unleashed-ctgp: true;
+    in-out property <bool> omen-unleashed-ppab: true;
     in-out property <int> language-index;
     in-out property <bool> autostart;
     in-out property <bool> start-in-tray;
     in-out property <int> close-index;
     in-out property <bool> hold-preset;
+    in property <[string]> poll-rate-choices;
+    in-out property <int> poll-rate-index: 1;
     in-out property <string> gpu-tgp-max-w;
     in property <string> gpu-tgp-max-error;
     in property <[string]> battery-choices;
@@ -162,19 +174,42 @@ export global Workbench {
     in property <string> plugins-summary;
     in property <string> active-plugin-id;
     in property <string> active-plugin-title;
+    // 0 = lighting-4zone, 1 = sensor-board, 2 = panel, 3 = hp-omen-suite
+    in property <int> active-plugin-surface-kind;
     in property <string> plugin-confirm-text;
     in-out property <int> palette-index;
     in property <[PaletteChoice]> palette-choices;
+    in property <[string]> color-look-choices;
+    in-out property <int> background-look-index: 0;
+    in-out property <int> nav-background-look-index: 0;
+    in-out property <int> foreground-look-index: 0;
+    in-out property <int> accent-look-index: 0;
     in property <color> background-preview;
+    in property <color> nav-background-preview;
     in property <color> foreground-preview;
     in property <color> accent-preview;
+    in property <color> background-secondary-preview;
+    in property <color> nav-background-secondary-preview;
+    in property <color> foreground-secondary-preview;
+    in property <color> accent-secondary-preview;
     in-out property <string> color-background;
+    in-out property <string> color-nav-background;
     in-out property <string> color-foreground;
     in-out property <string> color-accent;
+    in-out property <string> color-background-secondary;
+    in-out property <string> color-nav-background-secondary;
+    in-out property <string> color-foreground-secondary;
+    in-out property <string> color-accent-secondary;
     in property <string> appearance-error;
     in property <bool> hp-disabled;
     in property <bool> hp-available;
     in property <string> device-defaults-summary;
+    in property <bool> hw-service-installed;
+    in property <bool> hw-service-running;
+    in property <bool> hw-service-outdated;
+    in property <string> hw-service-pill-text;
+    // StatusPill kind: 0 = good, 1 = muted, 2 = warning, 3 = error
+    in property <int> hw-service-pill-kind: 1;
     in-out property <int> confirm-kind;
     in property <bool> notice-visible;
     in property <bool> notice-failed;
@@ -234,6 +269,9 @@ export global Workbench {
     callback apply-lighting();
     callback reset-lighting();
     callback refresh-lighting();
+    callback select-omen-mode(int);
+    callback apply-omen-mode();
+    callback reset-omen-unleashed();
     callback save-settings();
     callback discard-settings();
     callback settings-changed();
@@ -244,10 +282,12 @@ export global Workbench {
     callback remove-plugin(string);
     callback select-plugin-page(string);
     callback palette-changed(int);
+    callback look-changed(int, int);
     callback colors-changed();
     callback open-color-picker(int);
     callback reset-appearance();
     callback hp-service();
+    callback hw-service-action(string);
     callback detect-defaults();
     callback show-about();
     callback confirm(bool);
@@ -262,13 +302,14 @@ component FieldRow inherits Rectangle {
     in-out property <bool> show-info;
     // The last row of a group has no divider under it.
     in property <bool> last;
-    height: Theme.row-height + (root.show-info ? info-text.preferred-height + 34px : 0px);
+    private property <length> base-height: max(Theme.row-height, include.preferred-height + 12px);
+    height: root.base-height + (root.show-info ? info-text.preferred-height + 34px : 0px);
 
     // Every control keeps the control height; the same space above and below
     // centres label, info button, editor and unit on one line.
     HorizontalLayout {
-        y: (Theme.row-height - Theme.control-height) / 2;
-        height: Theme.control-height;
+        y: (root.base-height - max(Theme.control-height, include.preferred-height)) / 2;
+        height: max(Theme.control-height, include.preferred-height);
         spacing: 8px;
         // The check box then starts where the group title text starts.
         padding-left: 8px;
@@ -278,6 +319,7 @@ component FieldRow inherits Rectangle {
             checked <=> root.item.included;
             enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
             horizontal-stretch: 0;
+            min-width: 0px;
             toggled => { Workbench.include-field(root.item.index, self.checked); }
         }
 
@@ -329,7 +371,7 @@ component FieldRow inherits Rectangle {
             spacing: 8px;
             BrightnessSlider {
                 accessible-label: root.item.label;
-                value: root.item.value.to-float();
+                value: root.item.slider-value;
                 minimum: root.item.slider-min;
                 maximum: root.item.slider-max;
                 enabled: (root.item.included && !Workbench.busy) && Workbench.confirm-kind == 0;
@@ -354,13 +396,13 @@ component FieldRow inherits Rectangle {
     Rectangle {
         visible: root.show-info;
         x: 36px;
-        y: Theme.row-height + 4px;
+        y: root.base-height + 4px;
         width: parent.width - 52px;
         height: root.show-info ? info-text.preferred-height + 20px : 0px;
-        background: Theme.surface;
+        background: Theme.surface-fill;
         border-radius: 6px;
-        border-width: 1px;
-        border-color: Theme.line;
+        border-width: Theme.card-border-width;
+        border-color: Theme.surface-border;
 
         info-text := Text {
             x: 12px;
@@ -452,32 +494,12 @@ component PresetGroup inherits Rectangle {
     }
 }
 
-component Measurement inherits Rectangle {
-    in property <string> label;
-    in property <string> value;
-    height: 54px;
-    VerticalLayout {
-        spacing: 3px;
-        Text {
-            text: root.label;
-            color: Theme.muted;
-            font-size: 12px;
-        }
-
-        Text {
-            text: root.value;
-            color: Theme.ink;
-            font-size: root.value == Workbench.tr("common.unavailable") ? 13px : 24px;
-            font-family: "Consolas";
-            wrap: word-wrap;
-        }
-    }
-}
-
 component CurveCanvas inherits Rectangle {
     forward-focus: chart-focus;
-    background: Theme.surface;
-    border-radius: 6px;
+    background: Theme.surface-fill;
+    border-radius: 8px;
+    border-width: Theme.card-border-width;
+    border-color: Theme.surface-border;
     clip: true;
     min-height: 190px;
     // Margins around the plot: Y labels left, X labels below, captions above.
@@ -499,9 +521,9 @@ component CurveCanvas inherits Rectangle {
     }
 
     Text {
-        x: root.plot-left + 120px;
+        x: root.plot-left;
         y: 4px;
-        width: max(0px, root.width - root.plot-left - root.plot-right - 120px);
+        width: max(0px, root.width - root.plot-left - root.plot-right);
         height: 16px;
         text: Workbench.curve-delta;
         color: Theme.ink;
@@ -540,7 +562,7 @@ component CurveCanvas inherits Rectangle {
     for tick in Workbench.x-ticks: Text {
         property <bool> first: tick.position < 0.001;
         property <bool> last: tick.position > 0.999;
-        x: self.first ? root.plot-left : self.last ? root.plot-left + plot.width - self.width : min(root.plot-left + tick.position * plot.width - self.width / 2, root.width - self.width);
+        x: self.first ? root.plot-left : self.last ? root.plot-left + plot.width - self.width : clamp(root.plot-left + tick.position * plot.width - self.width / 2, root.plot-left, max(root.plot-left, root.width - self.width));
         y: root.plot-top + plot.height + 6px;
         width: 48px;
         height: 14px;
@@ -584,7 +606,7 @@ component CurveCanvas inherits Rectangle {
             background: Theme.line;
         }
         selection-band := Rectangle {
-            visible: Workbench.has-selection;
+            visible: Workbench.has-selection && Workbench.selection-high >= 0 && Workbench.selection-low <= 1;
             x: clamp(Workbench.selection-low,0,1) * parent.width;
             width: max(2px,(clamp(Workbench.selection-high,0,1) - clamp(Workbench.selection-low,0,1)) * parent.width);
             background: Theme.accent.with-alpha(0.14);
@@ -613,14 +635,14 @@ component CurveCanvas inherits Rectangle {
         }
 
         Rectangle {
-            visible: Workbench.nodes.length > 0;
+            visible: Workbench.nodes.length > 0 && Workbench.point-index >= 0 && Workbench.point-index < Workbench.nodes.length;
             x: floor(Workbench.nodes[Workbench.point-index].x * parent.width / 1phx) * 1phx;
             width: 1phx;
             background: Theme.accent.with-alpha(0.25);
         }
 
         Rectangle {
-            visible: Workbench.nodes.length > 0;
+            visible: Workbench.nodes.length > 0 && Workbench.point-index >= 0 && Workbench.point-index < Workbench.nodes.length;
             y: floor((1 - Workbench.nodes[Workbench.point-index].y) * parent.height / 1phx) * 1phx;
             height: 1phx;
             background: Theme.accent.with-alpha(0.25);
@@ -654,10 +676,10 @@ component CurveCanvas inherits Rectangle {
             // Beside the point, flipped away from the plot edges.
             x: clamp(self.anchor-x + 12px + self.width > parent.width ? self.anchor-x - 12px - self.width : self.anchor-x + 12px, 0px, max(0px, parent.width - self.width));
             y: clamp(self.anchor-y - 12px - self.height < 0px ? self.anchor-y + 12px : self.anchor-y - 12px - self.height, 0px, max(0px, parent.height - self.height));
-            background: Theme.control;
+            background: Theme.popup-fill;
             border-radius: 4px;
             border-width: 1px;
-            border-color: Theme.accent.with-alpha(0.55);
+            border-color: Theme.accent-border;
             readout-text := Text {
                 x: 8px;
                 y: 5px;
@@ -737,22 +759,25 @@ component ConfirmPrompt inherits FocusScope {
         return reject;
     }
     Rectangle {
-        background: #00000099;
-        TouchArea { }
+        background: Theme.scrim;
+        TouchArea {
+            scroll-event(e) => { return accept; }
+        }
     }
 
     Rectangle {
         width: min(480px, parent.width - 48px);
         height: confirm-layout.preferred-height;
-        background: Theme.surface;
-        border-width: 1px;
-        border-color: Theme.line;
-        border-radius: 6px;
+        background: Theme.popup-fill;
+        border-width: Theme.card-border-width;
+        border-color: Theme.popup-border;
+        border-radius: 10px;
+        clip: true;
         confirm-layout := VerticalLayout {
             padding: 20px;
             spacing: 16px;
             Text {
-                text: root.kind == 7 || root.kind == 8
+                text: root.kind == 7 || root.kind == 8 || root.kind == 9
                     ? Workbench.plugin-confirm-text
                     : Workbench.tr(root.kind == 2 ? "ui.confirm_delete" : root.kind == 3 ? "ui.confirm_exit" : "notice.unsaved_preset");
                 color: Theme.ink;
@@ -767,7 +792,7 @@ component ConfirmPrompt inherits FocusScope {
             }
 
             HorizontalLayout {
-                spacing: 8px;
+                spacing: 0px;
                 Rectangle {
                     horizontal-stretch: 1;
                 }
@@ -777,14 +802,24 @@ component ConfirmPrompt inherits FocusScope {
                     clicked => { root.accepted(false); }
                 }
 
+                Rectangle {
+                    width: 8px;
+                }
+
                 confirm-button := ActionButton {
-                    text: Workbench.tr(root.kind == 2 ? "preset.delete" : root.kind == 7 ? "plugins.replace" : root.kind == 8 ? "plugins.remove" : "notice.discard");
+                    text: Workbench.tr(root.kind == 2 ? "preset.delete" : root.kind == 7 ? "plugins.replace" : root.kind == 8 ? "plugins.remove" : root.kind == 9 ? "omen.confirm_apply" : "notice.discard");
                     primary: root.kind != 1;
                     clicked => { root.accepted(true); }
                 }
 
+                Rectangle {
+                    width: root.kind == 1 ? 8px : 0px;
+                }
+
                 save-button := ActionButton {
                     visible: root.kind == 1;
+                    enabled: root.kind == 1;
+                    fixed-width: root.kind != 1;
                     control-width: root.kind == 1 ? Theme.action-width : 0px;
                     text: Workbench.tr("preset.save");
                     primary: true;
@@ -804,7 +839,7 @@ export component AppWindow inherits Window {
         if target == 3 { lighting-color.focus(); }
         else { settings-button.focus(); }
     }
-    title: "PerformanceHub";
+    title: "GLPH";
     no-frame: true;
     resize-border-width: Workbench.window-maximized ? 0px : 6px;
     preferred-width: 1000px;
@@ -813,7 +848,7 @@ export component AppWindow inherits Window {
     min-height: 500px;
     max-width: 10000px;
     max-height: 10000px;
-    background: Theme.canvas;
+    background: Theme.nav-fill;
     default-font-family: "Segoe UI";
     default-font-size: 13px;
     private property <bool> dark-appearance: Theme.dark;
@@ -823,38 +858,51 @@ export component AppWindow inherits Window {
     private property <bool> battery-details;
     private property <bool> fan-link-details;
 
+    if Theme.has-nav-texture: Image {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        source: Theme.nav-texture;
+        image-fit: fill;
+        accessible-role: none;
+    }
+
     titlebar := Rectangle {
         x: 0px;
         y: 0px;
         width: parent.width;
-        height: 40px;
-        background: Theme.surface;
+        height: 38px;
+        background: transparent;
         titlebar-move := WindowMoveArea {
             x: 6px;
             y: 0px;
-            width: parent.width - 150px;
+            width: parent.width - 144px;
             height: parent.height;
             Text {
-                x: 14px;
-                width: 140px;
-                text: "PERFORMANCEHUB";
-                font-size: 12px;
-                font-weight: 600;
-                letter-spacing: 0.8px;
-                color: Theme.ink;
+                x: 16px;
+                width: 170px;
+                text: "GLPH";
+                font-size: 13px;
+                font-weight: 700;
+                letter-spacing: 0.9px;
+                color: Theme.nav-ink;
                 vertical-alignment: center;
             }
 
             Text {
-                x: 164px;
-                width: parent.width - 184px;
+                x: 198px;
+                width: max(0px, parent.width - 214px);
                 text: Workbench.busy ? Workbench.tr("control.working")
                     : Workbench.page < 2 ? Workbench.tr("ui.overview")
                     : Workbench.page == 2 ? Workbench.tr("ui.cooling")
                     : Workbench.page == 3 ? (Workbench.active-plugin-title != "" ? Workbench.active-plugin-title : Workbench.tr("ui.lighting"))
                     : Workbench.tr("settings.title");
-                color: Theme.muted;
+                font-size: 12px;
+                font-weight: 500;
+                color: Theme.nav-muted;
                 vertical-alignment: center;
+                overflow: elide;
             }
 
             TouchArea {
@@ -864,14 +912,14 @@ export component AppWindow inherits Window {
         }
 
         window-minimize := CaptionButton {
-            x: parent.width - 144px;
+            x: parent.width - 138px;
             kind: 0;
             text: Workbench.tr("window.minimize");
             clicked => { Workbench.window-action(0); }
         }
 
         window-maximize := CaptionButton {
-            x: parent.width - 96px;
+            x: parent.width - 92px;
             kind: 1;
             maximized: Workbench.window-maximized;
             text: Workbench.tr(Workbench.window-maximized ? "window.restore" : "window.maximize");
@@ -879,7 +927,7 @@ export component AppWindow inherits Window {
         }
 
         window-close := CaptionButton {
-            x: parent.width - 48px;
+            x: parent.width - 46px;
             kind: 2;
             text: Workbench.tr("settings.close");
             clicked => { Workbench.window-action(2); }
@@ -888,19 +936,17 @@ export component AppWindow inherits Window {
 
     sidebar := Rectangle {
         x: 0px;
-        y: 40px;
-        width: 160px;
-        height: parent.height - 40px;
-        background: Theme.surface;
-        Rectangle {
-            x: parent.width - 1px;
-            width: 1px;
-            background: Theme.line;
-        }
+        y: 38px;
+        width: 200px;
+        height: max(0px, parent.height - 38px);
+        background: transparent;
 
         VerticalLayout {
-            padding: 8px;
-            spacing: 6px;
+            padding-left: 10px;
+            padding-right: 10px;
+            padding-top: 4px;
+            padding-bottom: 10px;
+            spacing: 4px;
             navigation-overview := NavigationItem {
                 kind: 0;
                 text: Workbench.tr("ui.overview");
@@ -917,7 +963,16 @@ export component AppWindow inherits Window {
                 clicked => { Workbench.navigate(2); }
             }
 
-            if Workbench.plugin-nav-items.length > 0: Hairline { }
+            if Workbench.plugin-nav-items.length > 0: Rectangle {
+                height: 9px;
+                Rectangle {
+                    x: 4px;
+                    y: 4px;
+                    width: max(0px, parent.width - 8px);
+                    height: 1px;
+                    background: Theme.nav-line.with-alpha(0.65);
+                }
+            }
 
             if Workbench.plugin-nav-items.length > 0: ScrollView {
                 vertical-stretch: 1;
@@ -926,7 +981,7 @@ export component AppWindow inherits Window {
                 plugin-nav-list := VerticalLayout {
                     width: parent.width;
                     height: self.preferred-height;
-                    spacing: 6px;
+                    spacing: 4px;
                     for item in Workbench.plugin-nav-items: NavigationItem {
                         kind: item.icon-kind;
                         text: item.label;
@@ -941,7 +996,16 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
             }
 
-            Hairline { }
+            Rectangle {
+                height: 9px;
+                Rectangle {
+                    x: 4px;
+                    y: 4px;
+                    width: max(0px, parent.width - 8px);
+                    height: 1px;
+                    background: Theme.nav-line.with-alpha(0.65);
+                }
+            }
 
             settings-button := NavigationItem {
                 kind: 3;
@@ -954,10 +1018,26 @@ export component AppWindow inherits Window {
     }
 
     workspace := Rectangle {
-        x: 160px;
-        y: 40px;
-        width: parent.width - 160px;
-        height: parent.height - 40px;
+        x: 200px;
+        y: 38px;
+        width: max(0px, parent.width - 208px);
+        height: max(0px, parent.height - 46px);
+        border-radius: 12px;
+        border-width: Theme.card-border-width;
+        border-color: Theme.canvas-frame-border;
+        background: Theme.canvas-fill;
+        clip: true;
+
+        if Theme.has-canvas-texture: Image {
+            x: 1px;
+            y: 1px;
+            width: max(0px, parent.width - 2px);
+            height: max(0px, parent.height - 2px);
+            source: Theme.canvas-texture;
+            image-fit: fill;
+            accessible-role: none;
+        }
+
         VerticalLayout {
             spacing: 0px;
             if Workbench.test-mode: Text {
@@ -979,99 +1059,12 @@ export component AppWindow inherits Window {
                             content-width: self.visible-width - 12px;
                             VerticalLayout {
                                 spacing: 12px;
-                                HorizontalLayout {
-                                    spacing: 24px;
-                                    VerticalLayout {
-                                        spacing: 12px;
-                                        SectionTitle {
-                                            text: Workbench.tr("section.gpu");
-                                        }
-
-                                        Text {
-                                            text: Workbench.gpu-name;
-                                            color: Theme.muted;
-                                            wrap: word-wrap;
-                                        }
-
-                                        HorizontalLayout {
-                                            Measurement {
-                                                label: Workbench.tr("ui.power");
-                                                value: Workbench.gpu-power;
-                                            }
-
-                                            Measurement {
-                                                label: Workbench.tr("ui.temperature");
-                                                value: Workbench.gpu-temp;
-                                            }
-                                        }
-
-                                        Text {
-                                            text: Workbench.gpu-clock;
-                                            color: Theme.muted;
-                                            font-family: "Consolas";
-                                        }
-
-                                        Text {
-                                            visible: Workbench.gpu-tgp != "";
-                                            text: Workbench.gpu-tgp;
-                                            color: Theme.muted;
-                                            font-family: "Consolas";
-                                            font-size: 12px;
-                                            wrap: word-wrap;
-                                        }
-                                    }
-
-                                    Rectangle {
-                                        width: 1px;
-                                        background: Theme.line;
-                                    }
-
-                                    VerticalLayout {
-                                        spacing: 12px;
-                                        SectionTitle {
-                                            text: Workbench.tr("section.cpu");
-                                        }
-
-                                        Text {
-                                            text: Workbench.cpu-name;
-                                            color: Theme.muted;
-                                            wrap: word-wrap;
-                                        }
-
-                                        HorizontalLayout {
-                                            Measurement {
-                                                label: Workbench.tr("ui.power");
-                                                value: Workbench.cpu-power;
-                                            }
-
-                                            Measurement {
-                                                label: Workbench.tr("ui.tctl");
-                                                value: Workbench.cpu-temp;
-                                            }
-                                        }
-
-                                        Text {
-                                            text: Workbench.cpu-load;
-                                            color: Theme.muted;
-                                            font-family: "Consolas";
-                                            wrap: word-wrap;
-                                        }
-
-                                        Text {
-                                            visible: Workbench.chassis-temp != "";
-                                            text: Workbench.chassis-temp;
-                                            color: Theme.muted;
-                                            font-family: "Consolas";
-                                            font-size: 12px;
-                                            wrap: word-wrap;
-                                        }
-                                    }
-                                }
+                                TelemetryPanel { }
 
                                 HorizontalLayout {
+                                    spacing: 8px;
                                     device-details-toggle := ActionButton {
                                         text: Workbench.tr("ui.device_modes");
-                                        background: transparent;
                                         clicked => { root.device-details = !root.device-details; }
                                     }
 
@@ -1086,68 +1079,92 @@ export component AppWindow inherits Window {
                                     }
                                 }
 
-                                if root.device-details: VerticalLayout {
-                                    spacing: 12px;
-                                    Text {
-                                        text: Workbench.cpu-source;
-                                        color: Theme.muted;
-                                        wrap: word-wrap;
-                                        font-size: 12px;
-                                    }
-
-                                    Text {
-                                        visible: Workbench.sensor-details != "";
-                                        text: Workbench.sensor-details;
-                                        color: Theme.warning;
-                                        wrap: word-wrap;
-                                        font-size: 12px;
-                                    }
-
-                                    Text {
-                                        text: Workbench.last-apply;
-                                        color: Theme.muted;
-                                        wrap: word-wrap;
-                                        font-size: 12px;
-                                    }
-
-                                    Hairline { }
-
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        Text {
-                                            text: Workbench.tr("ui.graphics");
-                                            color: Theme.ink;
-                                            vertical-alignment: center;
-                                        }
-
-                                        ComboBox {
-                                            accessible-label: Workbench.tr("ui.graphics");
-                                            model: [Workbench.tr("mux.hybrid"), Workbench.tr("mux.discrete")];
-                                            current-index <=> Workbench.graphics-index;
-                                            enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
-                                            selected(value) => { Workbench.graphics-change(self.current-index); }
+                                if root.device-details: SettingsCard {
+                                    VerticalLayout {
+                                        padding: 16px;
+                                        spacing: 10px;
+                                        if Workbench.gpu-tgp != "" || Workbench.chassis-temp != "": HorizontalLayout {
+                                            spacing: 16px;
+                                            if Workbench.gpu-tgp != "": Text {
+                                                text: Workbench.gpu-tgp;
+                                                color: Theme.muted;
+                                                font-family: "Consolas";
+                                                font-size: 12px;
+                                                wrap: word-wrap;
+                                                horizontal-stretch: 1;
+                                            }
+                                            if Workbench.chassis-temp != "": Text {
+                                                text: Workbench.chassis-temp;
+                                                color: Theme.muted;
+                                                font-family: "Consolas";
+                                                font-size: 12px;
+                                                wrap: word-wrap;
+                                                horizontal-stretch: 1;
+                                            }
                                         }
 
                                         Text {
-                                            text: Workbench.graphics-status;
+                                            text: Workbench.cpu-source;
                                             color: Theme.muted;
                                             wrap: word-wrap;
-                                            horizontal-stretch: 1;
+                                            font-size: 12px;
                                         }
-                                    }
 
-                                    ActionButton {
-                                        visible: Workbench.recovery-pending;
-                                        text: Workbench.tr("preset.restore_button");
-                                        enabled: !Workbench.busy && Workbench.confirm-kind == 0;
-                                        clicked => { Workbench.apply-preset(); }
-                                    }
+                                        Text {
+                                            visible: Workbench.sensor-details != "";
+                                            text: Workbench.sensor-details;
+                                            color: Theme.warning;
+                                            wrap: word-wrap;
+                                            font-size: 12px;
+                                        }
 
-                                    Text {
-                                        text: Workbench.identity + "  ·  " + Workbench.power-source + "  ·  " + Workbench.tr(Workbench.admin ? "ui.admin" : "ui.user");
-                                        color: Theme.muted;
-                                        font-size: 11px;
-                                        wrap: word-wrap;
+                                        Text {
+                                            text: Workbench.last-apply;
+                                            color: Theme.muted;
+                                            wrap: word-wrap;
+                                            font-size: 12px;
+                                        }
+
+                                        Hairline { }
+
+                                        HorizontalLayout {
+                                            spacing: 12px;
+                                            Text {
+                                                text: Workbench.tr("ui.graphics");
+                                                color: Theme.ink;
+                                                vertical-alignment: center;
+                                            }
+
+                                            ComboBox {
+                                                accessible-label: Workbench.tr("ui.graphics");
+                                                model: [Workbench.tr("mux.hybrid"), Workbench.tr("mux.discrete")];
+                                                current-index <=> Workbench.graphics-index;
+                                                enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                                selected(value) => { Workbench.graphics-change(self.current-index); }
+                                            }
+
+                                            Text {
+                                                text: Workbench.graphics-status;
+                                                color: Theme.muted;
+                                                wrap: word-wrap;
+                                                horizontal-stretch: 1;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+
+                                        ActionButton {
+                                            visible: Workbench.recovery-pending;
+                                            text: Workbench.tr("preset.restore_button");
+                                            enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                            clicked => { Workbench.apply-preset(); }
+                                        }
+
+                                        Text {
+                                            text: Workbench.identity + "  ·  " + Workbench.power-source + "  ·  " + Workbench.tr(Workbench.admin ? "ui.admin" : "ui.user");
+                                            color: Theme.muted;
+                                            font-size: 11px;
+                                            wrap: word-wrap;
+                                        }
                                     }
                                 }
                                 Hairline { }
@@ -1356,7 +1373,7 @@ export component AppWindow inherits Window {
                                 apply-preset := ActionButton {
                                     text: Workbench.tr("preset.apply_button");
                                     primary: true;
-                                    enabled: Workbench.preset-saved && !Workbench.dirty && Workbench.confirm-kind == 0;
+                                    enabled: Workbench.preset-saved && Workbench.preset-applicable && !Workbench.dirty && !Workbench.operation-busy && Workbench.confirm-kind == 0;
                                     clicked => { Workbench.apply-preset(); }
                                 }
                             }
@@ -1369,154 +1386,142 @@ export component AppWindow inherits Window {
                     content-height: cooling-content.preferred-height;
                     visible: Workbench.page == 2 && !Workbench.curve-open;
                     cooling-content := VerticalLayout {
-                        width: min(Theme.workspace-width,parent.width);
+                        width: min(880px, parent.width);
                         x: (parent.width - self.width) / 2;
                         y: 0px;
                         height: self.preferred-height;
                         padding: 20px;
-                        spacing: 16px;
+                        spacing: 14px;
                         SectionTitle {
                             text: Workbench.tr("ui.cooling");
                         }
 
-                        HorizontalLayout {
-                            Text {
-                                text: Workbench.tr("ui.fan_request");
-                                color: Theme.ink;
-                                vertical-alignment: center;
-                            }
-
-                            fan-selector := ComboBox {
-                                model: [
-                                    Workbench.tr("ui.fan_bios"),
-                                    Workbench.tr("ui.fan_curve"),
-                                    Workbench.tr("ui.fan_max")
-                                ];
-                                current-index <=> Workbench.fan-index;
-                                enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
-                                selected(value) => { Workbench.fan-change(self.current-index); }
-                            }
-
-                            Rectangle {
-                                horizontal-stretch: 1;
+                        SettingsCard {
+                            VerticalLayout {
+                                spacing: 0px;
+                                SettingRow {
+                                    label: Workbench.tr("ui.fan_request");
+                                    description: Workbench.cooling-status;
+                                    last: true;
+                                    fan-selector := ComboBox {
+                                        width: Theme.field-width;
+                                        model: [
+                                            Workbench.tr("ui.fan_bios"),
+                                            Workbench.tr("ui.fan_curve"),
+                                            Workbench.tr("ui.fan_max")
+                                        ];
+                                        current-index <=> Workbench.fan-index;
+                                        enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                        selected(value) => { Workbench.fan-change(self.current-index); }
+                                    }
+                                }
                             }
                         }
-
-                        Text {
-                            text: Workbench.cooling-status;
-                            color: Theme.muted;
-                            wrap: word-wrap;
-                        }
-
-                        Hairline { }
 
                         SectionTitle {
                             text: Workbench.tr("fan_profile.library_title");
                         }
 
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text {
-                                text: Workbench.tr("fan_profile.preset");
-                                color: Theme.muted;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
+                        SettingsCard {
+                            VerticalLayout {
+                                spacing: 0px;
 
-                            fan-library-selector := ComboBox {
-                                width: Theme.field-width;
-                                accessible-label: Workbench.tr("fan_profile.preset");
-                                model: Workbench.fan-library-names;
-                                current-index <=> Workbench.fan-library-index;
-                                enabled: Workbench.fan-library-ready && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
-                                selected(value) => { Workbench.fan-library-selected(self.current-index); }
-                            }
+                                SettingRow {
+                                    label: Workbench.tr("fan_profile.preset");
+                                    fan-library-selector := ComboBox {
+                                        width: Theme.field-width;
+                                        accessible-label: Workbench.tr("fan_profile.preset");
+                                        model: Workbench.fan-library-names;
+                                        current-index <=> Workbench.fan-library-index;
+                                        enabled: Workbench.fan-library-ready && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        selected(value) => { Workbench.fan-library-selected(self.current-index); }
+                                    }
 
-                            ActionButton {
-                                text: "+";
-                                accessible-label: Workbench.tr("fan_profile.new");
-                                enabled: Workbench.fan-library-ready && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.fan-library-new(); }
-                            }
-                        }
+                                    ActionButton {
+                                        text: "+";
+                                        accessible-label: Workbench.tr("fan_profile.new");
+                                        enabled: Workbench.fan-library-ready && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.fan-library-new(); }
+                                    }
+                                }
 
-                        HorizontalLayout {
-                            Text {
-                                text: Workbench.tr("fan_profile.name");
-                                color: Theme.muted;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
+                                SettingRow {
+                                    label: Workbench.tr("fan_profile.name");
+                                    description: Workbench.tr("fan_profile.library_note");
+                                    fan-library-name := LineEdit {
+                                        width: Theme.field-width;
+                                        accessible-label: Workbench.tr("fan_profile.name");
+                                        text <=> Workbench.fan-library-name;
+                                        enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        edited(value) => { Workbench.fan-library-name-edited(value); }
+                                    }
 
-                            fan-library-name := LineEdit {
-                                width: Theme.field-width;
-                                accessible-label: Workbench.tr("fan_profile.name");
-                                text <=> Workbench.fan-library-name;
-                                enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                edited(value) => { Workbench.fan-library-name-edited(value); }
-                            }
+                                    Rectangle {
+                                        width: Theme.control-height;
+                                    }
+                                }
 
-                            Rectangle {
-                                width: Theme.control-height + 8px;
-                            }
-                        }
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 16px;
+                                    padding-top: 12px;
+                                    padding-bottom: 12px;
+                                    spacing: 8px;
+                                    edit-fan := ActionButton {
+                                        text: Workbench.tr("ui.edit_curve");
+                                        enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.open-curve(false); }
+                                    }
 
-                        HorizontalLayout {
-                            spacing: 8px;
-                            edit-fan := ActionButton {
-                                text: Workbench.tr("ui.edit_curve");
-                                enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.open-curve(false); }
-                            }
+                                    fan-library-reset := ActionButton {
+                                        text: Workbench.tr("preset.cancel_edit");
+                                        control-width: 160px;
+                                        enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.fan-library-reset(); }
+                                    }
 
-                            fan-library-reset := ActionButton {
-                                text: Workbench.tr("preset.cancel_edit");
-                                control-width: 160px;
-                                enabled: Workbench.fan-library-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.fan-library-reset(); }
-                            }
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                    }
 
-                            Rectangle {
-                                horizontal-stretch: 1;
-                            }
+                                    ActionButton {
+                                        text: Workbench.tr("ui.refresh");
+                                        enabled: !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.fan-library-refresh(); }
+                                    }
+                                }
 
-                            ActionButton {
-                                text: Workbench.tr("ui.refresh");
-                                enabled: !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.fan-library-refresh(); }
-                            }
-                        }
+                                Hairline { }
 
-                        Text {
-                            text: Workbench.tr("fan_profile.library_note");
-                            color: Theme.muted;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 16px;
+                                    padding-top: 12px;
+                                    padding-bottom: 14px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                    }
 
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Rectangle {
-                                horizontal-stretch: 1;
-                            }
+                                    fan-library-delete := ActionButton {
+                                        text: Workbench.tr("preset.delete");
+                                        enabled: Workbench.fan-library-saved && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.fan-library-delete(); }
+                                    }
 
-                            fan-library-delete := ActionButton {
-                                text: Workbench.tr("preset.delete");
-                                enabled: Workbench.fan-library-saved && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.fan-library-delete(); }
-                            }
+                                    fan-library-save := ActionButton {
+                                        text: Workbench.tr("preset.save");
+                                        enabled: Workbench.fan-library-ready && Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.fan-library-save(); }
+                                    }
 
-                            fan-library-save := ActionButton {
-                                text: Workbench.tr("preset.save");
-                                enabled: Workbench.fan-library-ready && Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.fan-library-save(); }
-                            }
-
-                            fan-library-request := ActionButton {
-                                text: Workbench.tr("preset.apply_button");
-                                primary: true;
-                                enabled: Workbench.fan-library-saved && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.fan-library-request(); }
+                                    fan-library-request := ActionButton {
+                                        text: Workbench.tr("preset.apply_button");
+                                        primary: true;
+                                        enabled: Workbench.fan-library-saved && !Workbench.fan-library-dirty && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.fan-library-request(); }
+                                    }
+                                }
                             }
                         }
 
@@ -1527,47 +1532,51 @@ export component AppWindow inherits Window {
                 }
 
                 lighting := Rectangle {
-                    visible: Workbench.page == 3 && !Workbench.curve-open;
-                    VerticalLayout {
-                        width: min(Theme.workspace-width,parent.width);
-                        x: (parent.width - self.width) / 2;
-                        padding: 20px;
-                        spacing: 12px;
-                        HorizontalLayout {
-                            SectionTitle {
-                                text: Workbench.tr("ui.lighting");
-                                horizontal-stretch: 1;
+                    visible: Workbench.page == 3 && !Workbench.curve-open && (Workbench.active-plugin-surface-kind == 0 || Workbench.active-plugin-surface-kind == 3);
+                    lighting-scroll := ScrollView {
+                        width: parent.width;
+                        height: parent.height;
+                        content-width: self.visible-width - 12px;
+                        content-height: lighting-outer.preferred-height;
+                        lighting-outer := VerticalLayout {
+                            width: min(Theme.workspace-width, parent.width);
+                            x: (parent.width - self.width) / 2;
+                            height: self.preferred-height;
+                            padding: 20px;
+                            spacing: 16px;
+
+                            // --- Top section: 4-Zone Keyboard Lighting ---
+                            HorizontalLayout {
+                                spacing: 8px;
+                                SectionTitle {
+                                    text: Workbench.active-plugin-surface-kind == 3 ? Workbench.tr("ui.lighting") : (Workbench.active-plugin-title != "" ? Workbench.active-plugin-title : Workbench.tr("ui.lighting"));
+                                    horizontal-stretch: 1;
+                                }
+
+                                keyboard-layout := ComboBox {
+                                    accessible-label: Workbench.tr("lighting.layout");
+                                    width: Theme.field-width;
+                                    model: ["Deutsch · QWERTZ", "English · QWERTY"];
+                                    current-index: Workbench.keyboard-german ? 0 : 1;
+                                    enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                    selected(value) => { Workbench.keyboard-layout(self.current-index == 0); }
+                                }
+
+                                lighting-power := ActionButton {
+                                    text: Workbench.lighting-on ? Workbench.tr("common.on") : Workbench.tr("common.off");
+                                    enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                    clicked => { Workbench.lighting-power(); }
+                                }
+
+                                Text {
+                                    text: Workbench.lighting-dirty ? Workbench.tr("lighting.preview") : "";
+                                    color: Theme.muted;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
                             }
 
-                            keyboard-layout := ComboBox {
-                                accessible-label: Workbench.tr("lighting.layout");
-                                width: Theme.field-width;
-                                model: ["Deutsch · QWERTZ", "English · QWERTY"];
-                                current-index: Workbench.keyboard-german ? 0 : 1;
-                                enabled: !Workbench.busy && Workbench.confirm-kind == 0;
-                                selected(value) => { Workbench.keyboard-layout(self.current-index == 0); }
-                            }
-
-                            lighting-power := ActionButton {
-                                text: Workbench.lighting-on ? Workbench.tr("common.on") : Workbench.tr("common.off");
-                                enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.lighting-power(); }
-                            }
-
-                            Text {
-                                text: Workbench.lighting-dirty ? Workbench.tr("lighting.preview") : "";
-                                color: Theme.muted;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        lighting-scroll := ScrollView {
-                            content-width: self.visible-width - 12px;
-                            content-height: lighting-content.preferred-height;
                             lighting-content := VerticalLayout {
-                                height: self.preferred-height;
-                                y: 0px;
                                 spacing: 12px;
                                 keyboard-preview := KeyboardPreview {
                                     keys: Workbench.keyboard-keys;
@@ -1620,8 +1629,8 @@ export component AppWindow inherits Window {
                                         height: Theme.control-height;
                                         border-radius: 6px;
                                         border-width: 1px;
-                                        border-color: lighting-brightness.has-focus || lighting-slider.has-focus ? Theme.accent : Theme.line;
-                                        background: Theme.control;
+                                        border-color: lighting-brightness.has-focus || lighting-slider.has-focus ? Theme.accent : Theme.control-border;
+                                        background: Theme.control-fill;
                                         HorizontalLayout {
                                             padding-left: 4px;
                                             padding-right: 8px;
@@ -1658,33 +1667,246 @@ export component AppWindow inherits Window {
                                     color: Theme.error;
                                     wrap: word-wrap;
                                 }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    lighting-reset := ActionButton {
+                                        text: Workbench.tr("ui.reset_draft");
+                                        enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.reset-lighting(); }
+                                    }
+
+                                    lighting-refresh := ActionButton {
+                                        text: Workbench.tr("ui.refresh");
+                                        enabled: !Workbench.busy && !Workbench.lighting-dirty && Workbench.lighting-error == "" && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.refresh-lighting(); }
+                                    }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    lighting-apply := ActionButton {
+                                        text: Workbench.tr("preset.apply_button");
+                                        accessible-description: Workbench.lighting-confirmed;
+                                        primary: true;
+                                        enabled: Workbench.lighting-ready && Workbench.lighting-dirty && Workbench.lighting-error == "" && !Workbench.busy && Workbench.confirm-kind == 0;
+                                        clicked => { Workbench.apply-lighting(); }
+                                    }
+                                }
+                            }
+
+                            // --- Bottom section: Original HP OMEN Performance Modes (only for hp-omen-suite) ---
+                            if Workbench.active-plugin-surface-kind == 3: VerticalLayout {
+                                spacing: 12px;
+
+                                Hairline { }
+
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    SectionTitle {
+                                        text: Workbench.tr("omen.modes_title");
+                                    }
+                                    Text {
+                                        text: Workbench.tr("omen.modes_subtitle");
+                                        color: Theme.muted;
+                                        font-size: 12px;
+                                        wrap: word-wrap;
+                                    }
+                                }
+
+                                SettingsCard {
+                                    VerticalLayout {
+                                        spacing: 0px;
+
+                                        VerticalLayout {
+                                            padding: 16px;
+                                            spacing: 12px;
+
+                                            omen-mode-tabs := SegmentedTabs {
+                                                enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                                labels: [
+                                                    Workbench.tr("mode.quiet"),
+                                                    Workbench.tr("mode.balanced"),
+                                                    Workbench.tr("mode.performance"),
+                                                    Workbench.tr("mode.unleashed")
+                                                ];
+                                                selected: Workbench.omen-mode-index;
+                                                changed(index) => { Workbench.select-omen-mode(index); }
+                                            }
+
+                                            CalloutBanner {
+                                                severity: Workbench.omen-mode-index == 3 ? 1 : 0;
+                                                text: Workbench.omen-mode-index == 0 ? Workbench.tr("omen.mode_desc_quiet")
+                                                    : Workbench.omen-mode-index == 1 ? Workbench.tr("omen.mode_desc_balanced")
+                                                    : Workbench.omen-mode-index == 2 ? Workbench.tr("omen.mode_desc_performance")
+                                                    : Workbench.tr("omen.mode_desc_unleashed");
+                                            }
+                                        }
+
+                                        if Workbench.omen-mode-index == 3: VerticalLayout {
+                                            spacing: 0px;
+
+                                            Hairline { }
+
+                                            SettingRow {
+                                                label: Workbench.tr("omen.unleashed_pl1");
+                                                description: Workbench.tr("omen.unleashed_pl1_desc");
+                                                HorizontalLayout {
+                                                    width: 240px;
+                                                    spacing: 10px;
+                                                    BrightnessSlider {
+                                                        accessible-label: Workbench.tr("omen.unleashed_pl1");
+                                                        minimum: 45;
+                                                        maximum: 95;
+                                                        value: Workbench.omen-unleashed-pl1;
+                                                        enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                                        edited(v) => { Workbench.omen-unleashed-pl1 = round(v); }
+                                                    }
+                                                    Text {
+                                                        width: 52px;
+                                                        text: Workbench.omen-unleashed-pl1 + " W";
+                                                        color: Theme.ink;
+                                                        font-size: 13px;
+                                                        font-weight: 600;
+                                                        horizontal-alignment: right;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("omen.unleashed_tpp");
+                                                description: Workbench.tr("omen.unleashed_tpp_desc");
+                                                HorizontalLayout {
+                                                    width: 240px;
+                                                    spacing: 10px;
+                                                    BrightnessSlider {
+                                                        accessible-label: Workbench.tr("omen.unleashed_tpp");
+                                                        minimum: 30;
+                                                        maximum: 72;
+                                                        value: Workbench.omen-unleashed-tpp;
+                                                        enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                                        edited(v) => { Workbench.omen-unleashed-tpp = round(v); }
+                                                    }
+                                                    Text {
+                                                        width: 52px;
+                                                        text: Workbench.omen-unleashed-tpp + " W";
+                                                        color: Theme.ink;
+                                                        font-size: 13px;
+                                                        font-weight: 600;
+                                                        horizontal-alignment: right;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("omen.unleashed_gps");
+                                                description: Workbench.tr("omen.unleashed_gps_desc");
+                                                HorizontalLayout {
+                                                    width: 240px;
+                                                    spacing: 10px;
+                                                    BrightnessSlider {
+                                                        accessible-label: Workbench.tr("omen.unleashed_gps");
+                                                        minimum: 65;
+                                                        maximum: 87;
+                                                        value: Workbench.omen-unleashed-gps;
+                                                        enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                                        edited(v) => { Workbench.omen-unleashed-gps = round(v); }
+                                                    }
+                                                    Text {
+                                                        width: 52px;
+                                                        text: Workbench.omen-unleashed-gps + " °C";
+                                                        color: Theme.ink;
+                                                        font-size: 13px;
+                                                        font-weight: 600;
+                                                        horizontal-alignment: right;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("omen.unleashed_ctgp");
+                                                description: Workbench.tr("omen.unleashed_ctgp_desc");
+                                                ToggleSwitch {
+                                                    accessible-label: Workbench.tr("omen.unleashed_ctgp");
+                                                    checked: Workbench.omen-unleashed-ctgp;
+                                                    enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    toggled(v) => { Workbench.omen-unleashed-ctgp = v; }
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("omen.unleashed_ppab");
+                                                description: Workbench.tr("omen.unleashed_ppab_desc");
+                                                last: true;
+                                                ToggleSwitch {
+                                                    accessible-label: Workbench.tr("omen.unleashed_ppab");
+                                                    checked: Workbench.omen-unleashed-ppab;
+                                                    enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    toggled(v) => { Workbench.omen-unleashed-ppab = v; }
+                                                }
+                                            }
+                                        }
+
+                                        Hairline { }
+
+                                        HorizontalLayout {
+                                            padding-left: 16px;
+                                            padding-right: 16px;
+                                            padding-top: 12px;
+                                            padding-bottom: 14px;
+                                            spacing: 8px;
+
+                                            if Workbench.omen-mode-index == 3: ActionButton {
+                                                text: Workbench.tr("omen.unleashed_reset");
+                                                enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                                clicked => { Workbench.reset-omen-unleashed(); }
+                                            }
+
+                                            Rectangle {
+                                                horizontal-stretch: 1;
+                                            }
+
+                                            omen-mode-apply := ActionButton {
+                                                text: Workbench.tr("omen.mode_apply");
+                                                primary: true;
+                                                enabled: !Workbench.busy && Workbench.confirm-kind == 0;
+                                                clicked => { Workbench.apply-omen-mode(); }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
+                    }
+                }
 
-                        HorizontalLayout {
-                            spacing: 8px;
-                            lighting-reset := ActionButton {
-                                text: Workbench.tr("ui.reset_draft");
-                                enabled: Workbench.lighting-ready && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.reset-lighting(); }
-                            }
+                plugin-fallback := Rectangle {
+                    visible: Workbench.page == 3 && !Workbench.curve-open && Workbench.active-plugin-surface-kind != 0 && Workbench.active-plugin-surface-kind != 3;
+                    VerticalLayout {
+                        width: min(880px, parent.width);
+                        x: (parent.width - self.width) / 2;
+                        padding: 20px;
+                        spacing: 14px;
+                        alignment: start;
 
-                            lighting-refresh := ActionButton {
-                                text: Workbench.tr("ui.refresh");
-                                enabled: !Workbench.busy && !Workbench.lighting-dirty && Workbench.lighting-error == "" && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.refresh-lighting(); }
-                            }
+                        SectionTitle {
+                            text: Workbench.active-plugin-title != "" ? Workbench.active-plugin-title : Workbench.tr("plugins.surface_unsupported_title");
+                        }
 
-                            Rectangle {
-                                horizontal-stretch: 1;
-                            }
-
-                            lighting-apply := ActionButton {
-                                text: Workbench.tr("preset.apply_button");
-                                accessible-description: Workbench.lighting-confirmed;
-                                primary: true;
-                                enabled: Workbench.lighting-ready && Workbench.lighting-dirty && Workbench.lighting-error == "" && !Workbench.busy && Workbench.confirm-kind == 0;
-                                clicked => { Workbench.apply-lighting(); }
+                        SettingsCard {
+                            VerticalLayout {
+                                padding: 16px;
+                                spacing: 10px;
+                                Text {
+                                    text: Workbench.tr("plugins.surface_unsupported_body");
+                                    color: Theme.muted;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                }
                             }
                         }
                     }
@@ -1803,6 +2025,34 @@ export component AppWindow inherits Window {
                                                     width: Theme.field-width;
                                                     model: [Workbench.tr("settings.close_tray"), Workbench.tr("settings.close_exit")];
                                                     current-index <=> Workbench.close-index;
+                                                    enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    selected(value) => { Workbench.settings-changed(); }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Text {
+                                        text: Workbench.tr("settings.card_telemetry");
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        letter-spacing: 0.6px;
+                                    }
+
+                                    SettingsCard {
+                                        VerticalLayout {
+                                            spacing: 0px;
+
+                                            SettingRow {
+                                                label: Workbench.tr("telemetry.poll_rate");
+                                                description: Workbench.tr("telemetry.poll_rate_desc");
+                                                last: true;
+                                                poll-rate := ComboBox {
+                                                    width: Theme.field-width;
+                                                    accessible-label: Workbench.tr("telemetry.poll_rate");
+                                                    model: Workbench.poll-rate-choices;
+                                                    current-index <=> Workbench.poll-rate-index;
                                                     enabled: (Workbench.settings-ready && !Workbench.busy) && Workbench.confirm-kind == 0;
                                                     selected(value) => { Workbench.settings-changed(); }
                                                 }
@@ -1960,34 +2210,146 @@ export component AppWindow inherits Window {
                                             SettingRow {
                                                 label: Workbench.tr("settings.background");
                                                 color-background := ColorField {
+                                                    control-width: 192px;
                                                     text: Workbench.tr("settings.background");
                                                     value: Workbench.color-background;
                                                     swatch-color: Workbench.background-preview;
                                                     enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
                                                     clicked => { Workbench.open-color-picker(0); }
                                                 }
+
+                                                background-look := ComboBox {
+                                                    control-width: 204px;
+                                                    model: Workbench.color-look-choices;
+                                                    current-index <=> Workbench.background-look-index;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    selected => { Workbench.look-changed(0, self.current-index); }
+                                                }
+                                            }
+
+                                            if Workbench.background-look-index == Theme.look-gradient-index: SettingRow {
+                                                label: Workbench.tr("settings.gradient_second_color");
+                                                color-background-secondary := ColorField {
+                                                    control-width: 192px;
+                                                    text: Workbench.tr("settings.gradient_second_color");
+                                                    value: Workbench.color-background-secondary;
+                                                    swatch-color: Workbench.background-secondary-preview;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.open-color-picker(4); }
+                                                }
+
+                                                Rectangle {
+                                                    width: 204px;
+                                                }
+                                            }
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.nav_background");
+                                                color-nav-background := ColorField {
+                                                    control-width: 192px;
+                                                    text: Workbench.tr("settings.nav_background");
+                                                    value: Workbench.color-nav-background;
+                                                    swatch-color: Workbench.nav-background-preview;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.open-color-picker(7); }
+                                                }
+
+                                                nav-background-look := ComboBox {
+                                                    control-width: 204px;
+                                                    model: Workbench.color-look-choices;
+                                                    current-index <=> Workbench.nav-background-look-index;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    selected => { Workbench.look-changed(3, self.current-index); }
+                                                }
+                                            }
+
+                                            if Workbench.nav-background-look-index == Theme.look-gradient-index: SettingRow {
+                                                label: Workbench.tr("settings.gradient_second_color");
+                                                color-nav-background-secondary := ColorField {
+                                                    control-width: 192px;
+                                                    text: Workbench.tr("settings.gradient_second_color");
+                                                    value: Workbench.color-nav-background-secondary;
+                                                    swatch-color: Workbench.nav-background-secondary-preview;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.open-color-picker(8); }
+                                                }
+
+                                                Rectangle {
+                                                    width: 204px;
+                                                }
                                             }
 
                                             SettingRow {
                                                 label: Workbench.tr("settings.foreground");
                                                 color-foreground := ColorField {
+                                                    control-width: 192px;
                                                     text: Workbench.tr("settings.foreground");
                                                     value: Workbench.color-foreground;
                                                     swatch-color: Workbench.foreground-preview;
                                                     enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
                                                     clicked => { Workbench.open-color-picker(1); }
                                                 }
+
+                                                foreground-look := ComboBox {
+                                                    control-width: 204px;
+                                                    model: Workbench.color-look-choices;
+                                                    current-index <=> Workbench.foreground-look-index;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    selected => { Workbench.look-changed(1, self.current-index); }
+                                                }
+                                            }
+
+                                            if Workbench.foreground-look-index == Theme.look-gradient-index: SettingRow {
+                                                label: Workbench.tr("settings.gradient_second_color");
+                                                color-foreground-secondary := ColorField {
+                                                    control-width: 192px;
+                                                    text: Workbench.tr("settings.gradient_second_color");
+                                                    value: Workbench.color-foreground-secondary;
+                                                    swatch-color: Workbench.foreground-secondary-preview;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.open-color-picker(5); }
+                                                }
+
+                                                Rectangle {
+                                                    width: 204px;
+                                                }
                                             }
 
                                             SettingRow {
                                                 label: Workbench.tr("settings.accent");
-                                                last: true;
+                                                last: Workbench.accent-look-index != Theme.look-gradient-index;
                                                 color-accent := ColorField {
+                                                    control-width: 192px;
                                                     text: Workbench.tr("settings.accent");
                                                     value: Workbench.color-accent;
                                                     swatch-color: Workbench.accent-preview;
                                                     enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
                                                     clicked => { Workbench.open-color-picker(2); }
+                                                }
+
+                                                accent-look := ComboBox {
+                                                    control-width: 204px;
+                                                    model: Workbench.color-look-choices;
+                                                    current-index <=> Workbench.accent-look-index;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    selected => { Workbench.look-changed(2, self.current-index); }
+                                                }
+                                            }
+
+                                            if Workbench.accent-look-index == Theme.look-gradient-index: SettingRow {
+                                                label: Workbench.tr("settings.gradient_second_color");
+                                                last: true;
+                                                color-accent-secondary := ColorField {
+                                                    control-width: 192px;
+                                                    text: Workbench.tr("settings.gradient_second_color");
+                                                    value: Workbench.color-accent-secondary;
+                                                    swatch-color: Workbench.accent-secondary-preview;
+                                                    enabled: Workbench.settings-ready && !Workbench.busy && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.open-color-picker(6); }
+                                                }
+
+                                                Rectangle {
+                                                    width: 204px;
                                                 }
                                             }
                                         }
@@ -2020,6 +2382,60 @@ export component AppWindow inherits Window {
                                 // --- Sub-tab 3: Hardware ---
                                 if Workbench.settings-tab == 3: VerticalLayout {
                                     spacing: 14px;
+
+                                    Text {
+                                        text: Workbench.tr("settings.card_service");
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        letter-spacing: 0.6px;
+                                    }
+
+                                    SettingsCard {
+                                        VerticalLayout {
+                                            spacing: 0px;
+
+                                            SettingRow {
+                                                label: Workbench.tr("settings.hw_service_title");
+                                                description: Workbench.tr("settings.hw_service_desc");
+                                                StatusPill {
+                                                    min-width: 140px;
+                                                    text: Workbench.hw-service-pill-text != "" ? Workbench.hw-service-pill-text : Workbench.tr("settings.hw_service_not_installed");
+                                                    kind: Workbench.hw-service-pill-kind;
+                                                }
+                                            }
+
+                                            HorizontalLayout {
+                                                padding-left: 16px;
+                                                padding-right: 16px;
+                                                padding-top: 10px;
+                                                padding-bottom: 14px;
+                                                spacing: 8px;
+                                                alignment: end;
+
+                                                ActionButton {
+                                                    text: Workbench.hw-service-outdated ? Workbench.tr("settings.hw_service_update_btn")
+                                                        : Workbench.hw-service-installed ? Workbench.tr("settings.hw_service_reinstall")
+                                                        : Workbench.tr("settings.hw_service_install");
+                                                    primary: !Workbench.hw-service-installed || Workbench.hw-service-outdated;
+                                                    enabled: (!Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.hw-service-action("install"); }
+                                                }
+
+                                                ActionButton {
+                                                    text: Workbench.hw-service-running ? Workbench.tr("settings.hw_service_stop") : Workbench.tr("settings.hw_service_start");
+                                                    enabled: (Workbench.hw-service-installed && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.hw-service-action(Workbench.hw-service-running ? "stop" : "start"); }
+                                                }
+
+                                                ActionButton {
+                                                    text: Workbench.tr("settings.hw_service_remove");
+                                                    enabled: (Workbench.hw-service-installed && !Workbench.busy) && Workbench.confirm-kind == 0;
+                                                    clicked => { Workbench.hw-service-action("remove"); }
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     Text {
                                         text: Workbench.tr("settings.card_gpu_power");
@@ -2082,8 +2498,8 @@ export component AppWindow inherits Window {
                                             }
 
                                             SettingRow {
-                                                label: Workbench.tr("settings.hp_service");
-                                                description: Workbench.tr("settings.detect_defaults_note");
+                                                label: Workbench.tr("settings.hp_service_row");
+                                                description: Workbench.tr("settings.hp_service_desc");
                                                 ActionButton {
                                                     text: Workbench.hp-disabled ? Workbench.tr("ui.hp_restore") : Workbench.tr("settings.hp_service");
                                                     enabled: (Workbench.hp-available && !Workbench.busy) && Workbench.confirm-kind == 0;
@@ -2110,7 +2526,7 @@ export component AppWindow inherits Window {
                         if Workbench.settings-dirty: Rectangle {
                             vertical-stretch: 0;
                             height: 58px;
-                            background: Theme.surface;
+                            background: Theme.surface-fill;
 
                             Hairline {
                                 y: 0px;
@@ -2186,8 +2602,8 @@ export component AppWindow inherits Window {
 
                             ActionButton {
                                 enabled: Workbench.confirm-kind == 0;
-                                text: Workbench.tr("ui.back");
-                                clicked => { Workbench.curve-action("close"); }
+                                text: Workbench.tr("ui.discard_curve");
+                                clicked => { Workbench.curve-action("discard"); }
                             }
 
                             ActionButton {
@@ -2302,13 +2718,22 @@ export component AppWindow inherits Window {
                 }
             }
         }
+
+        // Subtle 1px top specular highlight inside inset canvas (Glass / Glossy / Metallic / Neon)
+        Rectangle {
+            x: 12px;
+            y: 1px;
+            width: max(0px, parent.width - 24px);
+            height: 1px;
+            background: Theme.surface-top-sheen;
+        }
     }
 
     notification := NotificationPopup {
         visible: Workbench.notice-visible && Workbench.confirm-kind == 0;
-        width: min(420px,parent.width - 192px);
-        x: parent.width - self.width - 16px;
-        y: max(48px,parent.height - self.height - 76px);
+        width: min(420px, parent.width - 236px);
+        x: parent.width - self.width - 20px;
+        y: max(50px, parent.height - self.height - 24px);
         title: Workbench.notice-title;
         text: Workbench.notice-text;
         failed: Workbench.notice-failed;
@@ -2325,7 +2750,7 @@ export component AppWindow inherits Window {
         }
     }
     if Workbench.confirm-kind == 4: ColorPicker { }
-    if (Workbench.confirm-kind > 0 && Workbench.confirm-kind < 4) || Workbench.confirm-kind == 7 || Workbench.confirm-kind == 8: ConfirmPrompt {
+    if (Workbench.confirm-kind > 0 && Workbench.confirm-kind < 4) || Workbench.confirm-kind == 7 || Workbench.confirm-kind == 8 || Workbench.confirm-kind == 9: ConfirmPrompt {
         kind: Workbench.confirm-kind;
         save-requested => { Workbench.confirm-save(); }
         accepted(value) => {
@@ -2347,41 +2772,74 @@ export component AboutWindow inherits Window {
     preferred-height: 320px;
     min-width: 400px;
     min-height: 320px;
-    background: Theme.canvas;
+    background: Theme.nav-fill;
     default-font-family: "Segoe UI";
     default-font-size: 13px;
     private property <bool> dark-appearance: Theme.dark;
     changed dark-appearance => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
     init => { Palette.color-scheme = Theme.dark ? ColorScheme.dark : ColorScheme.light; }
-    VerticalLayout {
-        spacing: 0px;
-        Rectangle {
-            height: 40px;
-            background: Theme.surface;
-            WindowMoveArea {
-                x: 6px;
-                width: parent.width - 54px;
-                Text {
-                    x: 10px;
-                    text: root.window-title;
-                    color: Theme.ink;
-                    vertical-alignment: center;
-                }
-            }
+    if Theme.has-nav-texture: Image {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        source: Theme.nav-texture;
+        image-fit: fill;
+        accessible-role: none;
+    }
 
-            CaptionButton {
-                x: parent.width - 48px;
-                kind: 2;
-                text: root.close-text;
-                clicked => { root.dismiss(); }
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 38px;
+        background: transparent;
+        WindowMoveArea {
+            x: 6px;
+            width: parent.width - 52px;
+            Text {
+                x: 10px;
+                text: root.window-title;
+                color: Theme.nav-ink;
+                font-weight: 600;
+                vertical-alignment: center;
             }
+        }
+
+        CaptionButton {
+            x: parent.width - 46px;
+            kind: 2;
+            text: root.close-text;
+            clicked => { root.dismiss(); }
+        }
+    }
+
+    Rectangle {
+        x: 8px;
+        y: 38px;
+        width: max(0px, parent.width - 16px);
+        height: max(0px, parent.height - 46px);
+        border-radius: 10px;
+        border-width: Theme.card-border-width;
+        border-color: Theme.canvas-frame-border;
+        background: Theme.canvas-fill;
+        clip: true;
+
+        if Theme.has-canvas-texture: Image {
+            x: 1px;
+            y: 1px;
+            width: max(0px, parent.width - 2px);
+            height: max(0px, parent.height - 2px);
+            source: Theme.canvas-texture;
+            image-fit: fill;
+            accessible-role: none;
         }
 
         VerticalLayout {
             padding: 20px;
             spacing: 12px;
             SectionTitle {
-                text: "PerformanceHub";
+                text: "GLPH";
             }
 
             Text {

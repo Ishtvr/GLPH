@@ -1,6 +1,6 @@
 //! Declarative presentation of typed preset features. No register/API knowledge.
 use crate::i18n::{t, tf};
-use omen_core::{
+use glph_core::{
     device_defaults::DeviceDefaultsRecord,
     features::{Feature as F, Unit, ValueKind},
     profiles::{Choice as C, Value},
@@ -117,13 +117,17 @@ pub fn slider_watts_with_gpu_max(
     gpu_tgp_max_w: u32,
 ) -> Option<(i64, i64)> {
     let gpu_max = i64::from(gpu_tgp_max_w.clamp(
-        omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
-        omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
+        glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
+        glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
     ));
     match feature {
         F::GpuDynamicBoostLimitMw => Some((
-            i64::from(omen_core::profiles::GPU_DIRECT_TGP_MIN_W),
+            i64::from(glph_core::profiles::GPU_DIRECT_TGP_MIN_W),
             gpu_max,
+        )),
+        F::GpuMaxClockMhz => Some((
+            glph_core::profiles::GPU_MAX_CLOCK_MIN_MHZ,
+            glph_core::profiles::GPU_MAX_CLOCK_MAX_MHZ,
         )),
         F::CpuPptLimitMw => Some((15, 160)),
         F::CpuSlowPptLimitMw => Some((15, 80)),
@@ -131,8 +135,8 @@ pub fn slider_watts_with_gpu_max(
         F::CpuTemperatureLimitC => Some((60, 100)),
         F::GpuTemperatureLimitC => Some((65, 87)),
         F::CpuSkinTemperatureLimitC => Some((
-            i64::from(omen_core::fan::IR_LIMIT_MIN_C),
-            i64::from(omen_core::fan::IR_LIMIT_MAX_C),
+            i64::from(glph_core::fan::IR_LIMIT_MIN_C),
+            i64::from(glph_core::fan::IR_LIMIT_MAX_C),
         )),
         _ => None,
     }
@@ -142,7 +146,7 @@ pub fn slider_watts(feature: F, dynamic_boost: bool) -> Option<(i64, i64)> {
     slider_watts_with_gpu_max(
         feature,
         dynamic_boost,
-        omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W,
+        glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W,
     )
 }
 pub fn retired(feature: F) -> bool {
@@ -155,10 +159,10 @@ pub fn retired(feature: F) -> bool {
 /// Present the same Dynamic Boost spelling/precedence that Apply resolves.
 /// Saving still uses the existing alias-aware optimistic merge in core.
 pub fn display_value(
-    profile: &omen_core::profiles::PerformanceProfile,
+    profile: &glph_core::profiles::PerformanceProfile,
     feature: F,
 ) -> Option<&Value> {
-    omen_core::preset::display_value(
+    glph_core::preset::display_value(
         profile,
         if feature == F::GpuUnleashed {
             F::GpuDynamicBoost
@@ -169,8 +173,9 @@ pub fn display_value(
 }
 pub fn fields() -> Vec<Field> {
     let rows = [
-        // Section 1: GPU (direct fixed TGP + clocks + V/F curve — 0 CPU coupling)
+        // Section 1: GPU (direct fixed TGP + public NVML clock cap + offsets + V/F curve — 0 CPU coupling)
         (F::GpuDynamicBoostLimitMw, 0, 115000),
+        (F::GpuMaxClockMhz, 0, 2100),
         (F::GpuCoreOffsetMhz, 0, 0),
         (F::GpuMemoryOffsetMhz, 0, 0),
         (F::GpuVfCurve, 0, 0),
@@ -308,7 +313,7 @@ impl Field {
                 Value::Choice(choices[idx])
             }
             ValueKind::Boolean => Value::Boolean(self.seed != 0),
-            ValueKind::PerCore => Value::PerCore(omen_core::device_defaults::zero_per_core(16)),
+            ValueKind::PerCore => Value::PerCore(glph_core::device_defaults::zero_per_core(16)),
             ValueKind::VfCurve => Value::VfCurve(vec![]),
             _ => Value::Integer(self.seed),
         }
@@ -424,7 +429,7 @@ mod tests {
     use super::*;
     #[test]
     fn dynamic_boost_display_and_saved_edit_follow_apply_precedence() {
-        use omen_core::profiles::{DeviceBinding, PerformanceProfile, Setting};
+        use glph_core::profiles::{DeviceBinding, PerformanceProfile, Setting};
         let mut profile = PerformanceProfile {
             schema: 1,
             id: "alias-test".into(),
@@ -455,7 +460,7 @@ mod tests {
             display_value(&profile, F::GpuUnleashed),
             Some(&Value::Boolean(true))
         );
-        let edited = omen_core::preset::merge(
+        let edited = glph_core::preset::merge(
             &profile,
             &profile,
             "Alias",
@@ -482,9 +487,10 @@ mod tests {
                 .find(|f| f.feature == feature)
                 .map(|f| f.group)
         };
-        // GPU section holds direct GPU TGP + clocks + curve only (no CPU sliders!)
+        // GPU section holds direct GPU TGP + max clock cap + clocks + curve only (no CPU sliders!)
         for feature in [
             F::GpuDynamicBoostLimitMw,
+            F::GpuMaxClockMhz,
             F::GpuCoreOffsetMhz,
             F::GpuMemoryOffsetMhz,
             F::GpuVfCurve,
@@ -644,7 +650,7 @@ mod tests {
             initial(F::CpuCurveOptimizerPerCore),
             Value::PerCore(ref cores) if cores.len() == 16 && cores.iter().all(|c| c.steps == 0)
         ));
-        let rec = omen_core::device_defaults::resolve_defaults("8E35", "F.13", None);
+        let rec = glph_core::device_defaults::resolve_defaults("8E35", "F.13", None);
         let summary = format_device_defaults_summary(&rec);
         assert!(summary.contains("108 A") && summary.contains("160 A"));
         let tdc_field = fields.iter().find(|f| f.feature == F::CpuTdcMa).unwrap();

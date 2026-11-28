@@ -10,21 +10,21 @@
 //! child processes.
 //!
 //! Run on the reference device only:
-//! `cargo test -p omen-platform --test nvml_sessions -- --ignored --nocapture`
+//! `cargo test -p glph-platform --test nvml_sessions -- --ignored --nocapture`
 #![cfg(windows)]
 
 #[test]
 #[ignore = "needs the NVIDIA driver on the reference device"]
 fn a_retained_session_is_read_after_other_sessions_closed() {
-    let retained = omen_platform::GpuLimitProbe::new().expect("NVML session");
+    let retained = glph_platform::GpuLimitProbe::new().expect("NVML session");
     println!("retained first read: {:?}", retained.read());
     for round in 0..20 {
         // Same thread first: open and close a full control session.
-        let report = omen_platform::read_gpu_controls(None).map(|r| r.identity.name);
+        let report = glph_platform::read_gpu_controls(None).map(|r| r.identity.name);
         println!("round {round}: other session {report:?}");
         // Then from another thread, as the preset editor worker does.
         std::thread::spawn(|| {
-            let _ = omen_platform::read_gpu_controls(None);
+            let _ = glph_platform::read_gpu_controls(None);
         })
         .join()
         .unwrap();

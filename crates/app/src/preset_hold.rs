@@ -2,23 +2,29 @@
 //! applied preset's CPU limits and HP GPU flags are compared with the live
 //! values; drifted ones are written again and logged to `preset-hold.log`.
 //! The HP mode of a Dynamic Boost preset has no GET; its loss is seen as a
-//! locked GPU limit under load. Policy and back-off live in `omen_core::hold`.
-use omen_core::{
+//! locked GPU limit under load. Policy and back-off live in `glph_core::hold`.
+use glph_core::{
     features::Feature,
     hold::{self, Action, Hold},
     hp_mode::{self, HpMode},
     profiles::{Setting, Value},
 };
-use omen_platform::{ControlLease, Controller, profile_store::ProfileStore};
+use glph_platform::{ControlLease, Controller, profile_store::ProfileStore};
 use std::{
     sync::{Condvar, Mutex},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Consecutive locked readings before the mode counts as lost, so one
 /// transient sample during a load change does not rewrite it.
 const LOCKED_CHECKS: u8 = 2;
+/// Curve Optimizer verification reads 16 SMU core margins sequentially. Only
+/// run it after a trigger/nudge/new revision or at most every 120 seconds.
+const CO_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+/// Maximum age for reusing the persistent GPU telemetry worker's cached limit
+/// reading inside `keep_mode()` before falling back to a one-shot child probe.
+const CACHED_GPU_LIMIT_MAX_AGE: Duration = Duration::from_secs(10);
 static NOTICE: Mutex<Option<String>> = Mutex::new(None);
 pub fn take_notice() -> Option<String> {
     NOTICE.lock().ok()?.take()
@@ -80,7 +86,7 @@ impl Applied {
         // from an earlier boot is not re-applied piecemeal without sign-in
         // approval. Records without a boot time predate this rule.
         let boot = result["boot_unix_s"].as_u64()?;
-        if boot.abs_diff(omen_platform::boot_unix_s()) > 120 {
+        if boot.abs_diff(glph_platform::boot_unix_s()) > 120 {
             return None;
         }
         let applied = Self {
@@ -106,7 +112,9 @@ impl Applied {
         if !self.matches_journal(&id, &digest, &requested) {
             return Ok(false);
         }
-        let result = store.control_result()?;
+        let Some(result) = store.last_apply_result()? else {
+            return Ok(false);
+        };
         Ok(match result["operation"].as_str() {
             Some("apply") => Self::from_result(&result).as_ref() == Some(self),
             Some("mode" | "restore") => false,
@@ -127,19 +135,29 @@ struct Release {
 /// Runs for the lifetime of the dashboard process; never blocks the UI.
 pub fn spawn() {
     thread::spawn(|| {
+        crate::runtime_priority::configure_background_thread();
         let mut hold = Hold::default();
         let mut controller = None;
         let mut active = None;
         let mut release = Release::default();
+        let mut last_co_check: Option<Instant> = None;
         let origin = Instant::now();
         let mut pace = hold::Pace::default();
         pace.trigger(origin.elapsed());
         let mut next = origin + hold::FAST_INTERVAL;
         loop {
-            if wait_until(next) {
+            let nudged = wait_until(next);
+            if nudged {
                 pace.trigger(origin.elapsed());
             }
-            match tick(&mut hold, &mut controller, &mut active, &mut release) {
+            match tick(
+                &mut hold,
+                &mut controller,
+                &mut active,
+                &mut release,
+                &mut last_co_check,
+                nudged,
+            ) {
                 Ok(outcome) => {
                     if outcome.trigger {
                         pace.trigger(origin.elapsed());
@@ -153,13 +171,40 @@ pub fn spawn() {
             }
             let mut interval = pace.interval(origin.elapsed());
             if interval == hold::SLOW_INTERVAL
-                && omen_platform::power_status().ac_connected == Some(false)
+                && glph_platform::power_status().ac_connected == Some(false)
             {
                 interval = hold::BATTERY_INTERVAL;
             }
             next = Instant::now() + interval;
         }
     });
+}
+
+fn is_hp_gpu_feature(feature: Feature) -> bool {
+    matches!(
+        feature,
+        Feature::GpuCustomTgp
+            | Feature::GpuDynamicBoost
+            | Feature::GpuUnleashed
+            | Feature::GpuTemperatureLimitC
+    )
+}
+
+fn is_co_feature(feature: Feature) -> bool {
+    matches!(
+        feature,
+        Feature::CpuCurveOptimizerAllCore | Feature::CpuCurveOptimizerPerCore
+    )
+}
+
+fn hp_gpu_drift(status: &glph_core::hp::GpuPowerStatus, setting: &Setting) -> Option<Value> {
+    let live = match setting.feature {
+        Feature::GpuCustomTgp => Value::Boolean(status.custom_tgp_enabled),
+        Feature::GpuDynamicBoost | Feature::GpuUnleashed => Value::Boolean(status.ppab_enabled),
+        Feature::GpuTemperatureLimitC => Value::Integer(i64::from(status.temperature_threshold_c?)),
+        _ => return None,
+    };
+    (live != setting.value).then_some(live)
 }
 
 /// `active` is the digest of the preset the user applied last. A later mode
@@ -169,17 +214,20 @@ fn tick(
     controller: &mut Option<Controller>,
     active: &mut Option<Applied>,
     release: &mut Release,
+    last_co_check: &mut Option<Instant>,
+    nudged: bool,
 ) -> Result<Outcome, String> {
     let store = ProfileStore::user_data()?;
-    let stop = |hold: &mut Hold, release: &mut Release| {
+    let stop = |hold: &mut Hold, release: &mut Release, last_co: &mut Option<Instant>| {
         hold.clear();
         *release = Release::default();
+        *last_co = None;
     };
     if !store.app_settings().is_ok_and(|s| s.hold_preset) {
-        stop(hold, release);
+        stop(hold, release, last_co_check);
         return Ok(Outcome::default());
     }
-    if let Ok(result) = store.control_result() {
+    if let Ok(Some(result)) = store.last_apply_result() {
         match result["operation"].as_str() {
             Some("apply") => *active = Applied::from_result(&result),
             Some("mode" | "restore") => *active = None,
@@ -187,7 +235,7 @@ fn tick(
         }
     }
     let Some(applied) = active.as_ref() else {
-        stop(hold, release);
+        stop(hold, release, last_co_check);
         return Ok(Outcome::default());
     };
     // Never during a transaction or a pending recovery.
@@ -195,25 +243,30 @@ fn tick(
         return Ok(Outcome::default());
     }
     let Some((id, applied_digest, settings)) = store.applied_settings()? else {
-        stop(hold, release);
+        stop(hold, release, last_co_check);
         return Ok(Outcome::default());
     };
     if !applied.matches_journal(&id, &applied_digest, &settings) {
-        stop(hold, release);
+        stop(hold, release, last_co_check);
         return Ok(Outcome::default());
     }
     // Explicit Apply of the same preset is a new attempt, too.
+    let new_revision = hold.track(&format!(
+        "{}:{}",
+        applied.digest,
+        applied.nonce.as_deref().unwrap_or_default()
+    ));
     let mut outcome = Outcome {
-        trigger: hold.track(&format!(
-            "{}:{}",
-            applied.digest,
-            applied.nonce.as_deref().unwrap_or_default()
-        )),
+        trigger: new_revision,
         calm: false,
     };
     // An unavailable NVML must not stop keeping the CPU limits and flags.
-    if keep_mode(hold, release, &store, applied).is_err() {
-        *release = Release::default();
+    match keep_mode(hold, release, &store, applied) {
+        Ok(mode_outcome) => {
+            outcome.trigger |= mode_outcome.trigger;
+            outcome.calm |= mode_outcome.calm;
+        }
+        Err(_) => *release = Release::default(),
     }
     let targets = hold::targets(&applied.settings);
     if targets.is_empty() {
@@ -223,21 +276,44 @@ fn tick(
         Some(controller) => controller,
         None => controller.insert(Controller::new(false, None)?),
     };
+    let check_co_now =
+        nudged || new_revision || last_co_check.is_none_or(|at| at.elapsed() >= CO_CHECK_INTERVAL);
+    let mut co_checked = false;
+
+    // Batch all HP GPU status checks into ONE `0x21` read per tick using the
+    // thread-local cached `HpBios` session instead of 3 separate WMI sessions.
+    let mut cached_hp_gpu: Option<glph_core::hp::GpuPowerStatus> = None;
+
     for target in targets {
-        // A new Apply/Restore may have finished after the initial snapshot.
-        // Re-check the revision and live value while holding the same lease
-        // as the write, so an old preset cannot overwrite a newer one.
+        if is_co_feature(target.feature) {
+            if !check_co_now {
+                continue;
+            }
+            co_checked = true;
+        }
         let Ok(_lease) = ControlLease::acquire_background() else {
             break;
         };
-        if !applied.current(&store)? {
-            break;
-        }
-        let drift = controller.hold_check(&target)?;
+        let drift = if is_hp_gpu_feature(target.feature) {
+            if cached_hp_gpu.is_none() {
+                cached_hp_gpu = Some(glph_platform::read_hp_gpu_status(controller.inventory())?);
+            }
+            hp_gpu_drift(cached_hp_gpu.as_ref().expect("populated above"), &target)
+        } else {
+            controller.hold_check(&target)?
+        };
         match hold.decide(target.feature, drift.is_some()) {
             Action::Rewrite => {
+                // Re-verify revision under the held lease right before writing
+                // so a concurrent Apply/Restore is never overwritten.
+                if !applied.current(&store)? {
+                    break;
+                }
                 outcome.trigger = true;
                 let result = controller.reassert(&target);
+                if is_hp_gpu_feature(target.feature) {
+                    cached_hp_gpu = None;
+                }
                 log(&store, &id, &target, drift.as_ref(), &result);
             }
             Action::GiveUp => {
@@ -259,6 +335,9 @@ fn tick(
             Action::Keep | Action::Ignore => {}
         }
     }
+    if co_checked {
+        *last_co_check = Some(Instant::now());
+    }
     Ok(outcome)
 }
 
@@ -271,31 +350,40 @@ fn keep_mode(
     release: &mut Release,
     store: &ProfileStore,
     applied: &Applied,
-) -> Result<(), String> {
+) -> Result<Outcome, String> {
+    let mut outcome = Outcome::default();
     let id = &applied.id;
     let settings = &applied.settings;
-    let ac = omen_platform::power_status().ac_connected == Some(true);
+    let ac = glph_platform::power_status().ac_connected == Some(true);
     // On battery an NVML probe would wake a sleeping dGPU from D3cold; the
     // mode watch pauses until the charger returns.
     if !ac {
         *release = Release::default();
-        return Ok(());
+        return Ok(outcome);
+    }
+    // Never probe NVML during a PnP restart / foreground GPU transaction.
+    if ControlLease::gpu_pause_active() {
+        return Ok(outcome);
     }
     // The same holds on AC in hybrid mode: a powered-down dGPU has no limit
     // to watch, and the query would wake it.
-    if omen_platform::nvidia_gpu_awake() == Some(false) {
+    if glph_platform::nvidia_gpu_awake() == Some(false) {
         *release = Release::default();
-        return Ok(());
+        return Ok(outcome);
     }
     let mode = match HpMode::of_settings(settings, ac) {
         Some(mode @ (HpMode::Unleashed | HpMode::Performance)) => mode,
         _ => {
             *release = Release::default();
-            return Ok(());
+            return Ok(outcome);
         }
     };
     let (limit_mw, draw_mw): (u32, u32) =
-        crate::read_process::capture(crate::read_process::ReadCommand::GpuLimit)?;
+        if let Some(cached) = crate::telemetry_worker::cached_gpu_limit(CACHED_GPU_LIMIT_MAX_AGE) {
+            cached
+        } else {
+            crate::read_process::capture(crate::read_process::ReadCommand::GpuLimit)?
+        };
     if hp_mode::gpu_release_lost(limit_mw, draw_mw) {
         release.locked = release.locked.saturating_add(1);
     } else {
@@ -314,11 +402,12 @@ fn keep_mode(
     ) {
         Action::Rewrite => {
             let Ok(_lease) = ControlLease::acquire_background() else {
-                return Ok(());
+                return Ok(outcome);
             };
             if !applied.current(store)? {
-                return Ok(());
+                return Ok(outcome);
             }
+            outcome.trigger = true;
             release.locked = 0;
             // The transaction leaves TPP out (no readback); the stored preset
             // has it. Without one, the mode's own budget applies.
@@ -326,7 +415,7 @@ fn keep_mode(
                 .load(id)
                 .ok()
                 .filter(|p| {
-                    omen_platform::profile_store::profile_digest(p)
+                    glph_platform::profile_store::profile_digest(p)
                         .ok()
                         .as_deref()
                         == Some(applied.digest.as_str())
@@ -336,12 +425,12 @@ fn keep_mode(
                     HpMode::Unleashed => hp_mode::SHARED_BUDGET_MAX_W,
                     _ => 0,
                 });
-            let inventory = omen_platform::inventory();
-            let result = omen_platform::write_hp_thermal_mode(&inventory, mode).and_then(|()| {
+            let inventory = glph_platform::inventory();
+            let result = glph_platform::write_hp_thermal_mode(&inventory, mode).and_then(|()| {
                 if tpp == 0 {
                     Ok(())
                 } else {
-                    omen_platform::write_hp_shared_budget(&inventory, tpp)
+                    glph_platform::write_hp_shared_budget(&inventory, tpp)
                 }
             });
             match result {
@@ -349,10 +438,13 @@ fn keep_mode(
                 Err(error) => entry(&format!("failed: {error}")),
             }
         }
-        Action::GiveUp => entry("given up: mode lost again after every rewrite"),
+        Action::GiveUp => {
+            outcome.calm = true;
+            entry("given up: mode lost again after every rewrite");
+        }
         Action::Keep | Action::Ignore => {}
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn unix_now() -> u64 {
@@ -390,19 +482,19 @@ fn log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omen_core::{
+    use glph_core::{
         profiles::DeviceBinding,
         transaction::{Captured, Completion, Journal, PendingTransaction},
     };
 
     fn result(nonce: &str, settings: &[Setting]) -> serde_json::Value {
-        serde_json::json!({"operation":"apply","profile_id":"preset-test","profile_digest":"revision","nonce":nonce,"boot_unix_s":omen_platform::boot_unix_s(),"result":{"Ok":{"verified":settings}}})
+        serde_json::json!({"operation":"apply","profile_id":"preset-test","profile_digest":"revision","nonce":nonce,"boot_unix_s":glph_platform::boot_unix_s(),"result":{"Ok":{"verified":settings}}})
     }
     #[test]
     fn an_apply_from_an_earlier_boot_is_not_held() {
         let mut record = result("a", &[]);
         assert!(Applied::from_result(&record).is_some());
-        record["boot_unix_s"] = serde_json::json!(omen_platform::boot_unix_s() - 3600);
+        record["boot_unix_s"] = serde_json::json!(glph_platform::boot_unix_s() - 3600);
         assert!(Applied::from_result(&record).is_none());
         record.as_object_mut().unwrap().remove("boot_unix_s");
         assert!(Applied::from_result(&record).is_none());
@@ -479,17 +571,17 @@ mod tests {
         assert!(old.current(&store).unwrap());
         let pending_fan = store
             .prepare_fan_policy(
-                omen_platform::profile_store::FanPolicyOwner::Library {
+                glph_platform::profile_store::FanPolicyOwner::Library {
                     id: "fan-test".into(),
                 },
                 "8E35",
                 "F.13",
                 &[
-                    omen_core::profiles::FanPoint {
+                    glph_core::profiles::FanPoint {
                         temperature_c: 30,
                         duty_percent: 30,
                     },
-                    omen_core::profiles::FanPoint {
+                    glph_core::profiles::FanPoint {
                         temperature_c: 90,
                         duty_percent: 100,
                     },

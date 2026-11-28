@@ -1,5 +1,5 @@
 //! Inventory uses the same fixed, bounded child infrastructure as GPU telemetry.
-use omen_core::Inventory;
+use glph_core::Inventory;
 
 pub fn read() -> Inventory {
     try_read().unwrap_or_else(|error| Inventory {

@@ -9,10 +9,19 @@ export component NotificationPopup inherits Rectangle {
     callback dismissed();
     callback details();
     height: min(212px, max(156px, body.preferred-height + 112px));
-    background: Theme.surface;
-    border-width: 1px;
-    border-color: root.failed ? Theme.error : Theme.line;
-    border-radius: 8px;
+    background: Theme.popup-fill;
+    border-width: Theme.card-border-width;
+    border-color: root.failed ? Theme.error : Theme.popup-border;
+    border-radius: 10px;
+    clip: true;
+
+    Rectangle {
+        x: 10px;
+        y: 1px;
+        width: max(0px, parent.width - 20px);
+        height: 1px;
+        background: Theme.surface-top-sheen;
+    }
     VerticalLayout {
         padding: 12px;
         spacing: 8px;
@@ -83,7 +92,7 @@ export component MessageDialog inherits FocusScope {
         return reject;
     }
     Rectangle {
-        background: #00000099;
+        background: Theme.scrim;
         TouchArea {
             scroll-event(e) => { return accept; }
         }
@@ -102,10 +111,19 @@ export component MessageDialog inherits FocusScope {
     Rectangle {
         width: min(560px,parent.width - 40px);
         height: min(parent.height - 40px, max(180px, measure.preferred-height + 148px));
-        background: Theme.surface;
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: Theme.line;
+        background: Theme.popup-fill;
+        border-radius: 10px;
+        border-width: Theme.card-border-width;
+        border-color: Theme.popup-border;
+        clip: true;
+
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 1px;
+            background: Theme.surface-top-sheen;
+        }
         VerticalLayout {
             padding: 20px;
             spacing: 12px;

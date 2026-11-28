@@ -2,7 +2,7 @@
 //! START-only handle to the exact qualified OEM service. No STOP path exists.
 use super::*;
 use crate::windows::guardian::{self, Outcome, ParentProcess, Request, Target};
-use omen_core::{
+use glph_core::{
     guardian::{Observation, ParentState, Trigger},
     ownership::{Journal, Phase, Record},
 };
@@ -17,7 +17,7 @@ pub struct Report {
     recorded_at_unix_seconds: u64,
     start_requested: bool,
     #[serde(default)]
-    cooling_phase: Option<omen_core::cooling_override::Phase>,
+    cooling_phase: Option<glph_core::cooling_override::Phase>,
     #[serde(default)]
     cooling_error: Option<String>,
     result: Result<Outcome, String>,
@@ -110,7 +110,7 @@ pub(super) fn run() -> Result<(), String> {
         .ok_or("Guardian needs a durable cooling checkpoint before readiness")?;
     if duty.owner != request.owner
         || duty.original_service.identity != request.identity
-        || duty.phase != omen_core::cooling_override::Phase::PendingMaximum
+        || duty.phase != glph_core::cooling_override::Phase::PendingMaximum
         || !duty
             .helper
             .binary_sha256

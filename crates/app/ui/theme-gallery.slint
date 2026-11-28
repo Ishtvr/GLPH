@@ -1,19 +1,20 @@
 import { Theme } from "theme.slint";
-export struct PaletteChoice { name: string, canvas: color, ink: color, accent: color }
+export struct PaletteChoice { name: string, canvas: color, nav: color, ink: color, accent: color }
 export component ThemeGallery inherits Rectangle {
     in property <[PaletteChoice]> choices;
     in property <int> selected;
     in property <bool> enabled: true;
     callback changed(int);
-    height: 74px;
+    height: 78px;
     for choice[index] in root.choices: tile := Rectangle {
-        x: index * (root.width + 8px) / max(1,root.choices.length);
-        width: (root.width - (root.choices.length - 1) * 8px) / max(1,root.choices.length);
+        x: index * (root.width + 8px) / max(1, root.choices.length);
+        width: (root.width - (root.choices.length - 1) * 8px) / max(1, root.choices.length);
         height: parent.height;
-        border-radius: 6px;
-        background: Theme.surface;
-        border-width: 1px;
-        border-color: index == root.selected || focus.has-focus ? Theme.accent : Theme.line;
+        border-radius: 8px;
+        clip: true;
+        background: index == root.selected ? Theme.control-hover-fill : Theme.control-fill;
+        border-width: index == root.selected || focus.has-focus ? 1.5px : Theme.card-border-width;
+        border-color: index == root.selected || focus.has-focus ? Theme.accent-border : Theme.control-border;
         accessible-role: button;
         accessible-label: choice.name;
         accessible-enabled: root.enabled;
@@ -21,40 +22,88 @@ export component ThemeGallery inherits Rectangle {
         accessible-checked: index == root.selected;
         accessible-action-default => { if root.enabled { root.changed(index); } }
         forward-focus: focus;
+
+        // Mini two-tone Antigravity-style window preview (outer nav chrome + rounded inset canvas)
         Rectangle {
             x: 6px;
             y: 6px;
             width: parent.width - 12px;
-            height: 36px;
-            border-radius: 4px;
-            background: choice.canvas;
-            Text {
-                x: 8px;
-                text: "Aa";
-                font-size: 16px;
-                color: choice.ink;
-                vertical-alignment: center;
-                accessible-role: none;
+            height: 40px;
+            border-radius: 5px;
+            background: choice.nav;
+            border-width: 1px;
+            border-color: Theme.line.with-alpha(0.5);
+            clip: true;
+
+            // Mini nav rail active pill indicator
+            Rectangle {
+                x: 4px;
+                y: 8px;
+                width: 12px;
+                height: 6px;
+                border-radius: 2px;
+                background: choice.accent.with-alpha(0.35);
+                border-width: 1px;
+                border-color: choice.accent;
+            }
+            Rectangle {
+                x: 4px;
+                y: 18px;
+                width: 10px;
+                height: 3px;
+                border-radius: 1px;
+                background: choice.ink.with-alpha(0.30);
+            }
+            Rectangle {
+                x: 4px;
+                y: 25px;
+                width: 9px;
+                height: 3px;
+                border-radius: 1px;
+                background: choice.ink.with-alpha(0.22);
             }
 
+            // Mini inset rounded canvas
             Rectangle {
-                x: parent.width - 32px;
-                y: 12px;
-                width: 22px;
-                height: 12px;
-                border-radius: 3px;
-                background: choice.accent;
+                x: 20px;
+                y: 5px;
+                width: max(20px, parent.width - 23px);
+                height: parent.height - 8px;
+                border-radius: 4px;
+                background: choice.canvas;
+                border-width: 1px;
+                border-color: choice.ink.with-alpha(0.14);
+
+                Text {
+                    x: 7px;
+                    text: "Aa";
+                    font-size: 14px;
+                    font-weight: 600;
+                    color: choice.ink;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+
+                Rectangle {
+                    x: parent.width - 26px;
+                    y: 10px;
+                    width: 20px;
+                    height: 11px;
+                    border-radius: 3px;
+                    background: choice.accent;
+                }
             }
         }
 
         Text {
-            y: 44px;
+            y: 48px;
             height: 26px;
             text: choice.name;
             color: root.enabled ? Theme.ink : Theme.quiet;
             horizontal-alignment: center;
             vertical-alignment: center;
             font-size: 12px;
+            font-weight: index == root.selected ? 600 : 400;
             accessible-role: none;
         }
 

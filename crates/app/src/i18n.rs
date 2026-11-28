@@ -49,7 +49,7 @@ fn take_language_argument(args: &mut Vec<String>) -> Result<Option<Language>, St
     let language = args
         .get(1)
         .and_then(|code| Language::from_code(code))
-        .ok_or_else(|| omen_core::message::msg("language.invalid", &[]))?;
+        .ok_or_else(|| glph_core::message::msg("language.invalid", &[]))?;
     args.drain(..2);
     Ok(Some(language))
 }
@@ -62,7 +62,7 @@ pub fn configure(args: &mut Vec<String>) -> Result<(), String> {
         .ok()
         .and_then(|code| Language::from_code(&code));
     let stored = if explicit.is_none() && environment.is_none() {
-        omen_platform::profile_store::ProfileStore::user_data()
+        glph_platform::profile_store::ProfileStore::user_data()
             .and_then(|store| store.app_settings())
             .map(|settings| settings.language)
             .unwrap_or_default()
@@ -72,15 +72,15 @@ pub fn configure(args: &mut Vec<String>) -> Result<(), String> {
     let selected = select_language(explicit, environment, stored, detect_system_language());
     LANGUAGE
         .set(selected)
-        .map_err(|_| omen_core::message::msg("language.already_selected", &[]))
+        .map_err(|_| glph_core::message::msg("language.already_selected", &[]))
 }
 fn select_language(
     explicit: Option<Language>,
     environment: Option<Language>,
-    stored: omen_core::app_settings::LanguagePreference,
+    stored: glph_core::app_settings::LanguagePreference,
     system: Language,
 ) -> Language {
-    use omen_core::app_settings::LanguagePreference;
+    use glph_core::app_settings::LanguagePreference;
     explicit.or(environment).unwrap_or(match stored {
         LanguagePreference::German => Language::German,
         LanguagePreference::English => Language::English,
@@ -91,7 +91,7 @@ fn select_language(
 pub fn language_code() -> &'static str {
     LANGUAGE.get_or_init(detect_language).code()
 }
-pub fn preference_code(preference: omen_core::app_settings::LanguagePreference) -> &'static str {
+pub fn preference_code(preference: glph_core::app_settings::LanguagePreference) -> &'static str {
     select_language(None, None, preference, detect_system_language()).code()
 }
 
@@ -240,7 +240,7 @@ fn error_in(language: Language, detail: &str, depth: usize) -> String {
                 .join("\n");
         }
     }
-    if detail.contains(omen_core::message::OPEN) {
+    if detail.contains(glph_core::message::OPEN) {
         return message_in(language, detail);
     }
     let texts = texts();
@@ -264,7 +264,7 @@ pub fn message(text: &str) -> String {
 }
 
 fn message_in(language: Language, text: &str) -> String {
-    omen_core::message::render(text, |key, args| {
+    glph_core::message::render(text, |key, args| {
         let args = args
             .iter()
             .map(|a| {
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn persisted_language_follows_explicit_environment_and_system_precedence() {
-        use omen_core::app_settings::LanguagePreference as P;
+        use glph_core::app_settings::LanguagePreference as P;
         assert_eq!(
             select_language(
                 Some(Language::English),
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn markers_are_translated_with_nested_keys() {
-        let marker = omen_core::message::msg("preset.err.changed_elsewhere", &[&"@field.CpuTdcMa"]);
+        let marker = glph_core::message::msg("preset.err.changed_elsewhere", &[&"@field.CpuTdcMa"]);
         assert_eq!(
             message(&format!("x {marker}")),
             format!(
@@ -571,9 +571,9 @@ mod tests {
     fn localized_display_numbers_keep_exact_profile_units_in_both_languages() {
         for language in [Language::German, Language::English] {
             for value in [90_000, 90_125, -50_125] {
-                let invariant = omen_core::preset::format_number(value, 1000);
+                let invariant = glph_core::preset::format_number(value, 1000);
                 let shown = language.number(&invariant);
-                assert_eq!(omen_core::preset::parse_number(&shown, 1000), Ok(value));
+                assert_eq!(glph_core::preset::parse_number(&shown, 1000), Ok(value));
             }
         }
         assert_eq!(Language::German.number("12.5"), "12,5");
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn json_preflight_and_rollback_messages_render_in_the_requested_language() {
         let reason =
-            omen_core::message::msg("transaction.err.bounds", &[&115_001, &5_000, &115_000]);
+            glph_core::message::msg("transaction.err.bounds", &[&115_001, &5_000, &115_000]);
         let plan =
             serde_json::json!({"blockers":[{"feature":"gpu_power_limit_mw","reason":reason}]})
                 .to_string();
@@ -596,7 +596,7 @@ mod tests {
             assert!(
                 shown.contains("115001") && !shown.contains("blockers") && !shown.contains('⟦')
             );
-            let failed = serde_json::json!({"Err":{"error":reason,"rollback_errors":[omen_core::message::msg("transaction.err.recovery_incomplete", &[])]}}).to_string();
+            let failed = serde_json::json!({"Err":{"error":reason,"rollback_errors":[glph_core::message::msg("transaction.err.recovery_incomplete", &[])]}}).to_string();
             let shown = error_in(language, &failed, 0);
             assert!(shown.contains(lookup(language, "transaction.err.recovery_incomplete")));
         }
@@ -630,10 +630,11 @@ mod tests {
                 let after = code[offset + 5..].trim_start();
                 if let Some(literal) = after.strip_prefix('"').and_then(|s| s.split('"').next())
                     && !literal.is_empty()
+                        && !literal.starts_with("GLPH")
                         && !literal.starts_with("OmenHubPP")
                         && !literal.starts_with("PerformanceHub")
                         // The i glyph is the language-neutral information icon.
-                        && !["PerformanceHub", "Omen Hub++", "OmenHubPlusPlusWindow", "Segoe UI", "runas", "TaskbarCreated", "i"].contains(&literal)
+                        && !["GLPH", "GLPHWindow", "PerformanceHub", "Omen Hub++", "OmenHubPlusPlusWindow", "Segoe UI", "runas", "TaskbarCreated", "i"].contains(&literal)
                 {
                     unexpected.push(format!("{}: {literal}", path.display()));
                 }

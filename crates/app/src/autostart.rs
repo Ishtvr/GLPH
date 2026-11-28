@@ -11,7 +11,7 @@ use windows_sys::Win32::{
 };
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const VALUE: &str = "PerformanceHub";
+const VALUE: &str = "GLPH";
 
 /// Command line the logon task runs.
 pub fn command(executable: &Path, start_in_tray: bool) -> String {
@@ -69,7 +69,7 @@ fn remove_legacy_entry() -> Result<(), String> {
 
 /// The current start command: the logon task, else an older Run entry.
 pub fn entry() -> Result<Option<String>, String> {
-    if let Some((program, arguments)) = omen_platform::tray_task_command()? {
+    if let Some((program, arguments)) = glph_platform::tray_task_command()? {
         return Ok(Some(command(
             Path::new(&program),
             arguments.trim() == "--tray",
@@ -82,12 +82,12 @@ pub fn entry() -> Result<Option<String>, String> {
 /// older Run entry is removed.
 pub fn set_entry(entry: Option<&str>) -> Result<(), String> {
     if !crate::single_instance::elevated() {
-        return Err(omen_core::message::msg("settings.admin_required", &[]));
+        return Err(glph_core::message::msg("settings.admin_required", &[]));
     }
     let task = entry
         .map(|entry| split(entry).ok_or("Unsupported start command"))
         .transpose()?;
-    omen_platform::set_tray_task(task.map(|(program, arguments)| (Path::new(program), arguments)))?;
+    glph_platform::set_tray_task(task.map(|(program, arguments)| (Path::new(program), arguments)))?;
     remove_legacy_entry()
 }
 
@@ -100,14 +100,14 @@ pub fn migrate() {
         return;
     }
     if let Ok(Some(entry)) = legacy_entry()
-        && matches!(omen_platform::tray_task_command(), Ok(None))
+        && matches!(glph_platform::tray_task_command(), Ok(None))
     {
         let _ = set_entry(Some(&entry));
     }
-    if matches!(omen_platform::tray_task_restarts(), Ok(Some(false)))
-        && let Ok(Some((program, arguments))) = omen_platform::tray_task_command()
+    if matches!(glph_platform::tray_task_restarts(), Ok(Some(false)))
+        && let Ok(Some((program, arguments))) = glph_platform::tray_task_command()
     {
-        let _ = omen_platform::set_tray_task(Some((Path::new(&program), arguments.trim())));
+        let _ = glph_platform::set_tray_task(Some((Path::new(&program), arguments.trim())));
     }
 }
 
@@ -118,28 +118,22 @@ mod tests {
     #[test]
     fn start_command_quotes_the_path_and_starts_in_tray() {
         assert_eq!(
-            command(
-                Path::new(r"C:\Program Files\PerformanceHub\performance-hub.exe"),
-                true
-            ),
-            r#""C:\Program Files\PerformanceHub\performance-hub.exe" --tray"#
+            command(Path::new(r"C:\Program Files\GLPH\glph.exe"), true),
+            r#""C:\Program Files\GLPH\glph.exe" --tray"#
         );
         assert_eq!(
-            command(Path::new(r"D:\performance-hub.exe"), false),
-            r#""D:\performance-hub.exe""#
+            command(Path::new(r"D:\glph.exe"), false),
+            r#""D:\glph.exe""#
         );
     }
 
     #[test]
     fn start_command_splits_back_into_program_and_arguments() {
         for tray in [true, false] {
-            let line = command(Path::new(r"D:\PerformanceHub\performance-hub.exe"), tray);
+            let line = command(Path::new(r"D:\GLPH\glph.exe"), tray);
             assert_eq!(
                 split(&line),
-                Some((
-                    r"D:\PerformanceHub\performance-hub.exe",
-                    if tray { "--tray" } else { "" }
-                ))
+                Some((r"D:\GLPH\glph.exe", if tray { "--tray" } else { "" }))
             );
         }
         assert_eq!(split(r"D:\unquoted.exe --tray"), None);

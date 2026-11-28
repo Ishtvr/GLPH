@@ -5,18 +5,20 @@ export component CaptionButton inherits Rectangle {
     in property <bool> maximized;
     in property <string> text;
     callback clicked();
-    width: 48px;
-    height: 40px;
-    background: area.has-hover || focus.has-focus ? root.kind == 2 ? #C42B1C : Theme.hover : transparent;
+    width: 46px;
+    height: 38px;
+    background: area.has-hover || focus.has-focus ? (root.kind == 2 ? #C42B1C : Theme.nav-hover) : transparent;
+    border-width: focus.has-focus && root.kind != 2 ? 1px : 0px;
+    border-color: Theme.nav-accent;
     accessible-role: button;
     accessible-label: root.text;
     accessible-action-default => { root.clicked(); }
     forward-focus: focus;
     Image {
-        width: 16px;
-        height: 16px;
+        width: 14px;
+        height: 14px;
         source: root.kind == 0 ? @image-url("icons/minimize.svg") : root.kind == 2 ? @image-url("icons/close.svg") : root.maximized ? @image-url("icons/restore.svg") : @image-url("icons/maximize.svg");
-        colorize: root.kind == 2 && (area.has-hover || focus.has-focus) ? white : Theme.ink;
+        colorize: root.kind == 2 && (area.has-hover || focus.has-focus) ? white : Theme.nav-ink;
         accessible-role: none;
     }
 
@@ -36,11 +38,18 @@ export component NavigationItem inherits Rectangle {
     in property <bool> selected;
     in property <bool> enabled: true;
     callback clicked();
-    height: 44px;
-    background: root.selected || area.has-hover ? Theme.hover : transparent;
-    border-radius: 6px;
-    border-width: focus.has-focus ? 1px : 0px;
-    border-color: Theme.accent;
+    height: 38px;
+    border-radius: 8px;
+    clip: true;
+    background: root.selected ? Theme.nav-selected-fill
+              : area.has-hover ? Theme.nav-hover
+              : transparent;
+    border-width: focus.has-focus ? 1.5px : root.selected ? Theme.card-border-width : 1px;
+    border-color: focus.has-focus ? Theme.nav-accent
+                : root.selected ? Theme.nav-selected-border
+                : area.has-hover ? Theme.nav-line.with-alpha(0.55)
+                : transparent;
+    animate background, border-color { duration: Theme.reduce-motion ? 0ms : 150ms; easing: ease-out; }
     accessible-role: button;
     accessible-label: root.text;
     accessible-enabled: root.enabled;
@@ -48,45 +57,57 @@ export component NavigationItem inherits Rectangle {
     accessible-checked: root.selected;
     accessible-action-default => { if root.enabled { root.clicked(); } }
     forward-focus: focus;
-    Rectangle {
-        x: 0px;
-        y: 12px;
-        width: 2px;
-        height: 20px;
-        border-radius: 1px;
-        background: Theme.accent;
-        visible: root.selected;
+
+    // Subtle inner top specular rim on selected item (Glass / Glossy / Metallic / Neon)
+    if root.selected: Rectangle {
+        x: 8px;
+        y: 1px;
+        width: max(0px, parent.width - 16px);
+        height: 1px;
+        background: Theme.surface-top-sheen;
     }
 
-    Image {
+    if root.kind == 8: Image {
+        x: 10px;
+        y: 8px;
+        width: 22px;
+        height: 22px;
+        source: @image-url("icons/omen.png");
+        opacity: root.selected || area.has-hover ? 1.0 : 0.88;
+        accessible-role: none;
+    }
+
+    if root.kind != 8: Image {
         x: 12px;
-        y: 12px;
-        width: 20px;
-        height: 20px;
+        y: 10px;
+        width: 18px;
+        height: 18px;
         source: root.kind == 0 ? @image-url("icons/overview.svg")
               : root.kind == 1 ? @image-url("icons/fan.svg")
               : root.kind == 2 ? @image-url("icons/keyboard.svg")
               : root.kind == 3 ? @image-url("icons/settings.svg")
               : root.kind == 4 || root.kind == 5 ? @image-url("icons/sensors.svg")
               : @image-url("icons/plug.svg");
-        colorize: root.selected ? Theme.accent : Theme.muted;
+        colorize: root.selected ? Theme.nav-accent : area.has-hover ? Theme.nav-ink : Theme.nav-muted;
         accessible-role: none;
     }
 
     Text {
-        x: 42px;
+        x: 38px;
         width: max(0px, parent.width - 48px);
         height: parent.height;
         text: root.text;
-        color: root.enabled ? Theme.ink : Theme.quiet;
+        color: !root.enabled ? Theme.nav-quiet : (root.selected || area.has-hover) ? Theme.nav-ink : Theme.nav-muted;
         vertical-alignment: center;
         font-size: 13px;
+        font-weight: root.selected ? 600 : 500;
         overflow: elide;
         accessible-role: none;
     }
 
     area := TouchArea {
         enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => { focus.focus(); root.clicked(); }
     }
 

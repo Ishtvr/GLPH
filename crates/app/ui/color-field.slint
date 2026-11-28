@@ -5,20 +5,33 @@ export component ColorField inherits Rectangle {
     in property <color> swatch-color;
     in property <bool> mixed;
     in property <bool> enabled: true;
+    in property <length> control-width: Theme.field-width;
     callback clicked();
     forward-focus: focus;
     height: Theme.control-height;
-    width: Theme.field-width;
+    width: root.control-width;
     horizontal-stretch: 0;
-    background: area.has-hover && root.enabled ? Theme.hover : Theme.control;
+    background: area.has-hover && root.enabled ? Theme.control-hover-fill : Theme.control-fill;
     border-radius: 6px;
-    border-width: 1px;
-    border-color: focus.has-focus ? Theme.accent : Theme.line;
+    clip: true;
+    border-width: focus.has-focus ? 1.5px : Theme.card-border-width;
+    border-color: focus.has-focus ? Theme.accent : Theme.control-border;
+    animate background, border-color { duration: Theme.reduce-motion ? 0ms : 150ms; easing: ease-out; }
     accessible-role: button;
     accessible-label: root.text;
     accessible-value: root.value;
     accessible-enabled: root.enabled;
     accessible-action-default => { if root.enabled { root.clicked(); } }
+
+    Rectangle {
+        visible: root.enabled;
+        x: 6px;
+        y: 1px;
+        width: max(0px, parent.width - 12px);
+        height: 1px;
+        background: Theme.surface-top-sheen;
+    }
+
     Rectangle {
         x: 10px;
         y: 8px;

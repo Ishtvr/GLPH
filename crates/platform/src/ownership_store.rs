@@ -1,6 +1,6 @@
 //! Separate bounded recovery ledger. The Windows caller supplies the protected
 //! installation directory and owns the machine-wide lifetime lease.
-use omen_core::ownership::{Journal, Record};
+use glph_core::ownership::{Journal, Record};
 use sha2::{Digest, Sha256};
 use std::{fs::File, io::Read, path::PathBuf};
 
@@ -86,7 +86,7 @@ impl Journal for OwnershipJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omen_core::ownership::{Identity, Owner, Phase, Snapshot, State, Subject};
+    use glph_core::ownership::{Identity, Owner, Phase, Snapshot, State, Subject};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);

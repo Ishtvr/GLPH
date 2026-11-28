@@ -1,8 +1,8 @@
 //! Application preferences and the "Start with Windows" logon task. No hardware/startup
 //! approval API is reachable through this module.
-use omen_core::appearance::Appearance;
-use omen_core::{app_settings::AppSettings, message::msg};
-use omen_platform::profile_store::ProfileStore;
+use glph_core::appearance::Appearance;
+use glph_core::{app_settings::AppSettings, message::msg};
+use glph_platform::profile_store::ProfileStore;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +58,7 @@ pub fn save(
     gpu_tgp_max_w: u32,
     autostart: bool,
 ) -> Result<Snapshot, String> {
-    commit(
+    let saved = commit(
         &mut Store(ProfileStore::user_data()?),
         baseline,
         options,
@@ -66,10 +66,13 @@ pub fn save(
         gpu_tgp_max_w,
         autostart,
         &std::env::current_exe().map_err(|e| e.to_string())?,
-    )
+    )?;
+    // Propagate telemetry polling interval live without app restart.
+    crate::telemetry_worker::set_live_poll_interval_ms(saved.options.telemetry_poll_ms);
+    Ok(saved)
 }
 pub fn validate_gpu_tgp_max_w(max_w: u32) -> Result<(), String> {
-    use omen_core::profiles::{GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W, GPU_DYNAMIC_BOOST_LIMIT_MIN_W};
+    use glph_core::profiles::{GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W, GPU_DYNAMIC_BOOST_LIMIT_MIN_W};
     if !(GPU_DYNAMIC_BOOST_LIMIT_MIN_W..=GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W).contains(&max_w) {
         return Err(msg(
             "settings.invalid_gpu_tgp_max",
@@ -200,7 +203,7 @@ mod tests {
         let before = Appearance::default();
         store.save_ui_appearance(&before).unwrap();
         let appearance = Appearance {
-            palette: omen_core::appearance::PalettePreset::Vesper,
+            palette: glph_core::appearance::PalettePreset::Vesper,
             ..Default::default()
         };
         // This test owns the unique temp directory; a directory at the file
@@ -253,19 +256,21 @@ mod tests {
         let mut files = Files { store, entry: None };
         let baseline = files.read().unwrap();
         let options = AppSettings {
-            language: omen_core::app_settings::LanguagePreference::English,
+            language: glph_core::app_settings::LanguagePreference::English,
             start_in_tray: true,
             close_to_tray: false,
             battery_preset: Some("mode:quiet".into()),
             hold_preset: true,
+            telemetry_poll_ms: 500,
             ..Default::default()
         };
-        let appearance = omen_core::appearance::Appearance {
-            palette: omen_core::appearance::PalettePreset::Custom,
-            custom: omen_core::appearance::Colors {
+        let appearance = glph_core::appearance::Appearance {
+            palette: glph_core::appearance::PalettePreset::Custom,
+            custom: glph_core::appearance::Colors {
                 background: "#16191E".into(),
                 foreground: "#ECEEF2".into(),
                 accent: "#9CA8FF".into(),
+                ..Default::default()
             },
         };
         commit(
@@ -344,7 +349,7 @@ mod tests {
             run_writes: 0,
         };
         let mut options = baseline.options.clone();
-        options.language = omen_core::app_settings::LanguagePreference::English;
+        options.language = glph_core::app_settings::LanguagePreference::English;
         let saved = commit(
             &mut backend,
             &baseline,
@@ -413,6 +418,36 @@ mod tests {
             .is_err()
         );
         assert!(!backend.state.options.close_to_tray);
+        assert_eq!(backend.run_writes, 0);
+    }
+
+    #[test]
+    fn invalid_telemetry_poll_interval_is_rejected_without_touching_backend() {
+        let baseline = Snapshot {
+            options: Default::default(),
+            appearance: Default::default(),
+            gpu_tgp_max_w: 135,
+            run_entry: None,
+        };
+        let mut backend = Fake {
+            state: baseline.clone(),
+            fail_save: false,
+            run_writes: 0,
+        };
+        let mut invalid = baseline.options.clone();
+        invalid.telemetry_poll_ms = 750;
+        let err = commit(
+            &mut backend,
+            &baseline,
+            &invalid,
+            &baseline.appearance,
+            baseline.gpu_tgp_max_w,
+            false,
+            Path::new("test.exe"),
+        )
+        .unwrap_err();
+        assert!(err.contains("settings.invalid_telemetry_poll"));
+        assert_eq!(backend.state, baseline);
         assert_eq!(backend.run_writes, 0);
     }
 }

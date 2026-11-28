@@ -1,7 +1,7 @@
 //! Optional read-only APERF/MPERF telemetry. Own-thread affinity only; no HWCR
 //! writes, counter enable/reset, requested clocks or CPU tuning entry points.
 use super::{Affinity, Handle, Read, read_cell};
-use omen_core::cpu::{
+use glph_core::cpu::{
     AmdClockCounters, CpuClockSource, CpuEffectiveClocks, CpuLogicalClock, amd_effective_mhz,
 };
 use std::time::{Duration, Instant};
@@ -52,6 +52,10 @@ pub(super) struct ClockReader {
 }
 
 impl ClockReader {
+    pub(super) fn reset(&mut self) {
+        self.baseline = None;
+    }
+
     pub(super) fn sample(&mut self, driver: &Handle) -> Result<Option<CpuEffectiveClocks>, String> {
         let result = self.read(driver);
         if result.is_err() {
@@ -66,13 +70,18 @@ impl ClockReader {
         let count = processor_count()?;
         let sweep_start = Instant::now();
         let mut current = Vec::with_capacity(count as usize);
+        // Pin once and step directly across logical processors 0..count, then
+        // restore the thread's original mask once at the end. This halves
+        // SetThreadAffinityMask transitions per sample to avoid micro-stutters.
+        let mut affinity = Affinity::pin(0)?;
         for logical_processor in 0..count {
-            let affinity = Affinity::pin(logical_processor)?;
+            if logical_processor > 0 {
+                affinity.step_to(logical_processor)?;
+            }
             let reference_cycles = read_cell(driver, Read::ReferenceCycles)?;
             let start = Instant::now();
             let actual_cycles = read_cell(driver, Read::ActualCycles)?;
             let acquisition = start.elapsed();
-            affinity.restore()?;
             if acquisition > Duration::from_millis(10) {
                 return Err("CPU clock counter acquisition exceeded its timing bound".into());
             }
@@ -88,6 +97,7 @@ impl ClockReader {
                 at: start + acquisition / 2,
             });
         }
+        affinity.restore()?;
         if sweep_start.elapsed() > Duration::from_millis(100) {
             return Err("CPU clock acquisition sweep exceeded its timing bound".into());
         }

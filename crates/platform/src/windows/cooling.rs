@@ -1,7 +1,7 @@
 //! Board-bound cooling transport. Fixed GETs and one independent max-fan SET;
 //! no performance-mode, software level, EC, power or voltage setter.
 use super::hp::{HpBios, Read};
-use omen_core::{
+use glph_core::{
     Inventory,
     cooling::{self, FanSpeeds, FanTable, FanTopology, FirmwareIrTemperature, MaxFanState},
     hp::SystemDesignData,
@@ -55,7 +55,7 @@ impl FanControl {
     }
     pub fn report(&self) -> Result<FanReport, String> {
         let (c, b) = self.get(Read::SystemDesign)?;
-        let system_design = omen_core::hp::decode_system_design(c, &b)?;
+        let system_design = glph_core::hp::decode_system_design(c, &b)?;
         let max_fan = self.max_state()?;
         let (c, b) = self.get(Read::FanSpeeds)?;
         let speeds = cooling::decode_speeds(c, &b)?;

@@ -66,6 +66,10 @@ pub struct State {
     /// restart returns volatile firmware values to stock, so a battery
     /// session of an earlier boot is over. `None` in files of older builds.
     pub boot_unix_s: Option<u64>,
+    /// Exact battery preset id applied when entering this DC session, so
+    /// changing battery-preset links while on battery still restores the
+    /// preset that was actually applied.
+    pub applied_battery_preset: Option<String>,
 }
 
 /// Two readings of the same boot differ by clock adjustments only.
@@ -105,9 +109,16 @@ pub fn decide(ac: Option<bool>, battery: Option<&Selection>, state: &State) -> O
                 .ac_selection
                 .clone()
                 .unwrap_or(Selection::Mode(HpMode::Balanced)),
-            restore: match battery {
-                Some(Selection::Preset(id)) if state.switched => Some(id.clone()),
-                _ => None,
+            restore: if state.switched {
+                state
+                    .applied_battery_preset
+                    .clone()
+                    .or_else(|| match battery {
+                        Some(Selection::Preset(id)) => Some(id.clone()),
+                        _ => None,
+                    })
+            } else {
+                None
             },
         }),
         true => None,
@@ -126,6 +137,7 @@ impl State {
         {
             self.switched = false;
             self.manual_override = false;
+            self.applied_battery_preset = None;
         }
         self.boot_unix_s = Some(boot_unix_s);
         self
@@ -134,6 +146,30 @@ impl State {
     pub fn switched_to(&mut self, battery: bool) {
         self.switched = battery;
         self.manual_override = false;
+        if !battery {
+            self.applied_battery_preset = None;
+        }
+    }
+    /// After an automatic switch completed, remembering the exact battery
+    /// preset that was applied so AC return restores it even if links change.
+    pub fn switched_to_switch(&mut self, switch: &Switch) {
+        match switch {
+            Switch::ToBattery(Selection::Preset(id)) => {
+                self.switched = true;
+                self.manual_override = false;
+                self.applied_battery_preset = Some(id.clone());
+            }
+            Switch::ToBattery(Selection::Mode(_)) => {
+                self.switched = true;
+                self.manual_override = false;
+                self.applied_battery_preset = None;
+            }
+            Switch::BackToAc { .. } => {
+                self.switched = false;
+                self.manual_override = false;
+                self.applied_battery_preset = None;
+            }
+        }
     }
     /// After a manual Apply of `selection`; `ac` is the current source.
     pub fn manual(&mut self, selection: &Selection, ac: Option<bool>) {
@@ -146,6 +182,7 @@ impl State {
             self.manual_override = false;
         }
         self.switched = false;
+        self.applied_battery_preset = None;
     }
 }
 
@@ -370,6 +407,7 @@ mod tests {
             switched: true,
             manual_override: true,
             boot_unix_s: Some(1_000_000),
+            applied_battery_preset: Some("preset-battery".into()),
         };
         // Same boot (clock adjusted by a few seconds): nothing changes.
         let same = saved.clone().at_boot(1_000_030);
@@ -443,5 +481,38 @@ mod tests {
         let mut state = State::default();
         state.manual(&gaming(), Some(false));
         assert!(!state.manual_override);
+    }
+
+    #[test]
+    fn changing_battery_link_on_dc_still_restores_the_originally_applied_preset() {
+        let mut state = State {
+            ac_selection: Some(gaming()),
+            ..State::default()
+        };
+        let to_dc = Switch::ToBattery(Selection::Preset("preset-old-dc".into()));
+        state.switched_to_switch(&to_dc);
+        assert_eq!(
+            state.applied_battery_preset.as_deref(),
+            Some("preset-old-dc")
+        );
+        // User changes the configured battery preset to something else (or off) while on DC.
+        assert_eq!(
+            decide(Some(true), None, &state),
+            Some(Switch::BackToAc {
+                selection: gaming(),
+                restore: Some("preset-old-dc".into()),
+            })
+        );
+        assert_eq!(
+            decide(
+                Some(true),
+                Some(&Selection::Preset("preset-new-dc".into())),
+                &state
+            ),
+            Some(Switch::BackToAc {
+                selection: gaming(),
+                restore: Some("preset-old-dc".into()),
+            })
+        );
     }
 }

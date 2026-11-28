@@ -1,5 +1,5 @@
 [package]
-name = "omen-platform"
+name = "glph-platform"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ path = "tests/guardian_process.rs"
 harness = false
 
 [dependencies]
-omen-core.workspace = true
+glph-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

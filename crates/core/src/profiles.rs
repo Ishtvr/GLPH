@@ -14,6 +14,10 @@ pub const GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W: u32 = 135;
 pub const GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W: u32 = 175;
 /// Alias for the default tested ceiling.
 pub const GPU_DYNAMIC_BOOST_LIMIT_MAX_W: u32 = GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W;
+/// Minimum allowed public NVML GPU max clock cap in MHz.
+pub const GPU_MAX_CLOCK_MIN_MHZ: i64 = 300;
+/// Maximum allowed public NVML GPU max clock cap in MHz.
+pub const GPU_MAX_CLOCK_MAX_MHZ: i64 = 3500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -185,6 +189,14 @@ impl Setting {
                 }
                 if descriptor.unit == Unit::Percent && !(0..=100).contains(value) {
                     return Err(crate::message::msg("profile.err.percentage", &[]));
+                }
+                if self.feature == Feature::GpuMaxClockMhz
+                    && !(GPU_MAX_CLOCK_MIN_MHZ..=GPU_MAX_CLOCK_MAX_MHZ).contains(value)
+                {
+                    return Err(crate::message::msg(
+                        "transaction.err.bounds",
+                        &[value, &GPU_MAX_CLOCK_MIN_MHZ, &GPU_MAX_CLOCK_MAX_MHZ],
+                    ));
                 }
             }
             Value::Choice(value) => {
@@ -412,14 +424,12 @@ impl PerformanceProfile {
     pub fn effective(&self) -> PerformanceProfile {
         let mut profile = self.clone();
         let find = |feature| self.settings.iter().find(|s| s.feature == feature);
-        // The shared budget (TPP) and flashless GPU Dynamic Boost TGP ceiling
-        // are applied outside the direct transaction. The HP mode is no longer
-        // a preset field (30 October 2026); legacy entries are discarded.
-        let mut overridden = vec![
-            Feature::OmenPerformanceMode,
-            Feature::HpSharedPowerMw,
-            Feature::GpuDynamicBoostLimitMw,
-        ];
+        // The shared budget (TPP) is applied outside the direct transaction.
+        // The HP mode is no longer a preset field (30 October 2026); legacy
+        // entries are discarded. Direct GPU TGP (`GpuDynamicBoostLimitMw`)
+        // stays in `effective()` so TGP-only and TGP+Fan presets plan, apply
+        // and verify cleanly without hitting `empty_profile`.
+        let mut overridden = vec![Feature::OmenPerformanceMode, Feature::HpSharedPowerMw];
         if find(Feature::GpuVfCurve).is_some() {
             overridden.push(Feature::GpuCoreOffsetMhz);
         }
@@ -447,12 +457,18 @@ impl PerformanceProfile {
         }
         // Keep CPU Slow <= Fast physical invariant regardless of GPU settings:
         // GPU flags never alter, disable, or hide CPU Fast/Slow limits.
+        // Compare against the mode's expected PL1 (e.g. 80 W Unleashed, 60 W
+        // Performance, 55 W Balanced) so setting Fast PPT below the active mode's
+        // default Slow PPT never leaves Slow > Fast.
         if let Some(Setting {
             value: Value::Integer(fast_mw),
             ..
         }) = find(Feature::CpuPptLimitMw)
             && (15_000..=160_000).contains(fast_mw)
         {
+            let expected_default_slow_mw =
+                crate::hp_mode::HpMode::of_settings(&self.settings, true)
+                    .map_or(55_000, |mode| mode.default_pl1_mw());
             if let Some(slow) = profile
                 .settings
                 .iter_mut()
@@ -463,7 +479,7 @@ impl PerformanceProfile {
                 {
                     slow.value = Value::Integer(*fast_mw);
                 }
-            } else if *fast_mw < 55_000 {
+            } else if *fast_mw < expected_default_slow_mw {
                 profile.settings.push(Setting {
                     feature: Feature::CpuSlowPptLimitMw,
                     value: Value::Integer(*fast_mw),
@@ -798,5 +814,70 @@ mod tests {
             Unit::Millivolt
         );
         assert_ne!(Feature::GpuCoreOffsetMhz, Feature::GpuVoltageOffsetMv);
+    }
+
+    #[test]
+    fn gpu_max_clock_and_pure_tgp_and_mode_aware_slow_ppt_validate() {
+        for good in [300, 1800, 2100, 3500] {
+            assert!(
+                Setting {
+                    feature: Feature::GpuMaxClockMhz,
+                    value: Value::Integer(good),
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for bad in [-1, 0, 299, 3501] {
+            assert!(
+                Setting {
+                    feature: Feature::GpuMaxClockMhz,
+                    value: Value::Integer(bad),
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let pure_tgp = PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "tgp-only".into(),
+            name: "TGP Only".into(),
+            binding: DeviceBinding {
+                manufacturer: "HP".into(),
+                board: "8E35".into(),
+                bios: "F.13".into(),
+                cpu_names: vec![],
+                nvidia_uuid: Some("GPU-test".into()),
+                nvidia_driver: Some("621.14".into()),
+                nvidia_vbios: Some("98.06".into()),
+            },
+            settings: vec![Setting {
+                feature: Feature::GpuDynamicBoostLimitMw,
+                value: Value::Integer(125_000),
+            }],
+        };
+        assert!(pure_tgp.validate_intent().is_ok());
+        assert_eq!(pure_tgp.effective().settings.len(), 1);
+        assert_eq!(
+            pure_tgp.effective().settings[0].feature,
+            Feature::GpuDynamicBoostLimitMw
+        );
+
+        let unleashed_fast_65 = PerformanceProfile {
+            settings: vec![
+                Setting {
+                    feature: Feature::GpuDynamicBoost,
+                    value: Value::Boolean(true),
+                },
+                Setting {
+                    feature: Feature::CpuPptLimitMw,
+                    value: Value::Integer(65_000),
+                },
+            ],
+            ..pure_tgp
+        };
+        assert!(unleashed_fast_65.effective().settings.iter().any(|s| {
+            s.feature == Feature::CpuSlowPptLimitMw && s.value == Value::Integer(65_000)
+        }));
     }
 }

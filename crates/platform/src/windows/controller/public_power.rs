@@ -1,7 +1,7 @@
 //! Public GPU wattage adapter. Original values and driver limits are durable;
 //! no private NVAPI layout or guessed notebook TGP command is used.
 use super::*;
-use omen_core::gpu_power::PowerLimitState;
+use glph_core::gpu_power::PowerLimitState;
 
 impl Controller {
     pub(super) fn public_power_capability(&self) -> Capability {

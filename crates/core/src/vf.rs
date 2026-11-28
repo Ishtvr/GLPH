@@ -95,6 +95,35 @@ impl VfState {
         .validate()?;
         Ok(value)
     }
+    /// Monotonic factory base frequency (kHz) per node with programmed deltas
+    /// removed and clamped low anchors lowered to the next higher anchor's
+    /// frequency. Shared by `factory()`, `target_deltas()`, and curve limits so
+    /// resetting to the factory curve always yields zero deltas and never trips
+    /// `vf.err.bounds`.
+    pub fn base_frequencies_khz(&self) -> Result<Vec<u32>, String> {
+        self.validate()?;
+        let mut base: Vec<u32> = self
+            .nodes
+            .iter()
+            .map(|node| {
+                let raw = i64::from(node.frequency_khz) - i64::from(node.delta_khz);
+                if raw <= 0 && node.delta_khz > 0 {
+                    Ok(1_000)
+                } else {
+                    u32::try_from(raw)
+                        .ok()
+                        .filter(|&v| v > 0)
+                        .ok_or_else(|| crate::message::msg("vf.err.frequency", &[]))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        let mut ceiling = u32::MAX;
+        for freq in base.iter_mut().rev() {
+            *freq = (*freq).min(ceiling);
+            ceiling = *freq;
+        }
+        Ok(base)
+    }
     pub fn target_deltas(&self, target: &[VfPoint]) -> Result<Vec<(u16, i32)>, String> {
         self.validate()?;
         Setting {
@@ -105,16 +134,16 @@ impl VfState {
         if target.len() != self.nodes.len() {
             return Err(crate::message::msg("vf.err.complete_grid", &[]));
         }
+        let bases = self.base_frequencies_khz()?;
         self.nodes
             .iter()
+            .zip(bases)
             .zip(target)
-            .map(|(original, wanted)| {
+            .map(|((original, base_khz), wanted)| {
                 if u64::from(wanted.voltage_mv) * 1000 != u64::from(original.voltage_uv) {
                     return Err(crate::message::msg("vf.err.anchors", &[]));
                 }
-                let delta = i64::from(wanted.frequency_mhz) * 1000
-                    - i64::from(original.frequency_khz)
-                    + i64::from(original.delta_khz);
+                let delta = i64::from(wanted.frequency_mhz) * 1000 - i64::from(base_khz);
                 let delta = i32::try_from(delta)
                     .map_err(|_| crate::message::msg("vf.err.delta_representation", &[]))?;
                 if !(self.minimum_delta_khz..=self.maximum_delta_khz).contains(&delta) {
@@ -132,17 +161,11 @@ impl VfState {
     /// then 386 MHz). Such points are lowered to the next higher anchor's
     /// frequency, which keeps the curve non-decreasing as editors require.
     pub fn factory(&self) -> Result<Self, String> {
+        let bases = self.base_frequencies_khz()?;
         let mut state = self.clone();
-        for node in &mut state.nodes {
-            node.frequency_khz =
-                u32::try_from(i64::from(node.frequency_khz) - i64::from(node.delta_khz))
-                    .map_err(|_| crate::message::msg("vf.err.frequency", &[]))?;
+        for (node, base_khz) in state.nodes.iter_mut().zip(bases) {
+            node.frequency_khz = base_khz;
             node.delta_khz = 0;
-        }
-        let mut ceiling = u32::MAX;
-        for node in state.nodes.iter_mut().rev() {
-            node.frequency_khz = node.frequency_khz.min(ceiling);
-            ceiling = node.frequency_khz;
         }
         state.validate()?;
         Ok(state)
@@ -306,7 +329,14 @@ mod tests {
             .map(|p| p.frequency_khz / 1000)
             .collect();
         assert_eq!(mhz, [386, 386, 1400]);
-        assert!(factory.value().is_ok());
+        let Value::VfCurve(factory_points) = factory.value().unwrap() else {
+            panic!()
+        };
+        // Resetting a clamped curve back to factory must yield zero deltas, never vf.err.bounds.
+        assert_eq!(
+            clamped.target_deltas(&factory_points).unwrap(),
+            [(3, 0), (4, 0), (5, 0)]
+        );
     }
     #[test]
     fn incomplete_and_nonrepresentable_states_are_not_rounded() {

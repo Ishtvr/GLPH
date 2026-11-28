@@ -7,10 +7,10 @@ pub(crate) enum Target {
     Preset(String),
     /// Automatic AC/battery switch: a newer manual choice replaces it while
     /// it waits, and a running one finishes before the next starts.
-    Battery(omen_core::battery::Switch),
+    Battery(glph_core::battery::Switch),
 }
 struct State {
-    queue: omen_core::latest_request::Latest<Target>,
+    queue: glph_core::latest_request::Latest<Target>,
     paused: bool,
     stopped: bool,
     /// A target is executing (taken from the queue, not yet finished).
@@ -174,7 +174,7 @@ pub(crate) struct Automatic {
 impl Automatic {
     /// alse when manual work is waiting, running or the queue is paused
     /// (Save/recovery); the caller checks again later.
-    pub fn submit(&self, switch: omen_core::battery::Switch) -> bool {
+    pub fn submit(&self, switch: glph_core::battery::Switch) -> bool {
         let (lock, cv) = &*self.state;
         let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
         if s.stopped || s.paused || s.running || s.queue.pending() {
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn an_automatic_battery_switch_never_replaces_manual_work() {
-        use omen_core::battery::{Selection, Switch};
+        use glph_core::battery::{Selection, Switch};
         let (handle, _results) = Handle::new();
         let automatic = handle.automatic();
         let switch = Switch::ToBattery(Selection::Mode(HpMode::Quiet));

@@ -1,7 +1,7 @@
 //! Named fan curves are metadata until the explicit request action. Performance
 //! profiles store point snapshots, so library changes cannot alter them silently.
 use super::*;
-use omen_core::{fan_profile::FanPreset, profiles::FanPoint};
+use glph_core::{fan_profile::FanPreset, profiles::FanPoint};
 
 pub(super) struct Snapshot {
     pub presets: Vec<FanPreset>,
@@ -203,6 +203,7 @@ impl Host {
         if let Some(lib) = self.fan_library.borrow_mut().as_mut() {
             lib.draft.points = points;
         }
+        *self.fan_draft.borrow_mut() = None;
         self.sync_fan_library();
         self.status(t("fan_profile.curve_in_draft"), false);
     }
@@ -309,7 +310,7 @@ impl Host {
         let value = self.view.borrow().as_ref().and_then(|v| {
             v.selected
                 .as_ref()
-                .map(omen_core::fan_profile::shared_curve)
+                .map(glph_core::fan_profile::shared_curve)
         });
         let (points, invalid) = match value {
             Some(Ok(p)) => (p, false),
@@ -386,7 +387,7 @@ impl Host {
         startup: bool,
     ) -> Result<(), String> {
         if startup && self.profile_fan_invalid.get() {
-            return Err(omen_core::message::msg("fan_profile.err.startup", &[]));
+            return Err(glph_core::message::msg("fan_profile.err.startup", &[]));
         }
         if self.profile_fan_changed.get() {
             for f in [Feature::CpuFanCurve, Feature::GpuFanCurve] {

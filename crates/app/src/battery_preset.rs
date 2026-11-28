@@ -2,11 +2,11 @@
 //! fast through a moderate fast limit and an efficient boost policy, while a
 //! low sustained limit, the efficiency power mode and 60 Hz on the internal
 //! panel cut continuous draw. Created only when the user picks it.
-use omen_core::{
+use glph_core::{
     features::Feature,
     profiles::{Choice, DeviceBinding, PROFILE_SCHEMA, PerformanceProfile, Setting, Value},
 };
-use omen_platform::profile_store::ProfileStore;
+use glph_platform::profile_store::ProfileStore;
 
 /// Stable id, so the battery selection and Restore find the same preset.
 pub const ID: &str = "preset-battery-optimized";
@@ -57,7 +57,7 @@ pub fn ensure(store: &ProfileStore) -> Result<(), String> {
     if store.load(ID).is_ok() {
         return Ok(());
     }
-    let inventory = omen_platform::inventory();
+    let inventory = glph_platform::inventory();
     let binding = DeviceBinding {
         manufacturer: inventory.manufacturer,
         board: inventory.board,
@@ -98,8 +98,8 @@ mod tests {
         // Balanced mode (Dynamic Boost off): the fast limit is not
         // firmware-owned, and the efficiency mode keeps its Balanced plan.
         assert_eq!(
-            omen_core::hp_mode::HpMode::of_preset(&profile, false),
-            Some(omen_core::hp_mode::HpMode::Balanced)
+            glph_core::hp_mode::HpMode::of_preset(&profile, false),
+            Some(glph_core::hp_mode::HpMode::Balanced)
         );
         let effective = profile.effective().settings;
         assert!(
@@ -108,7 +108,7 @@ mod tests {
                 .any(|s| s.feature == Feature::WindowsEnergyMode)
         );
         assert_eq!(
-            omen_core::hp_mode::HpMode::cpu_pl1_of_profile(&profile),
+            glph_core::hp_mode::HpMode::cpu_pl1_of_profile(&profile),
             Some(18)
         );
     }

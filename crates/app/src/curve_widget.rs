@@ -1,6 +1,6 @@
 //! Reusable native GDI curve canvas. Every edit changes a draft only.
 use crate::i18n::{t, tf};
-use omen_core::{
+use glph_core::{
     curve_editor::{Curve, DragMode, Kind, Point as DataPoint},
     curve_input::{self, Key, Modifiers},
     curve_view::{Viewport, tick_step},

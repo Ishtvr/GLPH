@@ -2,7 +2,7 @@
 //! fixed SMU messages. Margins and scalar have SMU GETs; each limit is read back from the
 //! PM-table cell measured on 16 October 2026 (cpu-smu-calibrate-limits).
 use super::smu::{Message, Smu, core_mask, margin_arg, margin_value};
-use omen_core::{
+use glph_core::{
     Inventory,
     features::{Feature, Unit},
     message::msg,
@@ -390,7 +390,7 @@ fn observe_until(
     matches: impl Fn(&SmuImage) -> Result<bool, String>,
     mut sample: impl FnMut(u64, &SmuImage),
 ) -> Result<SmuImage, String> {
-    use omen_core::readback::{Decision, Settling};
+    use glph_core::readback::{Decision, Settling};
     use std::time::Instant;
     let start = Instant::now();
     let mut settling = Settling::new(READBACK_DEADLINE, READBACK_QUIET);
@@ -425,7 +425,7 @@ fn observe_until(
                     }
                     other => format!("{other:?}"),
                 };
-                return Err(omen_core::message::msg(
+                return Err(glph_core::message::msg(
                     "cpu.err.not_settled",
                     &[&format!("@field.{feature:?}"), &held],
                 ));
@@ -449,7 +449,7 @@ pub fn verify_target(
     )
     .map_err(|error| {
         // A translated message already names the setting and the held value.
-        if error.contains(omen_core::message::OPEN) {
+        if error.contains(glph_core::message::OPEN) {
             error
         } else {
             format!("{error}; requested {target:?}")
@@ -838,7 +838,7 @@ mod tests {
         assert!(
             validate(
                 Feature::CpuPptLimitMw,
-                &Value::Choice(omen_core::profiles::Choice::Manual)
+                &Value::Choice(glph_core::profiles::Choice::Manual)
             )
             .is_err()
         );

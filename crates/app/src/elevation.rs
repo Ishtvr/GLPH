@@ -3,13 +3,32 @@ use crate::{
     i18n::{t, tf},
     native_ui::{token, wide},
 };
-use omen_platform::profile_store::ProfileStore;
+use glph_platform::profile_store::ProfileStore;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::{
     Foundation::*,
     System::Threading::*,
     UI::{Shell::*, WindowsAndMessaging::SW_HIDE},
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAction {
+    Install,
+    Start,
+    Stop,
+    Remove,
+}
+
+impl ServiceAction {
+    pub fn arg(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Remove => "remove",
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -20,14 +39,23 @@ pub enum Action {
     /// revoking the sign-in approval (a normal Restore disables it).
     RestoreKeepStartup,
     Startup,
-    Mode(omen_core::hp_mode::HpMode),
-    ReplaceMode(omen_core::hp_mode::HpMode),
+    Mode(glph_core::hp_mode::HpMode),
+    ReplaceMode(glph_core::hp_mode::HpMode),
+    UnleashedMode(glph_core::hp_mode::HpUnleashedOptions),
     FanService,
-    Graphics(omen_core::quick_switch::GraphicsMode),
+    HardwareService(ServiceAction),
+    Graphics(glph_core::quick_switch::GraphicsMode),
     /// `true` stops and disables HPOmenCap, `false` restores it.
     HpService(bool),
     /// Discovers this device's hardware/mode defaults (incl. Standard & Performance TDC/EDC).
     DetectDefaults,
+    /// Reads the four-zone keyboard lighting state via elevated HP BIOS WMI.
+    KeyboardRead,
+    /// Applies four-zone keyboard RGB colors and on/off state via elevated HP BIOS WMI.
+    KeyboardDirectApply {
+        colors: [[u8; 3]; 4],
+        enabled: bool,
+    },
 }
 impl Action {
     fn name(self) -> &'static str {
@@ -35,11 +63,14 @@ impl Action {
             Self::Apply | Self::Replace => "apply",
             Self::Restore | Self::RestoreKeepStartup => "restore",
             Self::Startup => "startup",
-            Self::Mode(_) | Self::ReplaceMode(_) => "mode",
+            Self::Mode(_) | Self::ReplaceMode(_) | Self::UnleashedMode(_) => "mode",
             Self::FanService => "fan",
+            Self::HardwareService(_) => "hardware_service",
             Self::Graphics(_) => "mux",
             Self::HpService(_) => "hp_service",
             Self::DetectDefaults => "device_defaults",
+            Self::KeyboardRead => "keyboard_read",
+            Self::KeyboardDirectApply { .. } => "keyboard_apply",
         }
     }
 }
@@ -62,7 +93,7 @@ fn run_inner(
     wait_finished: bool,
 ) -> Result<serde_json::Value, String> {
     if let Some(id) = id {
-        omen_core::profiles::validate_id(id)?;
+        glph_core::profiles::validate_id(id)?;
     }
     let nonce = token();
     let arguments = match action {
@@ -84,17 +115,43 @@ fn run_inner(
         ),
         Action::Mode(mode) => format!("mode-ui-apply {} {nonce}", mode.name()),
         Action::ReplaceMode(mode) => format!("mode-ui-replace {} {nonce}", mode.name()),
+        Action::UnleashedMode(opts) => format!(
+            "mode-ui-unleashed {} {} {} {} {} {nonce}",
+            opts.cpu_pl1_w,
+            opts.shared_budget_w,
+            u8::from(opts.custom_tgp),
+            u8::from(opts.dynamic_boost),
+            opts.gpu_max_temp_c
+        ),
         Action::Replace => format!(
             "profile-ui-replace {} {nonce}",
             id.ok_or(t("elevation.save_first"))?
         ),
         Action::FanService => format!("fan-service-install {nonce}"),
+        Action::HardwareService(svc) => format!("service-ui {} {nonce}", svc.arg()),
         Action::Graphics(mode) => format!("mux-ui-apply {} {nonce}", mode.key()),
         Action::HpService(disable) => format!(
             "hp-service-ui {} {nonce}",
             if disable { "disable" } else { "restore" }
         ),
         Action::DetectDefaults => format!("device-defaults-ui-detect {nonce}"),
+        Action::KeyboardRead => format!("keyboard-ui-read {nonce}"),
+        Action::KeyboardDirectApply { colors, enabled } => format!(
+            "keyboard-ui-direct-apply {:02x}{:02x}{:02x} {:02x}{:02x}{:02x} {:02x}{:02x}{:02x} {:02x}{:02x}{:02x} {} {nonce}",
+            colors[0][0],
+            colors[0][1],
+            colors[0][2],
+            colors[1][0],
+            colors[1][1],
+            colors[1][2],
+            colors[2][0],
+            colors[2][1],
+            colors[2][2],
+            colors[3][0],
+            colors[3][1],
+            colors[3][2],
+            u8::from(enabled),
+        ),
     };
     let arguments = format!("--lang {} {arguments}", crate::i18n::language_code());
     let file = wide(
@@ -122,7 +179,25 @@ fn run_inner(
         return Err(t("elevation.no_process").into());
     }
     let result = (|| {
-        let deadline = Instant::now() + Duration::from_secs(45);
+        // Apply/Restore/Mode can include a VBIOS-TGP dGPU PnP restart and
+        // Code-43 recovery (up to ~100 s); give them a 120 s budget and cap
+        // serialized waits with a 180 s watchdog so a hung child never deadlocks.
+        let wait_secs = if wait_finished {
+            180
+        } else if matches!(
+            action,
+            Action::Apply
+                | Action::Replace
+                | Action::Restore
+                | Action::RestoreKeepStartup
+                | Action::Mode(_)
+                | Action::ReplaceMode(_)
+        ) {
+            120
+        } else {
+            45
+        };
+        let deadline = Instant::now() + Duration::from_secs(wait_secs);
         loop {
             match unsafe { WaitForSingleObject(execute.hProcess, 50) } {
                 WAIT_OBJECT_0 => break,
@@ -132,7 +207,7 @@ fn run_inner(
             if stopped() {
                 return Err(t("elevation.window_closed").into());
             }
-            if Instant::now() >= deadline && !wait_finished {
+            if Instant::now() >= deadline {
                 return Err(t("elevation.still_running").into());
             }
         }
@@ -140,7 +215,13 @@ fn run_inner(
         if unsafe { GetExitCodeProcess(execute.hProcess, &mut code) } == 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        let record = ProfileStore::user_data()?.control_result()?;
+        let store = ProfileStore::user_data()?;
+        // Prefer the per-nonce result file so concurrent UI operations
+        // never clobber each other; fall back to `last-control-result.json`.
+        let record = match store.take_nonce_control_result(&nonce)? {
+            Some(record) => record,
+            None => store.control_result()?,
+        };
         if record["schema"] != 1
             || record["nonce"].as_str() != Some(&nonce)
             || record["operation"].as_str() != Some(action.name())
@@ -152,12 +233,18 @@ fn run_inner(
             // rollback details stay in the recorded control result (journal).
             // The marker is translated once, where the caller shows it.
             return Err(match record["result"]["Err"]["error"].as_str() {
-                Some(text) if text.contains(omen_core::message::OPEN) => text.to_owned(),
-                _ => omen_core::message::msg("elevation.failed_logged", &[]),
+                Some(text) if text.contains(glph_core::message::OPEN) => text.to_owned(),
+                _ => glph_core::message::msg("elevation.failed_logged", &[]),
             });
         }
         if record["result"].get("Ok").is_none() {
             return Err(t("elevation.unverified").into());
+        }
+        if matches!(action, Action::Apply | Action::Replace) {
+            // Clear the Boot-Crash-Guard marker after 15 s of stable execution
+            // inside the long-lived UI process; if a hard crash/BSOD occurs
+            // earlier, the marker survives into the next boot.
+            crate::gpu_crash_guard::schedule_clear_after(Duration::from_secs(15));
         }
         Ok(record)
     })();
@@ -219,14 +306,14 @@ pub fn applied_status(record: &serde_json::Value) -> String {
         .flatten()
         .filter_map(|item| item.as_str())
         .filter_map(|key| serde_json::from_value(key.into()).ok())
-        .filter(|feature: &omen_core::features::Feature| {
+        .filter(|feature: &glph_core::features::Feature| {
             !matches!(
                 feature,
-                omen_core::features::Feature::HpSharedPowerMw
-                    | omen_core::features::Feature::GpuDynamicBoostLimitMw
+                glph_core::features::Feature::HpSharedPowerMw
+                    | glph_core::features::Feature::GpuDynamicBoostLimitMw
             )
         })
-        .map(|feature: omen_core::features::Feature| t(&format!("field.{feature:?}")).to_owned())
+        .map(|feature: glph_core::features::Feature| t(&format!("field.{feature:?}")).to_owned())
         .collect();
     if !overridden.is_empty() {
         add(tf("preset.overridden", &[&overridden.join(", ")]));
@@ -249,7 +336,7 @@ fn skipped_names(record: &serde_json::Value) -> Vec<String> {
         .flatten()
         .map(|item| {
             let reason = item["reason"].as_str().unwrap_or_default();
-            if reason.contains(omen_core::message::OPEN) {
+            if reason.contains(glph_core::message::OPEN) {
                 crate::i18n::message(reason)
             } else {
                 item["feature"]
@@ -257,7 +344,7 @@ fn skipped_names(record: &serde_json::Value) -> Vec<String> {
                     .and_then(|key| serde_json::from_value(key.into()).ok())
                     .map_or_else(
                         || reason.to_owned(),
-                        |feature: omen_core::features::Feature| {
+                        |feature: glph_core::features::Feature| {
                             t(&format!("field.{feature:?}")).to_owned()
                         },
                     )
@@ -286,7 +373,7 @@ pub fn restored_status(record: &serde_json::Value) -> String {
 
 /// A mode SET is not a thermal-mode GET. Keep verified CPU PL1 separate from
 /// unqualified PM observations, and retain optional read errors in the message.
-pub fn mode_written_status(mode: omen_core::hp_mode::HpMode, record: &serde_json::Value) -> String {
+pub fn mode_written_status(mode: glph_core::hp_mode::HpMode, record: &serde_json::Value) -> String {
     let mut text = tf("mode.written", &[&t(&format!("mode.{}", mode.name()))]);
     let report = &record["result"]["Ok"];
     if let Some(watts) = report["cpu_pl1_w"].as_i64() {
@@ -308,7 +395,7 @@ mod tests {
     use super::*;
     #[test]
     fn mode_result_never_promotes_unqualified_observations_to_cpu_limit_readback() {
-        use omen_core::hp_mode::HpMode;
+        use glph_core::hp_mode::HpMode;
         let unavailable = serde_json::json!({"result":{"Ok":{
             "cpu_pl1_w":null,"cpu_limit_observations_w":[55,80],"cpu_limits_read_error":"reader failed"
         }}});

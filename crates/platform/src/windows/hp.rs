@@ -1,5 +1,5 @@
 //! Fixed, model-bound HP BIOS contracts. No watchdog or public raw opcode API.
-use omen_core::{
+use glph_core::{
     Inventory,
     hp::{GpuPowerStatus, SystemDesignData, decode_gpu_status, decode_system_design},
     keyboard::{KeyboardKind, KeyboardState, decode_keyboard_capability, decode_legacy_lighting},
@@ -65,6 +65,11 @@ impl Read {
 pub(super) struct HpBios {
     connection: WMIConnection,
     path: String,
+    /// Cached WMI class/method definitions so `invoke()` avoids two redundant
+    /// `get_object()` WMI RPC roundtrips on every BIOS read/write.
+    data_in_class: IWbemClassWrapper,
+    method_int4: IWbemClassWrapper,
+    method_int128: IWbemClassWrapper,
 }
 
 impl HpBios {
@@ -99,7 +104,21 @@ impl HpBios {
                 ));
             }
         };
-        Ok(Self { connection, path })
+        let data_in_class = connection.get_object("hpqBDataIn")?;
+        let bios_class = connection.get_object("hpqBIntM")?;
+        let method_int4 = bios_class.get_method("hpqBIOSInt4")?.ok_or_else(|| {
+            WMIError::ConvertVariantError("HP hpqBIOSInt4 input signature is missing".into())
+        })?;
+        let method_int128 = bios_class.get_method("hpqBIOSInt128")?.ok_or_else(|| {
+            WMIError::ConvertVariantError("HP hpqBIOSInt128 input signature is missing".into())
+        })?;
+        Ok(Self {
+            connection,
+            path,
+            data_in_class,
+            method_int4,
+            method_int128,
+        })
     }
 
     pub(super) fn get(&self, read: Read) -> WMIResult<(u32, Vec<u8>)> {
@@ -177,9 +196,9 @@ impl HpBios {
         self.invoke(&contract, contract.input).map(|(_, b)| b[1])
     }
     /// The three fixed 4-byte performance-mode SETs used by the Hub (0x1A,
-    /// 0x22, 0x29). The caller passes only a type from `omen_core::hp_mode`.
+    /// 0x22, 0x29). The caller passes only a type from `glph_core::hp_mode`.
     pub(super) fn set_mode_payload(&self, command_type: u32, bytes: [u8; 4]) -> WMIResult<()> {
-        use omen_core::hp_mode::{GPU_POWER_TYPE, POWER_LIMITS_TYPE, THERMAL_MODE_TYPE};
+        use glph_core::hp_mode::{GPU_POWER_TYPE, POWER_LIMITS_TYPE, THERMAL_MODE_TYPE};
         if ![THERMAL_MODE_TYPE, GPU_POWER_TYPE, POWER_LIMITS_TYPE].contains(&command_type) {
             return Err(WMIError::ConvertVariantError(
                 "Only the fixed HP performance-mode SETs can be written".into(),
@@ -195,7 +214,7 @@ impl HpBios {
         self.invoke(&contract, &bytes).map(|_| ())
     }
     fn invoke(&self, contract: &ReadContract, bytes: &[u8]) -> WMIResult<(u32, Vec<u8>)> {
-        let data = self.connection.get_object("hpqBDataIn")?.spawn_instance()?;
+        let data = self.data_in_class.spawn_instance()?;
         data.put_property("Command", contract.command)?;
         data.put_property("CommandType", contract.command_type)?;
         data.put_property("Size", bytes.len() as u32)?;
@@ -213,14 +232,18 @@ impl HpBios {
         } else {
             data.put_property("hpqBData", bytes.to_vec())?;
         }
-        let signature = self
-            .connection
-            .get_object("hpqBIntM")?
-            .get_method(contract.method)?
-            .ok_or_else(|| {
-                WMIError::ConvertVariantError("HP GET input signature is missing".into())
-            })?;
-        let input = signature.spawn_instance()?;
+        let input = match contract.method {
+            "hpqBIOSInt4" => self.method_int4.spawn_instance()?,
+            "hpqBIOSInt128" => self.method_int128.spawn_instance()?,
+            other => self
+                .connection
+                .get_object("hpqBIntM")?
+                .get_method(other)?
+                .ok_or_else(|| {
+                    WMIError::ConvertVariantError("HP GET input signature is missing".into())
+                })?
+                .spawn_instance()?,
+        };
         input.put_property("InData", Variant::Object(data))?;
         let output = self
             .connection
@@ -407,9 +430,44 @@ fn typed_property(
     Variant::from_variant(&value)?.convert_into_cim_type(expected_type)
 }
 
+type ThreadBiosKey = (String, String, String);
+type ThreadBiosSlot = Option<(ThreadBiosKey, HpBios)>;
+
+std::thread_local! {
+    /// Reuses one WMI connection + cached class/method templates per worker
+    /// thread across repeated read/write calls (e.g. `preset_hold` ticks) so
+    /// each call runs a single `exec_method` instead of reconnecting `ROOT\WMI`.
+    static THREAD_BIOS: std::cell::RefCell<ThreadBiosSlot> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_thread_bios<T>(
+    inventory: &Inventory,
+    op: impl FnOnce(&HpBios) -> WMIResult<T>,
+) -> WMIResult<T> {
+    let key = (
+        inventory.manufacturer.clone(),
+        inventory.board.clone(),
+        inventory.bios.clone(),
+    );
+    THREAD_BIOS.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let needs_new = guard.as_ref().is_none_or(|(k, _)| *k != key);
+        if needs_new {
+            *guard = Some((key, HpBios::new(inventory)?));
+        }
+        let result = op(&guard.as_ref().expect("populated above").1);
+        if result.is_err() {
+            // Drop potentially stale COM/WMI session so the next call reconnects.
+            *guard = None;
+        }
+        result
+    })
+}
+
 pub fn read_hp_gpu_status(inventory: &Inventory) -> Result<GpuPowerStatus, String> {
     let query = || -> WMIResult<GpuPowerStatus> {
-        let (code, bytes) = HpBios::new(inventory)?.get(Read::GpuStatus)?;
+        let (code, bytes) = with_thread_bios(inventory, |bios| bios.get(Read::GpuStatus))?;
         decode_gpu_status(code, &bytes).map_err(WMIError::ConvertVariantError)
     };
     query().map_err(|error| query_error("GPU-status", error))
@@ -459,7 +517,7 @@ pub fn write_hp_gpu_power(
     custom_tgp: bool,
     ppab: bool,
 ) -> Result<GpuPowerStatus, String> {
-    use omen_core::hp_mode::GPU_POWER_TYPE;
+    use glph_core::hp_mode::GPU_POWER_TYPE;
     let bios = HpBios::new(inventory).map_err(|e| query_error("GPU-power", e))?;
     let gps_temp_c = bios
         .get(Read::GpuStatus)
@@ -493,7 +551,7 @@ pub fn write_hp_gpu_temperature_limit(
     inventory: &Inventory,
     temp_c: u8,
 ) -> Result<GpuPowerStatus, String> {
-    use omen_core::hp_mode::GPU_POWER_TYPE;
+    use glph_core::hp_mode::GPU_POWER_TYPE;
     if !(65..=87).contains(&temp_c) {
         return Err(format!(
             "GPU max temperature {temp_c} °C is outside the verified 65–87 °C range"
@@ -531,9 +589,9 @@ pub fn write_hp_gpu_temperature_limit(
 /// [FF, FF, FF, watts]; FF leaves Slow/STAPM/PL4 unchanged. The firmware has
 /// no TPP readback, so this write cannot be confirmed or restored exactly.
 pub fn write_hp_shared_budget(inventory: &Inventory, watts: u8) -> Result<(), String> {
-    use omen_core::hp_mode::POWER_LIMITS_TYPE;
+    use glph_core::hp_mode::POWER_LIMITS_TYPE;
     if watts == 0 || watts == 0xFF {
-        return Err(omen_core::message::msg("hp.err.tpp_range", &[]));
+        return Err(glph_core::message::msg("hp.err.tpp_range", &[]));
     }
     let bios = HpBios::new(inventory).map_err(|e| query_error("TPP", e))?;
     bios.set_mode_payload(POWER_LIMITS_TYPE, [0xFF, 0xFF, 0xFF, watts])
@@ -545,11 +603,11 @@ pub fn write_hp_shared_budget(inventory: &Inventory, watts: u8) -> Result<(), St
 /// preset was lost; flags and CPU limits are kept separately.
 pub fn write_hp_thermal_mode(
     inventory: &Inventory,
-    mode: omen_core::hp_mode::HpMode,
+    mode: glph_core::hp_mode::HpMode,
 ) -> Result<(), String> {
-    use omen_core::hp_mode::{self, HpMode, THERMAL_MODE_TYPE};
+    use glph_core::hp_mode::{self, HpMode, THERMAL_MODE_TYPE};
     if mode == HpMode::Unleashed && super::power_status().ac_connected != Some(true) {
-        return Err(omen_core::message::msg("mode.err.ac_required", &[]));
+        return Err(glph_core::message::msg("mode.err.ac_required", &[]));
     }
     let bios = HpBios::new(inventory).map_err(|e| query_error("mode", e))?;
     bios.set_mode_payload(THERMAL_MODE_TYPE, hp_mode::thermal_payload(mode))
@@ -562,10 +620,10 @@ pub fn write_hp_thermal_mode(
 /// October 2026); a transaction captured before that would see the limit
 /// change under it.
 pub fn write_hp_cpu_pl1(inventory: &Inventory, watts: u8) -> Result<(), String> {
-    use omen_core::hp_mode::POWER_LIMITS_TYPE;
+    use glph_core::hp_mode::POWER_LIMITS_TYPE;
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(6);
     if watts == 0 || watts == 0xFF {
-        return Err(omen_core::message::msg("hp.err.tpp_range", &[]));
+        return Err(glph_core::message::msg("hp.err.tpp_range", &[]));
     }
     let bios = HpBios::new(inventory).map_err(|e| query_error("PL1", e))?;
     bios.set_mode_payload(POWER_LIMITS_TYPE, [watts, watts, 0xFF, 0xFF])
@@ -577,7 +635,7 @@ pub fn write_hp_cpu_pl1(inventory: &Inventory, watts: u8) -> Result<(), String> 
             return Ok(());
         }
         if start.elapsed() >= DEADLINE {
-            return Err(omen_core::message::msg(
+            return Err(glph_core::message::msg(
                 "cpu.err.not_settled",
                 &[&"@field.CpuSlowPptLimitMw", &format!("{slow} W")],
             ));
@@ -586,9 +644,9 @@ pub fn write_hp_cpu_pl1(inventory: &Inventory, watts: u8) -> Result<(), String> 
 }
 
 /// Diagnostic: writes only the thermal byte of a Hub Performance slider step
-/// (`omen_core::hp_mode::performance_step_payload`). No readback exists.
+/// (`glph_core::hp_mode::performance_step_payload`). No readback exists.
 pub fn write_hp_performance_step(inventory: &Inventory, step: &str) -> Result<(), String> {
-    use omen_core::hp_mode::{THERMAL_MODE_TYPE, performance_step_payload};
+    use glph_core::hp_mode::{THERMAL_MODE_TYPE, performance_step_payload};
     let payload = performance_step_payload(step)?;
     let bios = HpBios::new(inventory).map_err(|e| query_error("mode", e))?;
     bios.set_mode_payload(THERMAL_MODE_TYPE, payload)
@@ -597,7 +655,7 @@ pub fn write_hp_performance_step(inventory: &Inventory, step: &str) -> Result<()
 
 #[derive(Debug, serde::Serialize)]
 pub struct HpModeReport {
-    pub plan: omen_core::hp_mode::ModePlan,
+    pub plan: glph_core::hp_mode::ModePlan,
     pub gpu_before: GpuPowerStatus,
     pub gpu_after: GpuPowerStatus,
     /// Qualified sustained PL1 from PM-table cell4, in watts.
@@ -620,7 +678,7 @@ pub struct GraphicsModeReport {
 /// and reads it back. The BIOS applies the stored mode at the next restart.
 pub fn apply_graphics_mode(
     inventory: &Inventory,
-    mode: omen_core::quick_switch::GraphicsMode,
+    mode: glph_core::quick_switch::GraphicsMode,
 ) -> Result<GraphicsModeReport, String> {
     let requested = mode.bios_byte();
     let previous = read_hp_graphics_mode(inventory)?;
@@ -647,12 +705,31 @@ pub fn apply_graphics_mode(
 /// CPU PL1 are verified afterwards. Any failed mode falls back to Balanced.
 pub fn apply_hp_mode(
     inventory: &Inventory,
-    mode: omen_core::hp_mode::HpMode,
+    mode: glph_core::hp_mode::HpMode,
 ) -> Result<HpModeReport, String> {
-    use omen_core::hp_mode::{self, GPU_POWER_TYPE, HpMode, POWER_LIMITS_TYPE, THERMAL_MODE_TYPE};
+    apply_hp_mode_inner(inventory, mode, None)
+}
+
+/// Switches the notebook into HP OMEN Unleashed mode with custom original OMEN
+/// Gaming Hub Unleashed slider settings (CPU PL1, TPP shared budget, cTGP,
+/// Dynamic Boost / PPAB, and GPU max temperature GPS).
+pub fn apply_hp_unleashed(
+    inventory: &Inventory,
+    opts: glph_core::hp_mode::HpUnleashedOptions,
+) -> Result<HpModeReport, String> {
+    opts.validate()?;
+    apply_hp_mode_inner(inventory, glph_core::hp_mode::HpMode::Unleashed, Some(opts))
+}
+
+fn apply_hp_mode_inner(
+    inventory: &Inventory,
+    mode: glph_core::hp_mode::HpMode,
+    unleashed_opts: Option<glph_core::hp_mode::HpUnleashedOptions>,
+) -> Result<HpModeReport, String> {
+    use glph_core::hp_mode::{self, GPU_POWER_TYPE, HpMode, POWER_LIMITS_TYPE, THERMAL_MODE_TYPE};
     let ac = super::power_status().ac_connected == Some(true);
     if mode == HpMode::Unleashed && !ac {
-        return Err(omen_core::message::msg("mode.err.ac_required", &[]));
+        return Err(glph_core::message::msg("mode.err.ac_required", &[]));
     }
     let bios = HpBios::new(inventory).map_err(|e| query_error("mode", e))?;
     let read_gpu = |bios: &HpBios| -> Result<GpuPowerStatus, String> {
@@ -666,7 +743,7 @@ pub fn apply_hp_mode(
         .map_err(|e| query_error("system-design", e))?;
     let design = decode_system_design(code, &design)?;
     if mode == HpMode::Unleashed && !design.extreme_supported {
-        return Err(omen_core::message::msg("mode.err.unsupported", &[]));
+        return Err(glph_core::message::msg("mode.err.unsupported", &[]));
     }
     let gpu_before = read_gpu(&bios)?;
     type ModeReadback = (GpuPowerStatus, Option<(i64, i64)>, Option<String>);
@@ -685,7 +762,7 @@ pub fn apply_hp_mode(
         if after.custom_tgp_enabled != plan.expect_custom_tgp
             || after.ppab_enabled != plan.expect_ppab
         {
-            return Err(omen_core::message::msg(
+            return Err(glph_core::message::msg(
                 "gpu.err.readback",
                 &[&after.custom_tgp_enabled, &after.ppab_enabled],
             ));
@@ -705,7 +782,7 @@ pub fn apply_hp_mode(
         if let Some((_, slow)) = limits {
             let pl1 = i64::from(plan.pl1_w());
             if slow != pl1 {
-                return Err(omen_core::message::msg(
+                return Err(glph_core::message::msg(
                     "mode.err.pl1_readback",
                     &[&pl1, &slow],
                 ));
@@ -713,7 +790,10 @@ pub fn apply_hp_mode(
         }
         Ok((after, limits, cpu_limits_read_error))
     };
-    let plan = hp_mode::plan(mode, design.default_shared_budget_raw, ac)?;
+    let plan = match unleashed_opts {
+        Some(opts) => hp_mode::plan_unleashed(opts)?,
+        None => hp_mode::plan(mode, design.default_shared_budget_raw, ac)?,
+    };
     match send(&plan) {
         Ok((gpu_after, cpu_limit_observations_w, cpu_limits_read_error)) => Ok(HpModeReport {
             plan,
@@ -727,9 +807,9 @@ pub fn apply_hp_mode(
             let fallback = hp_mode::plan(HpMode::Balanced, design.default_shared_budget_raw, ac)
                 .and_then(|balanced| send(&balanced));
             Err(match fallback {
-                Ok(_) => omen_core::message::msg("mode.err.balanced_restored", &[&error]),
+                Ok(_) => glph_core::message::msg("mode.err.balanced_restored", &[&error]),
                 Err(again) => {
-                    omen_core::message::msg("mode.err.fallback_failed", &[&error, &again])
+                    glph_core::message::msg("mode.err.fallback_failed", &[&error, &again])
                 }
             })
         }

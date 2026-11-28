@@ -4,7 +4,7 @@ use crate::{
     i18n::{t, tf},
     preset_fields, preset_ui, settings, ui,
 };
-use omen_core::{
+use glph_core::{
     Snapshot,
     app_settings::LanguagePreference,
     battery::Selection,
@@ -17,7 +17,7 @@ use omen_core::{
     profiles::{CoreDelta, DeviceBinding, PerformanceProfile, Value},
     quick_switch::{FanMode, GraphicsMode},
 };
-use omen_platform::profile_store::ProfileStore;
+use glph_platform::profile_store::ProfileStore;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
@@ -45,11 +45,12 @@ mod notices;
 mod pacing;
 mod plugins;
 mod surface;
+mod telemetry;
 slint::include_modules!();
 
 const AUX_DONE: u32 = WM_APP + 92;
 fn navigate_message() -> u32 {
-    unsafe { RegisterWindowMessageW(crate::native_ui::wide("PerformanceHub.Navigate").as_ptr()) }
+    unsafe { RegisterWindowMessageW(crate::native_ui::wide("GLPH.Navigate").as_ptr()) }
 }
 const MODES: [(&str, HpMode); 4] = [
     ("mode.quiet", HpMode::Quiet),
@@ -115,27 +116,30 @@ fn selection_label(selection: &Selection, profiles: &[PerformanceProfile]) -> St
         ),
     }
 }
+struct SaveSettingsRequest {
+    base: settings::Snapshot,
+    options: glph_core::app_settings::AppSettings,
+    appearance: glph_core::appearance::Appearance,
+    gpu_tgp_max_w: u32,
+    startup: bool,
+}
 enum Aux {
     FanLibrary(String, String),
     SaveFanPreset(
-        omen_core::fan_profile::FanPreset,
-        Option<omen_core::fan_profile::FanPreset>,
+        glph_core::fan_profile::FanPreset,
+        Option<glph_core::fan_profile::FanPreset>,
     ),
-    DeleteFanPreset(omen_core::fan_profile::FanPreset),
-    RequestFanPreset(omen_core::fan_profile::FanPreset),
+    DeleteFanPreset(glph_core::fan_profile::FanPreset),
+    RequestFanPreset(glph_core::fan_profile::FanPreset),
     Settings,
-    SaveSettings(
-        settings::Snapshot,
-        omen_core::app_settings::AppSettings,
-        omen_core::appearance::Appearance,
-        u32,
-        bool,
-    ),
+    SaveSettings(Box<SaveSettingsRequest>),
     Lighting(Option<(KeyboardState, [[u8; 3]; 4], bool)>),
     HpService(bool),
+    HardwareService(crate::elevation::ServiceAction),
     DetectDefaults,
     PickPluginFile(isize, String, String),
     InstallPlugin(std::path::PathBuf, bool),
+    LoadPlugins(Option<String>, bool),
     Stop,
 }
 enum AuxResult {
@@ -143,29 +147,63 @@ enum AuxResult {
     FanPresetSaved(
         Result<
             (
-                omen_core::fan_profile::FanPreset,
-                Vec<omen_core::fan_profile::FanPreset>,
+                glph_core::fan_profile::FanPreset,
+                Vec<glph_core::fan_profile::FanPreset>,
             ),
             String,
         >,
     ),
-    FanPresetDeleted(Result<(String, String, Vec<omen_core::fan_profile::FanPreset>), String>),
+    FanPresetDeleted(Result<(String, String, Vec<glph_core::fan_profile::FanPreset>), String>),
     FanPolicyRequested(Result<(), String>, bool),
     Settings(
         Result<settings::Snapshot, String>,
         Option<bool>,
-        Option<omen_core::device_defaults::DeviceDefaultsRecord>,
+        Option<Box<glph_core::device_defaults::DeviceDefaultsRecord>>,
+        Option<glph_platform::service_client::InstalledServiceInfo>,
     ),
     SettingsSaved(Result<settings::Snapshot, String>),
     Lighting(Result<KeyboardState, String>, bool),
     Hp(Result<bool, String>),
-    DefaultsDetected(Result<omen_core::device_defaults::DeviceDefaultsRecord, String>),
+    HardwareService(Result<glph_platform::service_client::InstalledServiceInfo, String>),
+    DefaultsDetected(Result<glph_core::device_defaults::DeviceDefaultsRecord, String>),
     PluginFilePicked(Result<Option<std::path::PathBuf>, String>),
     PluginInstalled(
         std::path::PathBuf,
-        Result<omen_platform::plugin_store::InstallOutcome, String>,
+        Result<glph_platform::plugin_store::InstallOutcome, String>,
+    ),
+    PluginsLoaded(
+        Vec<glph_core::plugins::InstalledPlugin>,
+        Option<String>,
+        bool,
     ),
 }
+fn apply_hw_service_info(
+    data: &Workbench<'_>,
+    info: &glph_platform::service_client::InstalledServiceInfo,
+) {
+    use glph_platform::service_client::ScmServiceState;
+    let installed = !matches!(info.state, ScmServiceState::NotInstalled);
+    let running = matches!(
+        info.state,
+        ScmServiceState::Running | ScmServiceState::StartPending
+    );
+    let outdated = installed && !info.receipt_matches_sibling;
+    let (pill_key, pill_kind) = if !installed {
+        ("settings.hw_service_not_installed", 1)
+    } else if outdated {
+        ("settings.hw_service_update", 2)
+    } else if running {
+        ("settings.hw_service_running", 0)
+    } else {
+        ("settings.hw_service_stopped", 1)
+    };
+    data.set_hw_service_installed(installed);
+    data.set_hw_service_running(running);
+    data.set_hw_service_outdated(outdated);
+    data.set_hw_service_pill_text(t(pill_key).into());
+    data.set_hw_service_pill_kind(pill_kind);
+}
+
 fn aux_worker(hwnd: usize, rx: mpsc::Receiver<Aux>, tx: mpsc::Sender<AuxResult>) {
     while let Ok(request) = rx.recv() {
         let result = match request {
@@ -189,8 +227,13 @@ fn aux_worker(hwnd: usize, rx: mpsc::Receiver<Aux>, tx: mpsc::Sender<AuxResult>)
                 Ok((preset.board, preset.bios, store.fan_presets()?))
             })()),
             Aux::RequestFanPreset(preset) => {
-                let result = ProfileStore::user_data()
-                    .and_then(|store| crate::profile_fan::request_library(&store, &preset));
+                let result = ProfileStore::user_data().and_then(|store| {
+                    let res = crate::profile_fan::request_library(&store, &preset);
+                    if res.is_ok() {
+                        let _ = ui::sync_cooling_to_service(&store);
+                    }
+                    res
+                });
                 let pending = ProfileStore::user_data()
                     .and_then(|s| Ok(s.pending()? || s.fan_policy_pending()?))
                     .unwrap_or(true);
@@ -201,46 +244,79 @@ fn aux_worker(hwnd: usize, rx: mpsc::Receiver<Aux>, tx: mpsc::Sender<AuxResult>)
                 let stored = ProfileStore::user_data()
                     .ok()
                     .and_then(|s| s.device_defaults_record(&inv.board, &inv.bios));
-                let resolved = omen_core::device_defaults::resolve_defaults(
+                let resolved = glph_core::device_defaults::resolve_defaults(
                     &inv.board,
                     &inv.bios,
                     stored.as_ref(),
                 );
+                let hw_service = glph_platform::service_client::query_service_info().ok();
                 AuxResult::Settings(
                     settings::load(),
-                    omen_platform::hp_control::oem_service()
+                    glph_platform::hp_control::oem_service()
                         .ok()
                         .flatten()
                         .map(|s| s.disabled),
-                    Some(resolved),
+                    Some(Box::new(resolved)),
+                    hw_service,
                 )
             }
-            Aux::SaveSettings(base, options, appearance, gpu_tgp_max_w, startup) => {
-                AuxResult::SettingsSaved(settings::save(
-                    &base,
-                    &options,
-                    &appearance,
-                    gpu_tgp_max_w,
-                    startup,
-                ))
-            }
+            Aux::SaveSettings(req) => AuxResult::SettingsSaved(settings::save(
+                &req.base,
+                &req.options,
+                &req.appearance,
+                req.gpu_tgp_max_w,
+                req.startup,
+            )),
             Aux::Lighting(target) => {
                 let applied = target.is_some();
-                AuxResult::Lighting(
-                    omen_platform::DirectLighting::new().and_then(|mut control| match target {
+                let is_admin = unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 };
+                let result = if is_admin {
+                    glph_platform::DirectLighting::new().and_then(|mut control| match target {
                         Some((expected, colors, on)) => control.apply(&expected, &colors, on),
                         None => control.read(),
-                    }),
-                    applied,
-                )
+                    })
+                } else {
+                    match target {
+                        Some((_expected, colors, on)) => crate::elevation::run(
+                            None,
+                            crate::elevation::Action::KeyboardDirectApply {
+                                colors,
+                                enabled: on,
+                            },
+                            || false,
+                        )
+                        .and_then(|record| {
+                            serde_json::from_value(record["result"]["Ok"].clone())
+                                .map_err(|e| e.to_string())
+                        }),
+                        None => crate::elevation::run(
+                            None,
+                            crate::elevation::Action::KeyboardRead,
+                            || false,
+                        )
+                        .and_then(|record| {
+                            serde_json::from_value(record["result"]["Ok"]["state"].clone())
+                                .map_err(|e| e.to_string())
+                        }),
+                    }
+                };
+                AuxResult::Lighting(result, applied)
             }
             Aux::HpService(disable) => AuxResult::Hp(
                 crate::elevation::run(None, crate::elevation::Action::HpService(disable), || false)
                     .and_then(|_| {
-                        omen_platform::hp_control::oem_service()?
+                        glph_platform::hp_control::oem_service()?
                             .map(|s| s.disabled)
                             .ok_or_else(|| t("control.unavailable").to_owned())
                     }),
+            ),
+            Aux::HardwareService(action) => AuxResult::HardwareService(
+                crate::elevation::run(
+                    None,
+                    crate::elevation::Action::HardwareService(action),
+                    || false,
+                )
+                .and_then(|_| glph_platform::service_client::query_service_info()),
             ),
             Aux::DetectDefaults => AuxResult::DefaultsDetected(
                 crate::elevation::run(None, crate::elevation::Action::DetectDefaults, || false)
@@ -250,12 +326,19 @@ fn aux_worker(hwnd: usize, rx: mpsc::Receiver<Aux>, tx: mpsc::Sender<AuxResult>)
                     }),
             ),
             Aux::PickPluginFile(owner, title, filter) => {
-                AuxResult::PluginFilePicked(omen_platform::pick_plugin_file(owner, &title, &filter))
+                AuxResult::PluginFilePicked(glph_platform::pick_plugin_file(owner, &title, &filter))
             }
             Aux::InstallPlugin(path, replace) => {
-                let outcome = omen_platform::plugin_store::PluginStore::user_data()
+                let outcome = glph_platform::plugin_store::PluginStore::user_data()
                     .and_then(|store| store.install_from_path(&path, replace));
                 AuxResult::PluginInstalled(path, outcome)
+            }
+            Aux::LoadPlugins(highlight_id, background) => {
+                let inv = crate::inventory::read();
+                let scanned = glph_platform::plugin_store::PluginStore::user_data()
+                    .map(|store| store.scan(&inv))
+                    .unwrap_or_default();
+                AuxResult::PluginsLoaded(scanned, highlight_id, background)
             }
             Aux::Stop => break,
         };
@@ -272,7 +355,7 @@ fn aux_worker(hwnd: usize, rx: mpsc::Receiver<Aux>, tx: mpsc::Sender<AuxResult>)
 struct Host {
     fan_library: RefCell<Option<cooling::Library>>,
     library_attempted: Cell<bool>,
-    profile_fan_points: RefCell<Option<Vec<omen_core::profiles::FanPoint>>>,
+    profile_fan_points: RefCell<Option<Vec<glph_core::profiles::FanPoint>>>,
     profile_fan_changed: Cell<bool>,
     profile_fan_invalid: Cell<bool>,
     profile_fan_choices: RefCell<Vec<cooling::Choice>>,
@@ -302,9 +385,13 @@ struct Host {
     profiles: RefCell<Vec<PerformanceProfile>>,
     battery_entries: RefCell<Vec<Selection>>,
     lighting: RefCell<Option<KeyboardState>>,
-    lighting_draft: RefCell<Option<omen_core::lighting_editor::Draft>>,
+    lighting_draft: RefCell<Option<glph_core::lighting_editor::Draft>>,
     lighting_attempted: Cell<bool>,
     curve: RefCell<Option<curve::Editor>>,
+    curve_nodes: Rc<VecModel<CurveNode>>,
+    curve_x_ticks: Rc<VecModel<AxisTick>>,
+    curve_y_ticks: Rc<VecModel<AxisTick>>,
+    curve_point_labels: Rc<VecModel<slint::SharedString>>,
     gpu_draft: RefCell<Option<Curve>>,
     fan_draft: RefCell<Option<Curve>>,
     tray: crate::tray::TrayIcon,
@@ -315,8 +402,8 @@ struct Host {
     new_curve_on_load: Cell<bool>,
     settings_loaded: Cell<bool>,
     loading_presets: Cell<bool>,
-    appearance_draft: RefCell<omen_core::appearance::Appearance>,
-    appearance_tokens: Cell<omen_core::appearance::Tokens>,
+    appearance_draft: RefCell<glph_core::appearance::Appearance>,
+    appearance_tokens: Cell<glph_core::appearance::Tokens>,
     pacing: RefCell<pacing::Pacer>,
     pacing_timer: slint::Timer,
     color_picker: RefCell<Option<colors::Picker>>,
@@ -327,8 +414,9 @@ struct Host {
     operation_busy: Cell<bool>,
     was_minimized: Cell<bool>,
     surface_timer: slint::Timer,
-    drain: Cell<omen_core::battery::DrainWatch>,
+    drain: Cell<glph_core::battery::DrainWatch>,
     plugins: RefCell<plugins::PluginHostState>,
+    telemetry: RefCell<telemetry::TelemetryUiState>,
     self_rc: RefCell<Option<std::rc::Weak<Host>>>,
 }
 
@@ -336,7 +424,7 @@ impl Host {
     /// Tells the user once per AC session that the battery discharges
     /// although the charger is connected.
     fn observe_drain(&self) {
-        let power = omen_platform::power_status();
+        let power = glph_platform::power_status();
         let mut watch = self.drain.get();
         let lost = watch.observe(power.ac_connected, power.battery_percent);
         self.drain.set(watch);
@@ -369,10 +457,10 @@ impl Host {
                 }
             }
         }
+        self.paint_about();
         if let Some(window) = self.about.borrow().as_ref() {
             let _ = window.show();
         }
-        self.paint_about();
     }
     fn set_lists(&self, profiles: Vec<PerformanceProfile>) {
         let Some(w) = self.window.upgrade() else {
@@ -490,6 +578,7 @@ impl Host {
         self.apply.pause(value);
         if let Some(w) = self.window.upgrade() {
             let d = w.global::<Workbench>();
+            d.set_operation_busy(value);
             d.set_busy(value || d.get_apply_busy());
         }
     }
@@ -554,11 +643,15 @@ impl Host {
         self.busy(true);
         self.status(
             t(match &request {
-                Aux::Settings | Aux::FanLibrary(..) | Aux::Lighting(None) => "ui.loading",
+                Aux::Settings
+                | Aux::FanLibrary(..)
+                | Aux::Lighting(None)
+                | Aux::LoadPlugins(..) => "ui.loading",
                 Aux::SaveSettings(..) => "ui.settings_saving",
                 Aux::Lighting(Some(_)) => "lighting.applying",
                 Aux::HpService(true) => "hp_service.disabling",
                 Aux::HpService(false) => "hp_service.restoring",
+                Aux::HardwareService(_) => "settings.hw_service_working",
                 Aux::DetectDefaults => "settings.detecting_defaults",
                 Aux::SaveFanPreset(..) => "preset.saving",
                 Aux::DeleteFanPreset(..) => "preset.deleting",
@@ -623,6 +716,10 @@ impl Host {
             field,
             view.as_ref().map(|v| &v.defaults_record),
         );
+        let slider_value = match &draft.value {
+            Value::Integer(v) => (*v as f64 / field.scale() as f64) as f32,
+            _ => draft.text.replace(',', ".").parse::<f32>().unwrap_or(0.0),
+        };
         let data = FieldData {
             index: index as i32,
             label: field.label().into(),
@@ -644,6 +741,7 @@ impl Host {
             info: info.into(),
             slider_min: slider.map_or(0.0, |(lo, _)| lo as f32),
             slider_max: slider.map_or(0.0, |(_, hi)| hi as f32),
+            slider_value,
         };
         if local < model.row_count() {
             model.set_row_data(local, data);
@@ -668,7 +766,7 @@ impl Host {
                 .unwrap_or_else(|| field.initial());
             let text = match &value {
                 Value::Integer(v) => {
-                    crate::i18n::number(&omen_core::preset::format_number(*v, field.scale()))
+                    crate::i18n::number(&glph_core::preset::format_number(*v, field.scale()))
                 }
                 _ => String::new(),
             };
@@ -825,13 +923,13 @@ impl Host {
             if let Some(val) = target {
                 draft.value = Value::Integer(val);
                 draft.text =
-                    crate::i18n::number(&omen_core::preset::format_number(val, field.scale()));
+                    crate::i18n::number(&glph_core::preset::format_number(val, field.scale()));
             }
         }
     }
     /// Refreshes unticked preset fields after an explicit "Detect device
     /// defaults" run so newly measured values appear immediately everywhere.
-    fn apply_detected_defaults(&self, record: omen_core::device_defaults::DeviceDefaultsRecord) {
+    fn apply_detected_defaults(&self, record: glph_core::device_defaults::DeviceDefaultsRecord) {
         if let Some(w) = self.window.upgrade() {
             w.global::<Workbench>().set_device_defaults_summary(
                 preset_fields::format_device_defaults_summary(&record).into(),
@@ -856,7 +954,7 @@ impl Host {
                     draft.value = val.clone();
                     draft.text = match val {
                         Value::Integer(v) => crate::i18n::number(
-                            &omen_core::preset::format_number(*v, field.scale()),
+                            &glph_core::preset::format_number(*v, field.scale()),
                         ),
                         _ => String::new(),
                     };
@@ -958,7 +1056,7 @@ impl Host {
             } else {
                 Some(match field.feature.descriptor().value_kind {
                     ValueKind::Integer => {
-                        Value::Integer(omen_core::preset::parse_number(&draft.text, field.scale())?)
+                        Value::Integer(glph_core::preset::parse_number(&draft.text, field.scale())?)
                     }
                     ValueKind::PerCore => Value::PerCore(
                         self.cores
@@ -982,28 +1080,28 @@ impl Host {
                 })
             };
             if let Some(value) = &value {
-                omen_core::profiles::Setting {
+                glph_core::profiles::Setting {
                     feature: field.feature,
                     value: value.clone(),
                 }
                 .validate()?;
                 if field.feature == Feature::GpuDynamicBoostLimitMw {
                     let ceiling = self.gpu_tgp_max_w.get().clamp(
-                        omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
-                        omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
+                        glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
+                        glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
                     );
                     let valid = matches!(
                         value,
                         Value::Integer(mw)
                             if mw % 1000 == 0
-                                && (i64::from(omen_core::profiles::GPU_DIRECT_TGP_MIN_W)
+                                && (i64::from(glph_core::profiles::GPU_DIRECT_TGP_MIN_W)
                                     ..=i64::from(ceiling))
                                     .contains(&(mw / 1000))
                     );
                     if !valid {
-                        return Err(omen_core::message::msg(
+                        return Err(glph_core::message::msg(
                             "vbios_tgp.err.range",
-                            &[&omen_core::profiles::GPU_DIRECT_TGP_MIN_W, &ceiling],
+                            &[&glph_core::profiles::GPU_DIRECT_TGP_MIN_W, &ceiling],
                         ));
                     }
                 }
@@ -1043,7 +1141,7 @@ impl Host {
             }
             Ok(data) if self.test => {
                 let profile = if let Some(base) = &data.baseline {
-                    match omen_core::preset::merge(base, base, &data.name, &data.edits) {
+                    match glph_core::preset::merge(base, base, &data.name, &data.edits) {
                         Ok(p) => p,
                         Err(e) => {
                             self.abort_saved_selection();
@@ -1064,7 +1162,7 @@ impl Host {
                             .edits
                             .into_iter()
                             .filter_map(|(feature, value)| {
-                                value.map(|value| omen_core::profiles::Setting { feature, value })
+                                value.map(|value| glph_core::profiles::Setting { feature, value })
                             })
                             .collect(),
                     }
@@ -1091,7 +1189,10 @@ impl Host {
             if w.global::<Workbench>().get_curve_open() {
                 self.curve_action("close");
             }
-            if page == 3 && !self.lighting_plugin_active() {
+            if page == 3
+                && w.global::<Workbench>().get_active_plugin_surface_kind() == 0
+                && !self.lighting_plugin_active()
+            {
                 let d = w.global::<Workbench>();
                 d.set_page(4);
                 d.set_settings_tab(1);
@@ -1104,25 +1205,39 @@ impl Host {
             }
             w.global::<Workbench>().set_page(page);
             if page != 3 {
-                w.global::<Workbench>().set_active_plugin_id("".into());
-                w.global::<Workbench>().set_active_plugin_title("".into());
+                let d = w.global::<Workbench>();
+                d.set_active_plugin_id("".into());
+                d.set_active_plugin_title("".into());
+                d.set_active_plugin_surface_kind(0);
             } else if w.global::<Workbench>().get_active_plugin_id().is_empty() {
                 let lang = crate::i18n::language_code();
-                if let Some((id, label)) = self
+                if let Some((id, label, surface)) = self
                     .plugins
                     .borrow()
                     .installed
                     .iter()
                     .find(|p| {
                         p.status.is_active()
-                            && p.surface_kind()
-                                == Some(omen_core::plugins::UiSurfaceKind::Lighting4Zone)
+                            && matches!(
+                                p.surface_kind(),
+                                Some(
+                                    glph_core::plugins::UiSurfaceKind::HpOmenSuite
+                                        | glph_core::plugins::UiSurfaceKind::Lighting4Zone
+                                )
+                            )
                     })
-                    .map(|p| (p.id.clone(), p.nav_label(lang)))
+                    .map(|p| (p.id.clone(), p.nav_label(lang), p.surface_kind()))
                 {
                     let d = w.global::<Workbench>();
                     d.set_active_plugin_id(id.into());
                     d.set_active_plugin_title(label.into());
+                    d.set_active_plugin_surface_kind(
+                        if surface == Some(glph_core::plugins::UiSurfaceKind::HpOmenSuite) {
+                            3
+                        } else {
+                            0
+                        },
+                    );
                 }
             }
             if self.test {
@@ -1139,6 +1254,10 @@ impl Host {
                 self.send_preset(preset_ui::Request::Load(None));
             }
             if page == 3
+                && matches!(
+                    w.global::<Workbench>().get_active_plugin_surface_kind(),
+                    0 | 3
+                )
                 && self.lighting.borrow().is_none()
                 && !self.lighting_attempted.get()
                 && !self.is_busy()
@@ -1165,7 +1284,7 @@ impl Host {
             if let Some(graphics) = store.graphics_mode() {
                 d.set_graphics_index(graphics.mode.index() as i32);
                 d.set_graphics_status(
-                    t(if graphics.restart_pending(omen_platform::boot_unix_s()) {
+                    t(if graphics.restart_pending(glph_platform::boot_unix_s()) {
                         "ui.restart_pending"
                     } else {
                         "ui.saved_preference"
@@ -1364,7 +1483,9 @@ impl Host {
         }
         if message == AUX_DONE {
             while let Ok(result) = self.aux_results.try_recv() {
-                self.busy(false);
+                if !matches!(result, AuxResult::PluginsLoaded(_, _, true)) {
+                    self.busy(false);
+                }
                 match result {
                     AuxResult::FanLibrary(result) => match result {
                         Ok(snapshot) => self.show_fan_library(snapshot, None),
@@ -1413,7 +1534,7 @@ impl Host {
                             Err(e) => self.status(&crate::i18n::error_message(&e), true),
                         }
                     }
-                    AuxResult::Settings(result, hp, defaults_record) => {
+                    AuxResult::Settings(result, hp, defaults_record, hw_service) => {
                         if let Some(w) = self.window.upgrade() {
                             let data = w.global::<Workbench>();
                             data.set_hp_available(hp.is_some());
@@ -1423,12 +1544,26 @@ impl Host {
                                     preset_fields::format_device_defaults_summary(&record).into(),
                                 );
                             }
+                            if let Some(info) = hw_service {
+                                apply_hw_service_info(&data, &info);
+                            }
                         }
                         match result {
                             Ok(s) => self.show_settings(s, false),
                             Err(e) => self.status(&e, true),
                         }
                     }
+                    AuxResult::HardwareService(result) => match result {
+                        Ok(info) => {
+                            if let Some(w) = self.window.upgrade() {
+                                apply_hw_service_info(&w.global::<Workbench>(), &info);
+                            }
+                            let msg = t("settings.hw_service_done");
+                            self.status(msg, false);
+                            self.completed(msg);
+                        }
+                        Err(e) => self.status(&crate::i18n::error_message(&e), true),
+                    },
                     AuxResult::DefaultsDetected(result) => match result {
                         Ok(record) => {
                             self.apply_detected_defaults(record);
@@ -1481,6 +1616,9 @@ impl Host {
                         }
                         Err(e) => self.status(&crate::i18n::error_message(&e), true),
                     },
+                    AuxResult::PluginsLoaded(scanned, highlight_id, _) => {
+                        self.apply_loaded_plugins(scanned, highlight_id);
+                    }
                 }
             }
         }
@@ -1533,39 +1671,52 @@ impl Host {
             return;
         };
         let d = w.global::<Workbench>();
+        macro_rules! set_str_if_changed {
+            ($get:ident, $set:ident, $val:expr) => {{
+                let val: String = $val;
+                if d.$get().as_str() != val.as_str() {
+                    d.$set(val.into());
+                }
+            }};
+        }
         let number = |value: Option<f64>, unit: &str| {
             value.map_or_else(
-                || t("common.unavailable").into(),
+                || t("common.unavailable").to_owned(),
                 |v| format!("{} {unit}", crate::i18n::number(&format!("{v:.1}"))),
             )
         };
-        d.set_identity(
+        set_str_if_changed!(
+            get_identity,
+            set_identity,
             format!(
                 "{} · {} · BIOS {}",
                 s.inventory.model, s.inventory.board, s.inventory.bios
             )
-            .into(),
         );
-        d.set_gpu_name(
+        set_str_if_changed!(
+            get_gpu_name,
+            set_gpu_name,
             s.gpu
                 .as_ref()
                 .map_or_else(|| s.inventory.gpus.join(" · "), |g| g.name.clone())
-                .into(),
         );
-        d.set_gpu_power(number(s.gpu.as_ref().and_then(|g| g.power_w), "W").into());
-        d.set_gpu_temp(
+        set_str_if_changed!(
+            get_gpu_power,
+            set_gpu_power,
+            number(s.gpu.as_ref().and_then(|g| g.power_w), "W")
+        );
+        set_str_if_changed!(
+            get_gpu_temp,
+            set_gpu_temp,
             number(
                 s.gpu.as_ref().and_then(|g| g.temperature_c.map(f64::from)),
                 "°C",
             )
-            .into(),
         );
-        d.set_gpu_clock(
-            number(
-                s.gpu.as_ref().and_then(|g| g.clock_mhz.map(f64::from)),
-                "MHz",
-            )
-            .into(),
+        set_str_if_changed!(
+            get_gpu_clock,
+            set_gpu_clock,
+            telemetry::format_gpu_clock_mhz(s.gpu.as_ref().and_then(|g| g.clock_mhz))
         );
         let gpu_tgp = match s.gpu.as_ref() {
             Some(g) => match (g.enforced_limit_w, g.maximum_limit_w.or(g.default_limit_w)) {
@@ -1579,28 +1730,47 @@ impl Host {
             },
             None => String::new(),
         };
-        d.set_gpu_tgp(gpu_tgp.into());
-        d.set_cpu_name(s.inventory.cpus.join(" · ").into());
-        d.set_cpu_power(number(s.cpu.as_ref().and_then(|c| c.package_power_w), "W").into());
-        d.set_cpu_temp(number(s.cpu.as_ref().and_then(|c| c.temperature_c), "°C").into());
-        d.set_cpu_load(crate::dashboard::cpu_load_line(s).into());
+        set_str_if_changed!(get_gpu_tgp, set_gpu_tgp, gpu_tgp);
+        set_str_if_changed!(get_cpu_name, set_cpu_name, s.inventory.cpus.join(" · "));
+        set_str_if_changed!(
+            get_cpu_power,
+            set_cpu_power,
+            number(s.cpu.as_ref().and_then(|c| c.package_power_w), "W")
+        );
+        set_str_if_changed!(
+            get_cpu_temp,
+            set_cpu_temp,
+            number(s.cpu.as_ref().and_then(|c| c.temperature_c), "°C")
+        );
+        set_str_if_changed!(
+            get_cpu_load,
+            set_cpu_load,
+            crate::dashboard::cpu_load_line(s)
+        );
         let chassis_temp = match (s.chassis_temp_c, s.chassis_max_temp_c) {
             (Some(ir_c), Some(limit_c)) => tf("ui.chassis_ir_line", &[&ir_c, &limit_c]),
             (Some(ir_c), None) => tf("ui.chassis_ir_only", &[&ir_c]),
             _ => String::new(),
         };
-        d.set_chassis_temp(chassis_temp.into());
-        d.set_cpu_source(crate::dashboard::cpu_detail(s).into());
-        d.set_sensor_details(
+        set_str_if_changed!(get_chassis_temp, set_chassis_temp, chassis_temp);
+        set_str_if_changed!(
+            get_cpu_source,
+            set_cpu_source,
+            crate::dashboard::cpu_detail(s)
+        );
+        set_str_if_changed!(
+            get_sensor_details,
+            set_sensor_details,
             s.warnings
                 .iter()
                 .chain(s.inventory.warnings.iter())
                 .map(|w| crate::i18n::message(w))
                 .collect::<Vec<_>>()
                 .join("\n")
-                .into(),
         );
-        d.set_power_source(
+        set_str_if_changed!(
+            get_power_source,
+            set_power_source,
             format!(
                 "{}{}",
                 t(if s.power.ac_connected == Some(true) {
@@ -1614,8 +1784,12 @@ impl Host {
                     .battery_percent
                     .map_or_else(String::new, |p| format!(" · {p} %"))
             )
-            .into(),
         );
+        if self.test {
+            self.telemetry.borrow_mut().seed_test_history(&w, s);
+        } else {
+            self.telemetry.borrow_mut().push_snapshot(&w, s);
+        }
     }
     fn show_settings(&self, s: settings::Snapshot, saved: bool) {
         let Some(w) = self.window.upgrade() else {
@@ -1631,6 +1805,9 @@ impl Host {
         d.set_autostart(s.run_entry.is_some());
         d.set_start_in_tray(s.options.start_in_tray);
         d.set_close_index(i32::from(!s.options.close_to_tray));
+        d.set_poll_rate_index(glph_core::app_settings::telemetry_poll_index(
+            s.options.telemetry_poll_ms,
+        ) as i32);
         d.set_hold_preset(s.options.hold_preset);
         d.set_gpu_tgp_max_w(s.gpu_tgp_max_w.to_string().into());
         d.set_gpu_tgp_max_error("".into());
@@ -1642,6 +1819,11 @@ impl Host {
             self.update_fields();
         }
         if saved {
+            if !self.test {
+                let _ = self
+                    .tx
+                    .send(ui::Request::PollInterval(s.options.telemetry_poll_ms));
+            }
             self.status(
                 t(
                     if crate::i18n::preference_code(s.options.language)
@@ -1667,26 +1849,18 @@ impl Host {
         let raw = w.global::<Workbench>().get_gpu_tgp_max_w();
         let trimmed = raw.trim();
         let value = trimmed.parse::<u32>().map_err(|_| {
-            omen_core::message::msg(
+            glph_core::message::msg(
                 "settings.invalid_gpu_tgp_max",
                 &[
-                    &omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
-                    &omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
+                    &glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_MIN_W,
+                    &glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_HARD_MAX_W,
                 ],
             )
         })?;
         settings::validate_gpu_tgp_max_w(value)?;
         Ok(value)
     }
-    fn settings_target(
-        &self,
-    ) -> Option<(
-        settings::Snapshot,
-        omen_core::app_settings::AppSettings,
-        omen_core::appearance::Appearance,
-        u32,
-        bool,
-    )> {
+    pub(super) fn settings_draft_state(&self) -> Option<SettingsDraftState> {
         let w = self.window.upgrade()?;
         let d = w.global::<Workbench>();
         let base = self.baseline_settings.borrow().clone()?;
@@ -1698,17 +1872,15 @@ impl Host {
         };
         options.start_in_tray = d.get_start_in_tray();
         options.close_to_tray = d.get_close_index() == 0;
+        options.telemetry_poll_ms = glph_core::app_settings::telemetry_poll_from_index(
+            d.get_poll_rate_index().max(0) as usize,
+        );
         options.hold_preset = d.get_hold_preset();
-        let gpu_tgp_max_w = match self.parse_gpu_tgp_max_w() {
-            Ok(v) => {
-                d.set_gpu_tgp_max_error("".into());
-                v
-            }
-            Err(e) => {
-                d.set_gpu_tgp_max_error(crate::i18n::error_message(&e).into());
-                return None;
-            }
-        };
+        let gpu_tgp_max_w = self.parse_gpu_tgp_max_w();
+        match &gpu_tgp_max_w {
+            Ok(_) => d.set_gpu_tgp_max_error("".into()),
+            Err(e) => d.set_gpu_tgp_max_error(crate::i18n::error_message(e).into()),
+        }
         Some((
             base,
             options,
@@ -1716,6 +1888,18 @@ impl Host {
             gpu_tgp_max_w,
             d.get_autostart(),
         ))
+    }
+    fn settings_target(
+        &self,
+    ) -> Option<(
+        settings::Snapshot,
+        glph_core::app_settings::AppSettings,
+        glph_core::appearance::Appearance,
+        u32,
+        bool,
+    )> {
+        let (base, options, appearance, gpu_tgp_max_w, startup) = self.settings_draft_state()?;
+        Some((base, options, appearance, gpu_tgp_max_w.ok()?, startup))
     }
     fn save_settings(&self) {
         if let Some((base, options, appearance, gpu_tgp_max_w, startup)) = self.settings_target() {
@@ -1757,25 +1941,34 @@ impl Host {
                 }
                 return;
             }
-            self.send_aux(Aux::SaveSettings(
+            self.send_aux(Aux::SaveSettings(Box::new(SaveSettingsRequest {
                 base,
                 options,
                 appearance,
                 gpu_tgp_max_w,
                 startup,
-            ));
+            })));
         }
     }
     fn settings_dirty(&self) -> bool {
-        self.settings_target()
-            .is_some_and(|(base, options, appearance, gpu_tgp_max_w, startup)| {
+        self.settings_draft_state().is_some_and(
+            |(base, options, appearance, gpu_tgp_max_w, startup)| {
                 base.options != options
                     || base.appearance != appearance
-                    || base.gpu_tgp_max_w != gpu_tgp_max_w
+                    || gpu_tgp_max_w != Ok(base.gpu_tgp_max_w)
                     || base.run_entry.is_some() != startup
-            })
+            },
+        )
     }
 }
+
+pub(super) type SettingsDraftState = (
+    settings::Snapshot,
+    glph_core::app_settings::AppSettings,
+    glph_core::appearance::Appearance,
+    Result<u32, String>,
+    bool,
+);
 
 unsafe extern "system" fn event_proc(
     hwnd: HWND,
@@ -1840,7 +2033,7 @@ unsafe extern "system" fn event_proc(
                 let event = crate::power_events::decode(wparam as u32, lparam);
                 // Firmware and other tools often reset limits around these
                 // events; one debounced check follows the last of them.
-                if event.is_some_and(omen_core::power::Event::may_reset_controls) {
+                if event.is_some_and(glph_core::power::Event::may_reset_controls) {
                     crate::preset_hold::nudge();
                 }
                 if let Some(e) = event
@@ -2003,11 +2196,11 @@ pub fn run(
         test_settings
             .as_ref()
             .and_then(|s| s.gpu_tgp_max_w().ok())
-            .unwrap_or(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W)
+            .unwrap_or(glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W)
     } else {
         ProfileStore::user_data()
             .and_then(|s| s.gpu_tgp_max_w())
-            .unwrap_or(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W)
+            .unwrap_or(glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W)
     };
     let host = Rc::new(Host {
         fan_library: Default::default(),
@@ -2045,6 +2238,10 @@ pub fn run(
         lighting_draft: RefCell::new(None),
         lighting_attempted: Cell::new(test),
         curve: RefCell::new(None),
+        curve_nodes: Rc::new(VecModel::default()),
+        curve_x_ticks: Rc::new(VecModel::default()),
+        curve_y_ticks: Rc::new(VecModel::default()),
+        curve_point_labels: Rc::new(VecModel::default()),
         gpu_draft: RefCell::new(None),
         fan_draft: RefCell::new(None),
         tray: Default::default(),
@@ -2059,7 +2256,7 @@ pub fn run(
         loading_presets: Cell::new(false),
         appearance_draft: Default::default(),
         appearance_tokens: Cell::new(
-            omen_core::appearance::Colors::default()
+            glph_core::appearance::Colors::default()
                 .tokens()
                 .expect("Valid built-in palette"),
         ),
@@ -2075,18 +2272,48 @@ pub fn run(
         surface_timer: Default::default(),
         drain: Default::default(),
         plugins: RefCell::new(plugins::PluginHostState::default()),
+        telemetry: RefCell::new(telemetry::TelemetryUiState::new()),
         self_rc: RefCell::new(None),
     });
     *host.self_rc.borrow_mut() = Some(Rc::downgrade(&host));
+    host.telemetry.borrow().attach(&window);
+    let initial_poll_ms = if test {
+        host.test_settings
+            .as_ref()
+            .and_then(|s| s.app_settings().ok())
+            .map_or(glph_core::app_settings::TELEMETRY_POLL_DEFAULT_MS, |s| {
+                s.telemetry_poll_ms
+            })
+    } else {
+        ProfileStore::user_data()
+            .and_then(|s| s.app_settings())
+            .map_or(glph_core::app_settings::TELEMETRY_POLL_DEFAULT_MS, |s| {
+                s.telemetry_poll_ms
+            })
+    };
     {
         let p = host.plugins.borrow();
         let d = window.global::<Workbench>();
         d.set_plugins(p.rows_model.clone().into());
         d.set_plugin_nav_items(p.nav_model.clone().into());
+        d.set_nodes(host.curve_nodes.clone().into());
+        d.set_x_ticks(host.curve_x_ticks.clone().into());
+        d.set_y_ticks(host.curve_y_ticks.clone().into());
+        d.set_point_labels(host.curve_point_labels.clone().into());
         d.set_settings_tab_dirty(Rc::new(VecModel::from(vec![false, false, false, false])).into());
+        d.set_poll_rate_choices(strings(
+            glph_core::app_settings::TELEMETRY_POLL_OPTIONS_MS
+                .iter()
+                .map(|&ms| glph_core::app_settings::telemetry_poll_label(ms).to_owned()),
+        ));
+        d.set_poll_rate_index(
+            glph_core::app_settings::telemetry_poll_index(initial_poll_ms) as i32,
+        );
     }
     window.global::<Theme>().set_reduce_motion(test);
-    host.load_plugins(None);
+    if test {
+        host.load_plugins(None);
+    }
     let initial_appearance = if test {
         host.test_settings
             .as_ref()
@@ -2127,7 +2354,7 @@ pub fn run(
         CreateWindowExW(
             0,
             class.as_ptr(),
-            crate::native_ui::wide(omen_core::APP_NAME).as_ptr(),
+            crate::native_ui::wide(glph_core::APP_NAME).as_ptr(),
             WS_OVERLAPPED,
             0,
             0,
@@ -2167,7 +2394,7 @@ pub fn run(
             let binding = test_view(None, &[]).binding;
             (1..=24)
                 .map(|i| PerformanceProfile {
-                    schema: omen_core::profiles::PROFILE_SCHEMA,
+                    schema: glph_core::profiles::PROFILE_SCHEMA,
                     id: format!("ui-long-{i}"),
                     name: tf("ui.test_long_preset", &[&i]),
                     binding: binding.clone(),
@@ -2206,7 +2433,7 @@ pub fn run(
                     .as_ref()
                     .map(|s| s.gpu_tgp_max_w())
                     .transpose()?
-                    .unwrap_or(omen_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W),
+                    .unwrap_or(glph_core::profiles::GPU_DYNAMIC_BOOST_LIMIT_DEFAULT_MAX_W),
                 run_entry: None,
             },
             false,
@@ -2215,7 +2442,7 @@ pub fn run(
         let notify = hwnd as usize;
         workers.push(thread::spawn(move || {
             *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(Snapshot {
-                inventory: omen_core::Inventory {
+                inventory: glph_core::Inventory {
                     model: t("ui.test_device").into(),
                     board: "TEST".into(),
                     bios: "TEST".into(),
@@ -2223,22 +2450,42 @@ pub fn run(
                     gpus: vec![format!("GPU · {}", t("ui.test_data"))],
                     ..Default::default()
                 },
-                gpu: Some(omen_core::GpuSample {
+                gpu: Some(glph_core::GpuSample {
                     name: format!("GPU · {}", t("ui.test_data")),
                     temperature_c: Some(64),
-                    clock_mhz: Some(2490),
-                    power_w: Some(92.4),
+                    clock_mhz: Some(2115),
+                    power_w: Some(87.0),
+                    utilization_percent: Some(78),
                     enforced_limit_w: Some(135.0),
                     default_limit_w: Some(135.0),
                     maximum_limit_w: Some(135.0),
                     warnings: vec![],
                 }),
-                cpu: Some(omen_core::CpuSample {
-                    busy_percent: Some(38.5),
-                    package_power_w: Some(45.0),
-                    temperature_c: Some(68.5),
+                cpu: Some(glph_core::CpuSample {
+                    busy_percent: Some(34.0),
+                    package_power_w: Some(48.0),
+                    temperature_c: Some(72.0),
+                    hardware: Some(glph_core::CpuHardwareSample {
+                        schema: 1,
+                        source: glph_core::CpuHardwareSource::PawnioAmdRapl,
+                        temperature_kind: glph_core::CpuTemperatureKind::AmdTctl,
+                        package_power_w: Some(48.0),
+                        temperature_c: Some(72.0),
+                        power_interval_ms: Some(1000),
+                        effective_clocks: Some(glph_core::cpu::CpuEffectiveClocks {
+                            source: glph_core::cpu::CpuClockSource::AmdAperfReadOnly,
+                            logical_processor_count: 1,
+                            processors: vec![glph_core::cpu::CpuLogicalClock {
+                                logical_processor: 0,
+                                effective_mhz: 3840.0,
+                                interval_ms: 1000,
+                            }],
+                        }),
+                        warnings: vec![],
+                    }),
                     ..Default::default()
                 }),
+                cpu_hardware_status: glph_core::CpuHardwareStatus::Active,
                 chassis_temp_c: Some(37),
                 chassis_max_temp_c: Some(50),
                 ..Default::default()
@@ -2271,7 +2518,7 @@ pub fn run(
         // test mode never writes hardware.
         let queue = host.apply.automatic();
         let test = host.test;
-        let submit: Box<dyn Fn(omen_core::battery::Switch) -> bool + Send> =
+        let submit: Box<dyn Fn(glph_core::battery::Switch) -> bool + Send> =
             Box::new(move |switch| test || queue.submit(switch));
         workers.push(thread::spawn(move || {
             ui::worker(
@@ -2285,10 +2532,12 @@ pub fn run(
                 Some(submit),
             )
         }));
+        let _ = host.tx.send(ui::Request::PollInterval(initial_poll_ms));
         let raw = hwnd as usize;
         workers.push(thread::spawn(move || preset_ui::worker(raw, presets, ptx)));
         let raw = hwnd as usize;
         workers.push(thread::spawn(move || aux_worker(raw, auxq, atx)));
+        let _ = host.aux.send(Aux::LoadPlugins(None, true));
         thread::spawn(crate::autostart::migrate);
         crate::preset_hold::spawn();
         crate::fan_watch::spawn();
@@ -2467,7 +2716,7 @@ pub fn run(
 /// All tool-entry commands activate the same Slint shell, retaining drafts.
 pub fn entry(page: i32, selected: Option<String>) -> Result<(), String> {
     if let Some(id) = &selected {
-        omen_core::profiles::validate_id(id)?;
+        glph_core::profiles::validate_id(id)?;
     }
     if crate::single_instance::running(ui::KIND) {
         crate::single_instance::activate(ui::CLASS, true);
@@ -2511,7 +2760,7 @@ fn test_view(id: Option<&str>, profiles: &[PerformanceProfile]) -> preset_ui::Vi
     } else {
         0
     };
-    let defaults_record = omen_core::device_defaults::resolve_defaults("TEST", "TEST", None);
+    let defaults_record = glph_core::device_defaults::resolve_defaults("TEST", "TEST", None);
     let defaults = defaults_record.map();
     preset_ui::View {
         profiles: profiles.to_vec(),
@@ -2527,9 +2776,9 @@ fn test_view(id: Option<&str>, profiles: &[PerformanceProfile]) -> preset_ui::Vi
         },
         defaults,
         defaults_record,
-        curve: Ok(omen_core::vf::VfState {
+        curve: Ok(glph_core::vf::VfState {
             nodes: (0..80)
-                .map(|i| omen_core::vf::VfNode {
+                .map(|i| glph_core::vf::VfNode {
                     index: i,
                     voltage_uv: 450000 + u32::from(i) * 10000,
                     frequency_khz: 400000 + u32::from(i) * 30000 + applied_delta as u32,
@@ -2568,6 +2817,15 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
     }
     {
         let h = h.clone();
+        let weak = w.as_weak();
+        w.global::<TelemetryState>().on_select_window(move |index| {
+            if let Some(w) = weak.upgrade() {
+                h.telemetry.borrow_mut().select_window(&w, index);
+            }
+        });
+    }
+    {
+        let h = h.clone();
         d.on_show_about(move || h.show_about());
     }
     macro_rules! callback {($method:ident,|$host:ident $(,$arg:ident)*|$body:block)=>{{let $host=h.clone();d.$method(move|$($arg),*|$body);}};}
@@ -2585,6 +2843,9 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
     });
     callback!(on_palette_changed, |h, index| {
         h.select_palette(index);
+    });
+    callback!(on_look_changed, |h, channel, index| {
+        h.select_look(channel, index);
     });
     callback!(on_colors_changed, |h| {
         h.edit_colors();
@@ -2611,8 +2872,13 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
         h.update_field(index as usize);
     });
     callback!(on_slider_field, |h, index, watts| {
+        let scale = preset_fields::fields()
+            .get(index as usize)
+            .map_or(1, |f| f.scale());
+        let rounded = watts.round() as i64;
         if let Some(row) = h.fields.borrow_mut().get_mut(index as usize) {
-            row.text = format!("{}", watts.round() as i64);
+            row.value = Value::Integer(rounded * scale);
+            row.text = format!("{rounded}");
         }
         h.dirty();
         h.update_field(index as usize);
@@ -2678,7 +2944,7 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
     });
     callback!(on_reset_preset, |h| {
         let view = h.view.borrow();
-        let mut reset_cores = omen_core::device_defaults::zero_per_core(16);
+        let mut reset_cores = glph_core::device_defaults::zero_per_core(16);
         for (field, row) in preset_fields::fields()
             .iter()
             .zip(h.fields.borrow_mut().iter_mut())
@@ -2691,7 +2957,7 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
             row.included = matches!(row.value, Value::Boolean(true));
             row.text = match &row.value {
                 Value::Integer(v) => {
-                    crate::i18n::number(&omen_core::preset::format_number(*v, field.scale()))
+                    crate::i18n::number(&glph_core::preset::format_number(*v, field.scale()))
                 }
                 Value::PerCore(cores) if !cores.is_empty() => {
                     reset_cores = cores.clone();
@@ -2789,7 +3055,7 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
             x,
             y,
             (w, ht),
-            omen_core::curve_input::Modifiers { shift, ctrl, alt },
+            glph_core::curve_input::Modifiers { shift, ctrl, alt },
         );
     });
     callback!(on_chart_wheel, |h, dx, dy, x, y, shift, ctrl| {
@@ -2902,10 +3168,68 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
             h.send_aux(Aux::Lighting(None));
         }
     });
+    callback!(on_select_omen_mode, |h, index| {
+        if let Some(w) = h.window.upgrade() {
+            w.global::<Workbench>()
+                .set_omen_mode_index(index.clamp(0, 3));
+        }
+    });
+    callback!(on_reset_omen_unleashed, |h| {
+        if let Some(w) = h.window.upgrade() {
+            let defaults = glph_core::hp_mode::HpUnleashedOptions::default();
+            let d = w.global::<Workbench>();
+            d.set_omen_unleashed_pl1(i32::from(defaults.cpu_pl1_w));
+            d.set_omen_unleashed_tpp(i32::from(defaults.shared_budget_w));
+            d.set_omen_unleashed_gps(i32::from(defaults.gpu_max_temp_c));
+            d.set_omen_unleashed_ctgp(defaults.custom_tgp);
+            d.set_omen_unleashed_ppab(defaults.dynamic_boost);
+        }
+    });
+    callback!(on_apply_omen_mode, |h| {
+        let Some(w) = h.window.upgrade() else { return };
+        let d = w.global::<Workbench>();
+        let mode_label = match d.get_omen_mode_index() {
+            0 => t("mode.quiet"),
+            1 => t("mode.balanced"),
+            2 => t("mode.performance"),
+            3 => t("mode.unleashed"),
+            _ => return,
+        };
+        let active_preset_name = ProfileStore::user_data()
+            .ok()
+            .and_then(|s| s.ac_selection())
+            .and_then(|sel| match sel {
+                glph_core::battery::Selection::Preset(id) => h
+                    .profiles
+                    .borrow()
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone()),
+                _ => None,
+            });
+        let prompt = match active_preset_name {
+            Some(name) => tf("omen.confirm_overwrite_named", &[&name, &mode_label]),
+            None => tf("omen.confirm_overwrite", &[&mode_label]),
+        };
+        d.set_plugin_confirm_text(prompt.into());
+        d.set_confirm_kind(9);
+    });
     callback!(on_hp_service, |h| {
         h.status(t("ui.hp_explicit"), false);
         if let Some(w) = h.window.upgrade() {
             h.send_aux(Aux::HpService(!w.global::<Workbench>().get_hp_disabled()));
+        }
+    });
+    callback!(on_hw_service_action, |h, action| {
+        let parsed = match action.as_str() {
+            "install" => Some(crate::elevation::ServiceAction::Install),
+            "start" => Some(crate::elevation::ServiceAction::Start),
+            "stop" => Some(crate::elevation::ServiceAction::Stop),
+            "remove" => Some(crate::elevation::ServiceAction::Remove),
+            _ => None,
+        };
+        if let Some(cmd) = parsed {
+            h.send_aux(Aux::HardwareService(cmd));
         }
     });
     callback!(on_detect_defaults, |h| {
@@ -2964,6 +3288,31 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
             }
             7 => h.confirm_replace_plugin(),
             8 => h.confirm_remove_plugin(),
+            9 => {
+                let index = d.get_omen_mode_index();
+                match index {
+                    0 => h.send_control(ui::ControlRequest::ApplyMode(
+                        glph_core::hp_mode::HpMode::Quiet,
+                    )),
+                    1 => h.send_control(ui::ControlRequest::ApplyMode(
+                        glph_core::hp_mode::HpMode::Balanced,
+                    )),
+                    2 => h.send_control(ui::ControlRequest::ApplyMode(
+                        glph_core::hp_mode::HpMode::Performance,
+                    )),
+                    3 => {
+                        let opts = glph_core::hp_mode::HpUnleashedOptions {
+                            cpu_pl1_w: d.get_omen_unleashed_pl1().clamp(45, 95) as u8,
+                            shared_budget_w: d.get_omen_unleashed_tpp().clamp(30, 72) as u8,
+                            custom_tgp: d.get_omen_unleashed_ctgp(),
+                            dynamic_boost: d.get_omen_unleashed_ppab(),
+                            gpu_max_temp_c: d.get_omen_unleashed_gps().clamp(65, 87) as u8,
+                        };
+                        h.send_control(ui::ControlRequest::ApplyUnleashed(opts));
+                    }
+                    _ => {}
+                }
+            }
             _ => (),
         }
     });
@@ -2975,7 +3324,7 @@ mod tests {
     #[test]
     fn battery_choices_are_other_presets_the_template_and_the_stored_choice() {
         let preset = |id: &str| PerformanceProfile {
-            schema: omen_core::profiles::PROFILE_SCHEMA,
+            schema: glph_core::profiles::PROFILE_SCHEMA,
             id: id.into(),
             name: id.into(),
             binding: test_view(None, &[]).binding,

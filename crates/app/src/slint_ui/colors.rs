@@ -1,6 +1,6 @@
 //! Shared local color editor. Acceptance changes a UI draft, never hardware.
 use super::*;
-use omen_core::{
+use glph_core::{
     appearance::{PalettePreset, parse_hex},
     color::{Hsv, SWATCHES, hex},
 };
@@ -43,7 +43,8 @@ impl Host {
                         _ => t("settings.custom"),
                     }
                     .into(),
-                    canvas: color(parse_hex(&c.background).unwrap_or([32, 33, 39])),
+                    canvas: color(parse_hex(&c.background).unwrap_or([24, 25, 31])),
+                    nav: color(parse_hex(&c.nav_background).unwrap_or([34, 36, 45])),
                     ink: color(parse_hex(&c.foreground).unwrap_or([242, 243, 245])),
                     accent: color(parse_hex(&c.accent).unwrap_or([124, 135, 248])),
                 }
@@ -61,11 +62,29 @@ impl Host {
         d.set_background_preview(color(
             parse_hex(d.get_color_background().as_str()).unwrap_or(fallback.canvas),
         ));
+        d.set_nav_background_preview(color(
+            parse_hex(d.get_color_nav_background().as_str()).unwrap_or(fallback.nav),
+        ));
         d.set_foreground_preview(color(
             parse_hex(d.get_color_foreground().as_str()).unwrap_or(fallback.ink),
         ));
         d.set_accent_preview(color(
             parse_hex(d.get_color_accent().as_str()).unwrap_or(fallback.accent),
+        ));
+        d.set_background_secondary_preview(color(
+            parse_hex(d.get_color_background_secondary().as_str())
+                .unwrap_or(fallback.canvas_secondary),
+        ));
+        d.set_nav_background_secondary_preview(color(
+            parse_hex(d.get_color_nav_background_secondary().as_str())
+                .unwrap_or(fallback.nav_secondary),
+        ));
+        d.set_foreground_secondary_preview(color(
+            parse_hex(d.get_color_foreground_secondary().as_str())
+                .unwrap_or(fallback.ink_secondary),
+        ));
+        d.set_accent_secondary_preview(color(
+            parse_hex(d.get_color_accent_secondary().as_str()).unwrap_or(fallback.accent_secondary),
         ));
         self.palette_choices();
     }
@@ -78,11 +97,16 @@ impl Host {
         };
         let d = w.global::<Workbench>();
         let (rgb, title) = match target {
-            0..=2 if d.get_settings_ready() => {
+            0..=2 | 4..=8 if d.get_settings_ready() => {
                 let text = match target {
                     0 => d.get_color_background(),
                     1 => d.get_color_foreground(),
-                    _ => d.get_color_accent(),
+                    2 => d.get_color_accent(),
+                    4 => d.get_color_background_secondary(),
+                    5 => d.get_color_foreground_secondary(),
+                    6 => d.get_color_accent_secondary(),
+                    7 => d.get_color_nav_background(),
+                    _ => d.get_color_nav_background_secondary(),
                 };
                 let rgb = parse_hex(text.as_str()).unwrap_or([255; 3]);
                 (
@@ -90,7 +114,9 @@ impl Host {
                     t(match target {
                         0 => "settings.background",
                         1 => "settings.foreground",
-                        _ => "settings.accent",
+                        2 => "settings.accent",
+                        7 => "settings.nav_background",
+                        _ => "settings.gradient_second_color",
                     }),
                 )
             }
@@ -208,9 +234,14 @@ impl Host {
                     self.edit_lighting_color(&text);
                     self.draw_lighting(true);
                 }
+                4 => d.set_color_background_secondary(text.clone().into()),
+                5 => d.set_color_foreground_secondary(text.clone().into()),
+                6 => d.set_color_accent_secondary(text.clone().into()),
+                7 => d.set_color_nav_background(text.clone().into()),
+                8 => d.set_color_nav_background_secondary(text.clone().into()),
                 _ => (),
             }
-            if p.target < 3 {
+            if p.target != 3 {
                 self.edit_colors();
                 self.sync_color_fields();
             }

@@ -5,7 +5,7 @@
 //! its DriverStore package is accepted; no other service or driver.
 use super::{Service, State, state};
 use crate::profile_store::ProfileStore;
-use omen_core::message::msg;
+use glph_core::message::msg;
 use serde::Serialize;
 use std::{
     path::Path,
@@ -37,7 +37,9 @@ pub fn oem_service() -> Result<Option<OemService>, String> {
 
 /// Stops and disables HPOmenCap, or restores its start type and starts it.
 pub fn set_oem_service_disabled(disable: bool) -> Result<OemService, String> {
-    if let Ok(Some(_)) = super::recovery_record() {
+    if let Ok(Some(record)) = super::recovery_record()
+        && !record.phase.complete()
+    {
         return Err(msg("hp_service.session_active", &[]));
     }
     if !disable {

@@ -110,7 +110,7 @@ struct StartupAuthorization {
     user_sid: String,
     profile_id: String,
     profile_digest: String,
-    binding: omen_core::profiles::DeviceBinding,
+    binding: glph_core::profiles::DeviceBinding,
     binary_sha256: String,
 }
 
@@ -126,7 +126,7 @@ fn authorization_path(installation: &StartupInstallation) -> Result<PathBuf, Str
 /// installer protects this directory: an unelevated process cannot forge a new
 /// profile approval by editing its user-writable selection or journal files.
 pub fn authorize_startup_profile(
-    profile: &omen_core::profiles::PerformanceProfile,
+    profile: &glph_core::profiles::PerformanceProfile,
 ) -> Result<(), String> {
     let installation = verify_startup_installation()?;
     let record = StartupAuthorization {
@@ -142,7 +142,7 @@ pub fn authorize_startup_profile(
 }
 
 pub fn verify_startup_profile(
-    profile: &omen_core::profiles::PerformanceProfile,
+    profile: &glph_core::profiles::PerformanceProfile,
 ) -> Result<(), String> {
     let installation = verify_startup_installation()?;
     let mut data = vec![];
@@ -262,22 +262,15 @@ impl Drop for Apartment {
 /// Whether any build of the logon fan service is installed (its receipt
 /// exists), even one that predates the current executable.
 pub fn fan_service_present() -> bool {
-    std::env::var_os("ProgramFiles").is_some_and(|files| {
-        current_user_sid().is_ok_and(|sid| {
-            PathBuf::from(files)
-                .join("OmenHubPlusPlus")
-                .join(format!("fan-service-{sid}.json"))
-                .is_file()
-        })
+    installation_root().is_ok_and(|root| {
+        current_user_sid().is_ok_and(|sid| root.join(format!("fan-service-{sid}.json")).is_file())
     })
 }
 /// Whether the logon fan service is installed from this exact build (receipt
 /// written by scripts/install-fan-service.ps1 in the protected directory).
 pub fn fan_service_installed() -> bool {
     (|| -> Result<bool, String> {
-        let root =
-            PathBuf::from(std::env::var_os("ProgramFiles").ok_or("Program Files unavailable")?)
-                .join("OmenHubPlusPlus");
+        let root = installation_root()?;
         let sid = current_user_sid()?;
         let mut bytes = vec![];
         File::open(root.join(format!("fan-service-{sid}.json")))
@@ -285,6 +278,9 @@ pub fn fan_service_installed() -> bool {
             .take(65537)
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
+        if bytes.len() > 65536 {
+            return Ok(false);
+        }
         let receipt: serde_json::Value =
             serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
                 .map_err(|e| e.to_string())?;
@@ -333,7 +329,7 @@ pub(super) fn installation_root() -> Result<PathBuf, String> {
         }
         let path = String::from_utf16(unsafe { std::slice::from_raw_parts(directory, count) })
             .map_err(|e| e.to_string())?;
-        Ok(PathBuf::from(path).join("OmenHubPlusPlus"))
+        Ok(PathBuf::from(path).join("GLPH"))
     })();
     unsafe {
         windows::Win32::System::Com::CoTaskMemFree(Some(directory.cast()));
@@ -361,8 +357,8 @@ pub(super) fn inspect_installed_binary(
     let sid = current_user_sid()?;
     if receipt.schema != 1
         || receipt.user_sid != sid
-        || receipt.task_name != format!("OmenHubPP-Profile-{sid}")
-        || receipt.executable != root.join("Omen Hub++.exe")
+        || receipt.task_name != format!("GLPH-Profile-{sid}")
+        || receipt.executable != root.join("glph.exe")
     {
         return Err("Startup installation identity/path differs".into());
     }

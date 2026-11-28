@@ -13,7 +13,7 @@ use super::{
     power_status, smu::Smu, windows_settings,
 };
 use crate::profile_store::ProfileStore;
-use omen_core::{
+use glph_core::{
     Inventory,
     battery::Selection,
     device_defaults::{
@@ -70,8 +70,8 @@ fn primary_cpu(inventory: &Inventory) -> &str {
     inventory.cpus.first().map(String::as_str).unwrap_or("")
 }
 
-fn mux_choice(mode: u8) -> Option<omen_core::profiles::Choice> {
-    use omen_core::profiles::Choice;
+fn mux_choice(mode: u8) -> Option<glph_core::profiles::Choice> {
+    use glph_core::profiles::Choice;
     match mode {
         0 => Some(Choice::Hybrid),
         1 => Some(Choice::DiscreteOnly),
@@ -273,7 +273,7 @@ pub fn discover_active_elevated(
     store: &ProfileStore,
 ) -> Result<DeviceDefaultsRecord, String> {
     if store.pending()? || store.fan_policy_pending()? {
-        return Err(omen_core::message::msg("store.err.pending_checkpoint", &[]));
+        return Err(glph_core::message::msg("store.err.pending_checkpoint", &[]));
     }
     let _lease = ControlLease::acquire_foreground()?;
     let existing = store.device_defaults_record(&inventory.board, &inventory.bios);

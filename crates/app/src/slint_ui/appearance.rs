@@ -16,6 +16,8 @@ pub(crate) fn paint(theme: Theme<'_>, tokens: Tokens) {
     theme.set_quiet(color(tokens.quiet));
     theme.set_accent(color(tokens.accent));
     theme.set_on_accent(color(tokens.on_accent));
+    theme.set_ui_accent(color(tokens.ui_accent));
+    theme.set_on_ui_accent(color(tokens.on_ui_accent));
 
     theme.set_nav(color(tokens.nav));
     theme.set_nav_dark(tokens.nav_dark);
@@ -35,26 +37,6 @@ pub(crate) fn paint(theme: Theme<'_>, tokens: Tokens) {
     theme.set_nav_secondary(color(tokens.nav_secondary));
     theme.set_ink_secondary(color(tokens.ink_secondary));
     theme.set_accent_secondary(color(tokens.accent_secondary));
-
-    theme.set_canvas_hi(color(tokens.canvas_hi));
-    theme.set_canvas_mid(color(tokens.canvas_mid));
-    theme.set_canvas_lo(color(tokens.canvas_lo));
-    theme.set_surface_hi(color(tokens.surface_hi));
-    theme.set_surface_mid(color(tokens.surface_mid));
-    theme.set_surface_lo(color(tokens.surface_lo));
-    theme.set_control_hi(color(tokens.control_hi));
-    theme.set_control_mid(color(tokens.control_mid));
-    theme.set_control_lo(color(tokens.control_lo));
-    theme.set_nav_hi(color(tokens.nav_hi));
-    theme.set_nav_mid(color(tokens.nav_mid));
-    theme.set_nav_lo(color(tokens.nav_lo));
-    theme.set_accent_hi(color(tokens.accent_hi));
-    theme.set_accent_mid(color(tokens.accent_mid));
-    theme.set_accent_lo(color(tokens.accent_lo));
-    theme.set_rim_hi(color(tokens.rim_hi));
-    theme.set_rim_lo(color(tokens.rim_lo));
-    theme.set_nav_rim_hi(color(tokens.nav_rim_hi));
-    theme.set_nav_rim_lo(color(tokens.nav_rim_lo));
 
     theme.set_chart_cpu(color(tokens.chart_cpu));
     theme.set_chart_gpu(color(tokens.chart_gpu));

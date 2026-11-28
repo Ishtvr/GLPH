@@ -54,33 +54,19 @@ export component BrightnessSlider inherits Rectangle {
         height: 4px;
         border-radius: 2px;
         clip: true;
-        background: Theme.accent-fill;
+        background: Theme.ui-accent;
         visible: root.show-fill;
     }
 
-    // Solid color thumb keeps crisp circular border-radius in both software & FemtoVG renderers,
-    // with an inner specular highlight dot for Metallic / Glass / Glossy / Neon looks.
     Rectangle {
         x: (parent.width - 16px) * root.fraction;
         y: (parent.height - 16px) / 2;
         width: 16px;
         height: 16px;
         border-radius: 8px;
-        background: root.enabled ? Theme.accent : Theme.quiet;
+        background: root.enabled ? Theme.ui-accent : Theme.quiet;
         border-width: focus.has-focus ? 2px : 1px;
-        border-color: focus.has-focus ? Theme.ink
-                    : root.enabled && (Theme.accent-look == 1 || Theme.accent-look == 2 || Theme.accent-look == 3 || Theme.accent-look == 6)
-                      ? Theme.accent-hi
-                    : Theme.accent;
-        Rectangle {
-            visible: root.enabled && (Theme.accent-look == 1 || Theme.accent-look == 2 || Theme.accent-look == 3 || Theme.accent-look == 6);
-            x: 4px;
-            y: 2px;
-            width: 8px;
-            height: 4px;
-            border-radius: 2px;
-            background: #FFFFFF70;
-        }
+        border-color: focus.has-focus ? Theme.ink : Theme.ui-accent;
     }
 
     area := TouchArea {
@@ -265,28 +251,14 @@ export component ToggleSwitch inherits Rectangle {
         border-radius: 11px;
         clip: true;
         border-width: 1px;
-        // Keep solid color base so pill corners remain razor-round in all renderers,
-        // layered with specular sheen strip for Metallic / Glass / Glossy / Neon looks.
         background: !root.enabled ? Theme.surface
-                  : root.checked ? Theme.accent
+                  : root.checked ? Theme.ui-accent
                   : area.has-hover ? Theme.hover : Theme.control;
         border-color: !root.enabled ? Theme.line
-                    : root.checked ? Theme.accent-border : Theme.control-border;
+                    : root.checked ? Theme.ui-accent : Theme.control-border;
         animate background {
             duration: Theme.reduce-motion ? 0ms : 150ms;
             easing: ease;
-        }
-
-        Rectangle {
-            visible: root.enabled && (root.checked
-                ? (Theme.accent-look == 1 || Theme.accent-look == 2 || Theme.accent-look == 3 || Theme.accent-look == 6)
-                : (Theme.background-look == 1 || Theme.background-look == 2 || Theme.background-look == 3 || Theme.background-look == 6));
-            x: 3px;
-            y: 1px;
-            width: parent.width - 6px;
-            height: 8px;
-            border-radius: 4px;
-            background: root.checked ? #FFFFFF38 : #FFFFFF20;
         }
 
         thumb := Rectangle {
@@ -296,7 +268,7 @@ export component ToggleSwitch inherits Rectangle {
             height: 16px;
             border-radius: 8px;
             background: !root.enabled ? Theme.quiet
-                      : root.checked ? Theme.on-accent : Theme.ink;
+                      : root.checked ? Theme.on-ui-accent : Theme.ink;
             animate x {
                 duration: Theme.reduce-motion ? 0ms : 160ms;
                 easing: cubic-bezier(0.23, 1, 0.32, 1);
@@ -354,16 +326,16 @@ export component CheckBox inherits Rectangle {
         height: 17px;
         border-radius: 4px;
         clip: true;
-        background: root.checked ? Theme.accent-fill : Theme.control-fill;
+        background: root.checked ? Theme.ui-accent : Theme.control-fill;
         border-width: 1px;
-        border-color: root.enabled ? (root.checked ? Theme.accent-border : Theme.control-border) : Theme.quiet;
+        border-color: root.enabled ? (root.checked ? Theme.ui-accent : Theme.control-border) : Theme.quiet;
         Path {
             visible: root.checked;
             x: 3px;
             y: 4px;
             width: 11px;
             height: 8px;
-            stroke: Theme.on-accent;
+            stroke: Theme.on-ui-accent;
             stroke-width: 1.8px;
             commands: "M 0 3 L 4 7 L 10 0";
         }

@@ -36,17 +36,17 @@ impl Host {
                 };
                 PaletteChoice {
                     name: match i {
-                        0 => "Slate",
+                        0 => t("settings.look_standard"),
                         1 => t("settings.graphite"),
                         2 => "Vesper",
                         3 => t("settings.light"),
                         _ => t("settings.custom"),
                     }
                     .into(),
-                    canvas: color(parse_hex(&c.background).unwrap_or([24, 25, 31])),
-                    nav: color(parse_hex(&c.nav_background).unwrap_or([34, 36, 45])),
+                    canvas: color(parse_hex(&c.background).unwrap_or([36, 36, 36])),
+                    nav: color(parse_hex(&c.nav_background).unwrap_or([0, 0, 0])),
                     ink: color(parse_hex(&c.foreground).unwrap_or([242, 243, 245])),
-                    accent: color(parse_hex(&c.accent).unwrap_or([124, 135, 248])),
+                    accent: color(parse_hex(&c.accent).unwrap_or([0, 0, 0])),
                 }
             })
             .collect::<Vec<_>>();

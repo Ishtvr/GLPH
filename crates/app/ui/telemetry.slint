@@ -60,8 +60,9 @@ component WindowPill inherits Rectangle {
     height: 24px;
     border-radius: 5px;
     background: root.active ? Theme.accent-fill : area.has-hover ? Theme.hover : transparent;
-    border-width: focus.has-focus ? 1px : 0px;
-    border-color: root.active ? Theme.on-accent : Theme.accent;
+    border-width: focus.has-focus ? 1px : root.active ? 1px : 0px;
+    border-color: focus.has-focus ? Theme.ui-accent : root.active ? Theme.accent-border : transparent;
+    animate background, border-color { duration: Theme.reduce-motion ? 0ms : 140ms; easing: ease-out; }
 
     label := Text {
         width: parent.width;

@@ -21,7 +21,7 @@ export component ActionButton inherits Rectangle {
     max-height: Theme.control-height;
     vertical-stretch: 0;
     horizontal-stretch: 0;
-    border-radius: 6px;
+    border-radius: 7px;
     clip: true;
     // Pressed text retains one of the validated foreground/background pairs.
     background: !root.enabled ? Theme.surface-fill
@@ -30,24 +30,11 @@ export component ActionButton inherits Rectangle {
               : area.has-hover ? Theme.control-hover-fill
               : Theme.control-fill;
     border-width: root.enabled && (area.pressed || focus.has-focus) ? 1.5px : Theme.card-border-width;
-    border-color: root.enabled && (area.pressed || focus.has-focus) ? (root.primary ? Theme.on-accent : Theme.accent)
-                : !root.enabled ? Theme.line.with-alpha(0.55)
+    border-color: root.enabled && (area.pressed || focus.has-focus) ? (root.primary ? Theme.on-accent : Theme.ui-accent)
+                : !root.enabled ? Theme.line.with-alpha(0.45)
                 : root.primary ? Theme.accent-border
                 : Theme.control-border;
-    animate background, border-color { duration: Theme.reduce-motion ? 0ms : 150ms; easing: ease-out; }
-
-    // 1px inner top specular rim for Glass / Glossy / Metallic / Neon looks
-    Rectangle {
-        visible: root.enabled;
-        x: 6px;
-        y: 1px;
-        width: max(0px, parent.width - 12px);
-        height: 1px;
-        background: root.primary
-            ? (Theme.accent-look == 1 || Theme.accent-look == 2 || Theme.accent-look == 3 || Theme.accent-look == 6
-                ? #FFFFFF66 : transparent)
-            : Theme.surface-top-sheen;
-    }
+    animate background, border-color { duration: Theme.reduce-motion ? 0ms : 140ms; easing: ease-out; }
 
     label := Text {
         x: 10px;
@@ -162,7 +149,7 @@ export component SegmentedTabs inherits Rectangle {
         background: index == root.selected ? Theme.control-hover-fill
                   : self.hovered && root.enabled ? Theme.control-fill
                   : transparent;
-        border-color: index == root.selected ? Theme.control-border : transparent;
+        border-color: transparent;
         accessible-item-selectable: true;
         accessible-item-selected: index == root.selected;
         clicked => { root.changed(index); }
@@ -342,8 +329,9 @@ export component StatusPill inherits Rectangle {
 
 export component SectionTitle inherits Text {
     color: Theme.ink-fill;
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 600;
+    letter-spacing: -0.25px;
     vertical-alignment: center;
     height: 32px;
 }
@@ -357,18 +345,12 @@ export component SectionHeader inherits Rectangle {
     accessible-label: root.text;
     accessible-action-default => { root.clicked(); }
     height: Theme.control-height;
-    background: Theme.surface-fill;
-    border-radius: 6px;
+    background: area.has-hover ? Theme.control-hover-fill : Theme.surface-fill;
+    border-radius: 7px;
     clip: true;
     border-width: focus.has-focus ? 1.5px : Theme.card-border-width;
-    border-color: focus.has-focus ? Theme.accent : Theme.surface-border;
-    Rectangle {
-        x: 6px;
-        y: 1px;
-        width: max(0px, parent.width - 12px);
-        height: 1px;
-        background: Theme.surface-top-sheen;
-    }
+    border-color: focus.has-focus ? Theme.ui-accent : Theme.surface-border;
+    animate background, border-color { duration: Theme.reduce-motion ? 0ms : 140ms; easing: ease-out; }
 
     HorizontalLayout {
         padding-left: 12px;
@@ -376,6 +358,7 @@ export component SectionHeader inherits Rectangle {
         Text {
             text: root.text;
             color: Theme.ink;
+            font-weight: 500;
             vertical-alignment: center;
             horizontal-stretch: 1;
         }
@@ -390,7 +373,7 @@ export component SectionHeader inherits Rectangle {
         }
     }
 
-    TouchArea {
+    area := TouchArea {
         clicked => { focus.focus(); root.clicked(); }
     }
 

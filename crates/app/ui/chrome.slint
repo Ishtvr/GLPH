@@ -42,14 +42,11 @@ export component NavigationItem inherits Rectangle {
     border-radius: 8px;
     clip: true;
     background: root.selected ? Theme.nav-selected-fill
-              : area.has-hover ? Theme.nav-hover
+              : area.has-hover ? Theme.nav-hover.with-alpha(0.55)
               : transparent;
-    border-width: focus.has-focus ? 1.5px : root.selected ? Theme.card-border-width : 1px;
-    border-color: focus.has-focus ? Theme.nav-accent
-                : root.selected ? Theme.nav-selected-border
-                : area.has-hover ? Theme.nav-line.with-alpha(0.55)
-                : transparent;
-    animate background, border-color { duration: Theme.reduce-motion ? 0ms : 150ms; easing: ease-out; }
+    border-width: focus.has-focus ? 1.5px : 0px;
+    border-color: focus.has-focus ? Theme.nav-accent : transparent;
+    animate background, border-color { duration: Theme.reduce-motion ? 0ms : 140ms; easing: ease-out; }
     accessible-role: button;
     accessible-label: root.text;
     accessible-enabled: root.enabled;

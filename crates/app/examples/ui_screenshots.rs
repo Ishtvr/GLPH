@@ -95,6 +95,8 @@ mod win {
         theme.set_quiet(color(tokens.quiet));
         theme.set_accent(color(tokens.accent));
         theme.set_on_accent(color(tokens.on_accent));
+        theme.set_ui_accent(color(tokens.ui_accent));
+        theme.set_on_ui_accent(color(tokens.on_ui_accent));
 
         theme.set_nav(color(tokens.nav));
         theme.set_nav_dark(tokens.nav_dark);
@@ -114,26 +116,6 @@ mod win {
         theme.set_nav_secondary(color(tokens.nav_secondary));
         theme.set_ink_secondary(color(tokens.ink_secondary));
         theme.set_accent_secondary(color(tokens.accent_secondary));
-
-        theme.set_canvas_hi(color(tokens.canvas_hi));
-        theme.set_canvas_mid(color(tokens.canvas_mid));
-        theme.set_canvas_lo(color(tokens.canvas_lo));
-        theme.set_surface_hi(color(tokens.surface_hi));
-        theme.set_surface_mid(color(tokens.surface_mid));
-        theme.set_surface_lo(color(tokens.surface_lo));
-        theme.set_control_hi(color(tokens.control_hi));
-        theme.set_control_mid(color(tokens.control_mid));
-        theme.set_control_lo(color(tokens.control_lo));
-        theme.set_nav_hi(color(tokens.nav_hi));
-        theme.set_nav_mid(color(tokens.nav_mid));
-        theme.set_nav_lo(color(tokens.nav_lo));
-        theme.set_accent_hi(color(tokens.accent_hi));
-        theme.set_accent_mid(color(tokens.accent_mid));
-        theme.set_accent_lo(color(tokens.accent_lo));
-        theme.set_rim_hi(color(tokens.rim_hi));
-        theme.set_rim_lo(color(tokens.rim_lo));
-        theme.set_nav_rim_hi(color(tokens.nav_rim_hi));
-        theme.set_nav_rim_lo(color(tokens.nav_rim_lo));
 
         theme.set_chart_cpu(color(tokens.chart_cpu));
         theme.set_chart_gpu(color(tokens.chart_gpu));
@@ -209,7 +191,7 @@ mod win {
                 };
                 PaletteChoice {
                     name: match i {
-                        0 => "Slate".into(),
+                        0 => tr(dict, "settings.look_standard").into(),
                         1 => tr(dict, "settings.graphite").into(),
                         2 => "Vesper".into(),
                         3 => tr(dict, "settings.light").into(),
@@ -842,72 +824,8 @@ mod win {
             &format!("{prefix}_keyboard_omen.png"),
         )?;
 
-        // 7. Full Material Showcase on Overview
+        // 7. Theme & Gradient Showcase on Overview
         let looks: &[(&str, Appearance)] = &[
-            (
-                "metallic",
-                Appearance {
-                    palette: PalettePreset::Custom,
-                    custom: Colors {
-                        background_look: ColorLook::Metallic,
-                        nav_background_look: ColorLook::Metallic,
-                        accent_look: ColorLook::Metallic,
-                        ..PalettePreset::Slate.colors()
-                    },
-                },
-            ),
-            (
-                "glass",
-                Appearance {
-                    palette: PalettePreset::Custom,
-                    custom: Colors {
-                        background_look: ColorLook::Glass,
-                        nav_background_look: ColorLook::Glass,
-                        accent_look: ColorLook::Glass,
-                        ..PalettePreset::Slate.colors()
-                    },
-                },
-            ),
-            (
-                "glossy",
-                Appearance {
-                    palette: PalettePreset::Custom,
-                    custom: Colors {
-                        background_look: ColorLook::Glossy,
-                        nav_background_look: ColorLook::Glossy,
-                        accent_look: ColorLook::Glossy,
-                        ..PalettePreset::Slate.colors()
-                    },
-                },
-            ),
-            (
-                "neon",
-                Appearance {
-                    palette: PalettePreset::Custom,
-                    custom: Colors {
-                        background: "#0B0D14".into(),
-                        nav_background: "#121521".into(),
-                        foreground: "#F2F4FA".into(),
-                        accent: "#2D57FF".into(),
-                        background_look: ColorLook::Neon,
-                        nav_background_look: ColorLook::Neon,
-                        accent_look: ColorLook::Neon,
-                        ..PalettePreset::Slate.colors()
-                    },
-                },
-            ),
-            (
-                "matte",
-                Appearance {
-                    palette: PalettePreset::Custom,
-                    custom: Colors {
-                        background_look: ColorLook::Matte,
-                        nav_background_look: ColorLook::Matte,
-                        accent_look: ColorLook::Matte,
-                        ..PalettePreset::Graphite.colors()
-                    },
-                },
-            ),
             (
                 "gradient",
                 Appearance {
@@ -916,10 +834,10 @@ mod win {
                         background_look: ColorLook::Gradient,
                         nav_background_look: ColorLook::Gradient,
                         accent_look: ColorLook::Gradient,
-                        background: "#141826".into(),
-                        background_secondary: "#231938".into(),
-                        nav_background: "#1A2034".into(),
-                        nav_background_secondary: "#121524".into(),
+                        background: "#1B1E28".into(),
+                        background_secondary: "#12131A".into(),
+                        nav_background: "#0B0C10".into(),
+                        nav_background_secondary: "#151924".into(),
                         accent: "#4F8BFF".into(),
                         accent_secondary: "#A855F7".into(),
                         ..PalettePreset::Slate.colors()
@@ -927,42 +845,24 @@ mod win {
                 },
             ),
             (
-                "light",
+                "graphite",
                 Appearance {
-                    palette: PalettePreset::Light,
+                    palette: PalettePreset::Graphite,
                     custom: Colors::default(),
                 },
             ),
             (
-                "oled_black",
+                "vesper",
                 Appearance {
-                    palette: PalettePreset::Custom,
-                    custom: Colors {
-                        background: "#000000".into(),
-                        nav_background: "#141826".into(),
-                        foreground: "#C5C8CE".into(),
-                        accent: "#2D57FF".into(),
-                        background_look: ColorLook::Glossy,
-                        nav_background_look: ColorLook::Metallic,
-                        accent_look: ColorLook::Neon,
-                        ..Colors::default()
-                    },
+                    palette: PalettePreset::Vesper,
+                    custom: Colors::default(),
                 },
             ),
             (
-                "mixed_light_nav",
+                "light",
                 Appearance {
-                    palette: PalettePreset::Custom,
-                    custom: Colors {
-                        background: "#0B0D12".into(),
-                        nav_background: "#EAEFF7".into(),
-                        foreground: "#F2F4FA".into(),
-                        accent: "#60A5FA".into(),
-                        background_look: ColorLook::Standard,
-                        nav_background_look: ColorLook::Glass,
-                        accent_look: ColorLook::Standard,
-                        ..Colors::default()
-                    },
+                    palette: PalettePreset::Light,
+                    custom: Colors::default(),
                 },
             ),
         ];
@@ -978,25 +878,30 @@ mod win {
             )?;
         }
 
-        // Also capture Cooling & Settings→Darstellung in Glass & Glossy to verify cross-app propagation
-        apply_appearance(&app, &dict, &looks[1].1); // Glass
-        wb.set_page(2);
-        capture(
-            &window,
-            &mut buffer,
-            &out_dir,
-            &format!("{prefix}_cooling_glass.png"),
-        )?;
-
-        apply_appearance(&app, &dict, &looks[2].1); // Glossy
+        // Capture Settings→Darstellung in Default Antigravity + dirty footer to verify rounded bottom corners
+        apply_appearance(&app, &dict, &Appearance::default());
         wb.set_page(4);
         wb.set_settings_tab(2);
+        wb.set_settings_dirty(true);
         capture(
             &window,
             &mut buffer,
             &out_dir,
-            &format!("{prefix}_appearance_glossy.png"),
+            &format!("{prefix}_appearance_dirty.png"),
         )?;
+
+        // Capture Settings→Darstellung in Gradient (showing 2nd color row + clean footer)
+        apply_appearance(&app, &dict, &looks[0].1);
+        wb.set_page(4);
+        wb.set_settings_tab(2);
+        wb.set_settings_dirty(true);
+        capture(
+            &window,
+            &mut buffer,
+            &out_dir,
+            &format!("{prefix}_appearance_gradient.png"),
+        )?;
+        wb.set_settings_dirty(false);
 
         Ok(())
     }

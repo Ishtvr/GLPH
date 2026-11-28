@@ -1039,6 +1039,10 @@ export component AppWindow inherits Window {
         }
 
         VerticalLayout {
+            x: 1px;
+            y: 1px;
+            width: max(0px, parent.width - 2px);
+            height: max(0px, parent.height - 2px);
             spacing: 0px;
             if Workbench.test-mode: Text {
                 text: Workbench.tr("ui.test_mode");
@@ -2522,10 +2526,12 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        // 3. Sticky Dirty Footer (only visible when form settings have unsaved edits)
+                        // 3. Sticky Dirty Footer (rounded bottom corners match workspace 12px frame)
                         if Workbench.settings-dirty: Rectangle {
                             vertical-stretch: 0;
                             height: 58px;
+                            border-bottom-left-radius: 11px;
+                            border-bottom-right-radius: 11px;
                             background: Theme.surface-fill;
 
                             Hairline {

@@ -241,10 +241,10 @@ fn run_inner(
             return Err(t("elevation.unverified").into());
         }
         if matches!(action, Action::Apply | Action::Replace) {
-            // Clear the Boot-Crash-Guard marker after 15 s of stable execution
-            // inside the long-lived UI process; if a hard crash/BSOD occurs
-            // earlier, the marker survives into the next boot.
-            crate::gpu_crash_guard::schedule_clear_after(Duration::from_secs(15));
+            // Clear the Boot-Crash-Guard marker after 45 s of stable execution
+            // inside the long-lived UI process; unstable CPU Curve Optimizer /
+            // Fmax and GPU V/F crashes often manifest 20–30 s after apply.
+            crate::gpu_crash_guard::schedule_clear_after(Duration::from_secs(45));
         }
         Ok(record)
     })();

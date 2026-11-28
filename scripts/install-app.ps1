@@ -258,6 +258,23 @@ try {
         $appCreated += $appShortcuts[1]
     }
 
+    # Keep any existing GLPH-Tray logon task aligned with this installed binary
+    # so switching between User and Machine scope never leaves Windows launching
+    # a stale executable from the other directory.
+    $trayTaskName = 'GLPH-Tray-' + $appIdentity.User.Value
+    $trayTaskUpdated = $false
+    $trayTask = Get-ScheduledTask -TaskName $trayTaskName -ErrorAction SilentlyContinue
+    if ($null -ne $trayTask -and $trayTask.Actions.Count -eq 1) {
+        $trayAction = $trayTask.Actions[0]
+        $trayExec = if ($trayAction.Execute) { $trayAction.Execute.Trim('"') } else { '' }
+        $trayArgs = if ($trayAction.Arguments) { $trayAction.Arguments } else { '--tray' }
+        if ($trayExec -and -not $trayExec.Equals($appBinary, [StringComparison]::OrdinalIgnoreCase)) {
+            $newTrayAction = New-ScheduledTaskAction -Execute "`"$appBinary`"" -Argument $trayArgs
+            Set-ScheduledTask -TaskName $trayTaskName -Action $newTrayAction | Out-Null
+            $trayTaskUpdated = $true
+        }
+    }
+
     [pscustomobject]@{
         Installed = $true
         Scope = $Scope
@@ -267,6 +284,7 @@ try {
         PluginsCopied = $pluginsInstalled
         SHA256 = $appSourceHash
         Shortcuts = $appCreated
+        TrayTaskUpdated = $trayTaskUpdated
         StartupApprovalInvalidated = ($null -ne $appPreviousHash -and $appPreviousHash -ne $appSourceHash -and (Test-Path -LiteralPath $appStartupReceipt))
         ProfileSelected = $false
         HardwareApplied = $false

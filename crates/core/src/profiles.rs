@@ -98,6 +98,13 @@ pub enum Choice {
 pub struct VfPoint {
     pub voltage_mv: u32,
     pub frequency_mhz: u32,
+    /// Signed offset (MHz) relative to the driver's factory base curve at this
+    /// voltage anchor. Present on curves saved by delta-aware editors so
+    /// dynamic GPU P-state / thermal base-curve shifts (e.g. Blackwell
+    /// 600–670 mV Vmin ramp shifts > 900 MHz) never trigger `vf.err.bounds`
+    /// or write accidental ±900 MHz offsets. Legacy curves omit this (`None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_mhz: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,11 +256,16 @@ impl Setting {
                 }
             }
             Value::VfCurve(points) => {
+                let any_delta = points.iter().any(|p| p.delta_mhz.is_some());
+                let all_delta = points.iter().all(|p| p.delta_mhz.is_some());
                 if points.is_empty()
                     || points.len() > 2048
-                    || points
-                        .iter()
-                        .any(|p| p.voltage_mv == 0 || p.frequency_mhz == 0)
+                    || (any_delta && !all_delta)
+                    || points.iter().any(|p| {
+                        p.voltage_mv == 0
+                            || p.frequency_mhz == 0
+                            || p.delta_mhz.is_some_and(|d| !(-5_000..=5_000).contains(&d))
+                    })
                     || points.windows(2).any(|p| {
                         p[0].voltage_mv >= p[1].voltage_mv
                             || p[0].frequency_mhz > p[1].frequency_mhz
@@ -598,6 +610,7 @@ mod tests {
                 value: Value::VfCurve(vec![VfPoint {
                     voltage_mv: 900,
                     frequency_mhz: 1200,
+                    delta_mhz: None,
                 }]),
             }],
         };

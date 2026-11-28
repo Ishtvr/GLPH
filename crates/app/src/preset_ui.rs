@@ -95,10 +95,17 @@ fn load(id: Option<&str>) -> Result<View, String> {
         .as_ref()
         .is_some_and(|p| p.settings.iter().any(|s| s.feature.needs_nvidia()));
     let dgpu_asleep = glph_platform::nvidia_gpu_awake() == Some(false);
-    // D3cold-safe & non-NVIDIA/multi-GPU-safe: never wake a sleeping dGPU unless
-    // the selected preset explicitly needs NVIDIA controls, and fall back to a
-    // non-NVIDIA controller instead of failing the entire Presets view.
-    let (mut controller, curve) = if dgpu_asleep && !selected_needs_nvidia {
+    let gpu_paused = glph_platform::ControlLease::gpu_pause_active();
+    // D3cold-safe, PnP-restart-safe & non-NVIDIA/multi-GPU-safe: never open
+    // NVML/NVAPI handles while a dGPU PnP restart holds `Global\GLPH.GpuPause`,
+    // never wake a sleeping dGPU unless the selected preset needs NVIDIA
+    // controls, and fall back to a non-NVIDIA controller instead of failing.
+    let (mut controller, curve) = if gpu_paused {
+        (
+            Controller::new(false, None)?,
+            Err("Discrete NVIDIA GPU is temporarily paused during hardware apply".into()),
+        )
+    } else if dgpu_asleep && !selected_needs_nvidia {
         (
             Controller::new(false, None)?,
             Err("Discrete NVIDIA GPU is asleep (D3cold); wake GPU or select an NVIDIA preset to edit its V/F curve".into()),

@@ -1971,6 +1971,17 @@ impl Backend for Controller {
             RestoreState::NvidiaLockedClocks { active_max_mhz, .. } => Ok(
                 active_max_mhz.is_some_and(|mhz| target.value == Value::Integer(i64::from(mhz)))
             ),
+            RestoreState::NvidiaVfCurve { state, .. } => {
+                let Value::VfCurve(points) = &target.value else {
+                    return Ok(false);
+                };
+                let wanted = state.target_deltas(points)?;
+                Ok(state
+                    .nodes
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(node, (index, delta))| node.index == *index && node.delta_khz == *delta))
+            }
             _ => Ok(saved.value == target.value),
         }
     }

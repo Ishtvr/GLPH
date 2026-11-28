@@ -108,6 +108,7 @@ impl Host {
         } else {
             self.fan_draft.borrow().clone()
         };
+        let mut legacy_reset = false;
         let result = if let Some(curve) = cached {
             Ok(curve)
         } else if gpu {
@@ -120,14 +121,35 @@ impl Host {
                 .zip(preset_fields::fields())
                 .find(|(_, f)| f.feature == Feature::GpuVfCurve)
                 .and_then(|(d, _)| d.included.then(|| d.value.clone()));
+            let is_legacy = matches!(
+                value.as_ref(),
+                Some(Value::VfCurve(pts))
+                    if !pts.is_empty() && pts.iter().all(|p| p.delta_mhz.is_none())
+            );
             view.curve
                 .clone()
-                .and_then(|state| gpu_editor(state, value.as_ref()))
+                .and_then(|state| match gpu_editor(state.clone(), value.as_ref()) {
+                    Ok(curve) => Ok(curve),
+                    Err(err)
+                        if is_legacy
+                            && (err.contains("vf.err.bounds")
+                                || err.contains("vf.err.legacy_drift")) =>
+                    {
+                        legacy_reset = true;
+                        gpu_editor(state, None)
+                    }
+                    Err(err) => Err(err),
+                })
         } else {
             unreachable!("Fan editor is handled by its library")
         };
         match result {
-            Ok(curve) => self.open_loaded_curve(curve),
+            Ok(curve) => {
+                self.open_loaded_curve(curve);
+                if legacy_reset {
+                    self.status(t("curve.legacy_reset_notice"), true);
+                }
+            }
             Err(e) => self.status(&crate::i18n::error_message(&e), true),
         }
     }
@@ -994,16 +1016,32 @@ mod tests {
             .is_err()
         );
         let saved = state.value().unwrap();
+        let opened = gpu_editor(state.clone(), Some(&saved))
+            .unwrap()
+            .value()
+            .unwrap();
+        let Value::VfCurve(saved_pts) = &saved else {
+            panic!()
+        };
+        let Value::VfCurve(opened_pts) = &opened else {
+            panic!()
+        };
+        assert_eq!(opened_pts.len(), saved_pts.len());
+        for (a, b) in opened_pts.iter().zip(saved_pts) {
+            assert_eq!(
+                (a.voltage_mv, a.frequency_mhz),
+                (b.voltage_mv, b.frequency_mhz)
+            );
+            assert!(a.delta_mhz.is_some());
+        }
         assert_eq!(
-            gpu_editor(state.clone(), Some(&saved))
-                .unwrap()
-                .value()
-                .unwrap(),
-            saved
+            state.target_deltas(opened_pts).unwrap(),
+            state.target_deltas(saved_pts).unwrap()
         );
         let partial = Value::VfCurve(vec![glph_core::profiles::VfPoint {
             voltage_mv: 800,
             frequency_mhz: 1100,
+            delta_mhz: None,
         }]);
         assert!(gpu_editor(state, Some(&partial)).is_err());
     }

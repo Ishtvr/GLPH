@@ -37,6 +37,10 @@ use windows_sys::Win32::{
 };
 
 const CYCLE: Duration = Duration::from_secs(2);
+/// Slice interval used while the loop holds an open NVAPI session (`gpu.is_some()`),
+/// allowing a foreground VBIOS/PnP restart (`Global\GLPH.GpuPause`) to force an
+/// immediate driver handle drop instead of waiting up to `CYCLE` (2 s).
+const GPU_PAUSE_POLL: Duration = Duration::from_millis(100);
 /// Below this GPU temperature the driver is asked only every
 /// [`GPU_IDLE_POLL`], with no driver session kept in between, so a dGPU in
 /// hybrid mode can power down. The OMEN Hub reads the GPU every 30 s in idle.
@@ -103,6 +107,52 @@ fn acquire_write_access<T>(
         }
     }
     Ok(WriteAccess::Busy)
+}
+
+fn wait_for_stop_or_gpu_pause_with_clock<T>(
+    gpu: &mut Option<T>,
+    delay: Duration,
+    mut pause_active: impl FnMut() -> bool,
+    mut wait_step: impl FnMut(Duration) -> Result<(bool, Duration), String>,
+) -> Result<bool, String> {
+    if delay.is_zero() || gpu.is_none() {
+        return wait_step(delay).map(|(stopping, _)| stopping);
+    }
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if pause_active() {
+            *gpu = None;
+            return wait_step(remaining).map(|(stopping, _)| stopping);
+        }
+        let step = remaining.min(GPU_PAUSE_POLL);
+        let (stopping, elapsed) = wait_step(step)?;
+        if stopping {
+            return Ok(true);
+        }
+        // Honor early wakeups (e.g. Session-0 standby or live config update)
+        // instead of sleeping through the rest of the cycle.
+        if step >= Duration::from_millis(20) && elapsed < step / 2 {
+            return Ok(false);
+        }
+        remaining = remaining.saturating_sub(step);
+    }
+    Ok(false)
+}
+
+/// Sleeps for `delay` while keeping an open NVAPI session (`gpu.is_some()`)
+/// responsive to `Global\GLPH.GpuPause`. When `gpu` is already `None`, waits
+/// in a single `stop(delay)` call with zero extra wakeups.
+fn wait_for_stop_or_gpu_pause<T>(
+    gpu: &mut Option<T>,
+    delay: Duration,
+    pause_active: impl FnMut() -> bool,
+    stop: &mut impl FnMut(Duration) -> Result<bool, String>,
+) -> Result<bool, String> {
+    wait_for_stop_or_gpu_pause_with_clock(gpu, delay, pause_active, |step| {
+        let before = Instant::now();
+        let stopping = stop(step)?;
+        Ok((stopping, before.elapsed()))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -882,8 +932,12 @@ fn run_loop(
                     let reading = gpu.as_ref().and_then(|reader| reader.sample().ok());
                     last_gpu = reading.map(|temperature| (temperature, Instant::now()));
                     // A cool GPU is not polled until the reading expires;
-                    // release the driver session so it may power down.
-                    if reading.is_none_or(|temperature| temperature < GPU_IDLE_C) {
+                    // release the driver session so it may power down. Also
+                    // release immediately if a foreground PnP pause began
+                    // while `sample()` was executing.
+                    if reading.is_none_or(|temperature| temperature < GPU_IDLE_C)
+                        || ControlLease::gpu_pause_active()
+                    {
                         gpu = None;
                     }
                     reading
@@ -903,11 +957,20 @@ fn run_loop(
             let write_lease = match acquire_write_access(
                 CYCLE_LEASE_ATTEMPTS,
                 ControlLease::acquire,
-                &mut stop,
+                |delay| {
+                    if ControlLease::gpu_pause_active() {
+                        gpu = None;
+                    }
+                    stop(delay)
+                },
             )? {
                 WriteAccess::Acquired(lease) => lease,
                 WriteAccess::Stop => return Ok(()),
                 WriteAccess::Busy => {
+                    // A foreground hardware transaction (e.g. preset apply or
+                    // VBIOS TGP PnP restart) owns the lease: drop any live
+                    // NVAPI session immediately before sleeping out the cycle.
+                    gpu = None;
                     write_was_blocked = true;
                     report(&idle("waiting_for_control", "Hardware transaction is busy; cooling output is pending and maximum will be established when the lease returns".into()));
                     if stop(CYCLE.saturating_sub(started.elapsed()))? {
@@ -935,6 +998,8 @@ fn run_loop(
                 last_heartbeat = None;
                 last_written_mode = None;
                 last_written_levels = None;
+                cpu = None;
+                gpu = None;
                 drop(write_lease);
                 report(&idle(
                     "waiting_for_hub",
@@ -1015,7 +1080,12 @@ fn run_loop(
                 updated_unix_s: updated_unix_ms / 1000,
                 updated_unix_ms,
             });
-            if stop(CYCLE.saturating_sub(started.elapsed()))? {
+            if wait_for_stop_or_gpu_pause(
+                &mut gpu,
+                CYCLE.saturating_sub(started.elapsed()),
+                ControlLease::gpu_pause_active,
+                &mut stop,
+            )? {
                 return Ok(());
             }
         }
@@ -1371,5 +1441,71 @@ mod tests {
             None,
             false
         ));
+    }
+
+    #[test]
+    fn wait_for_stop_or_gpu_pause_drops_gpu_handle_promptly_when_pause_signals() {
+        // Warm GPU handle active: pause flips true on the 3rd check, drops `gpu`,
+        // and finishes the remainder in one single wait call.
+        let mut gpu = Some(42u32);
+        let mut checks = 0usize;
+        let mut steps = Vec::new();
+        let stopped = wait_for_stop_or_gpu_pause_with_clock(
+            &mut gpu,
+            Duration::from_secs(2),
+            || {
+                checks += 1;
+                checks >= 3
+            },
+            |step| {
+                steps.push(step);
+                Ok((false, step))
+            },
+        )
+        .unwrap();
+        assert!(!stopped);
+        assert!(gpu.is_none());
+        assert_eq!(
+            steps,
+            vec![
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(1800),
+            ]
+        );
+
+        // No open GPU handle: single wait call, zero pause polling.
+        let mut none_gpu: Option<u32> = None;
+        let mut single_steps = Vec::new();
+        let stopped = wait_for_stop_or_gpu_pause_with_clock(
+            &mut none_gpu,
+            Duration::from_secs(2),
+            || panic!("must not poll GPU pause when no GPU handle is open"),
+            |step| {
+                single_steps.push(step);
+                Ok((false, step))
+            },
+        )
+        .unwrap();
+        assert!(!stopped);
+        assert_eq!(single_steps, vec![Duration::from_secs(2)]);
+
+        // Early wake (standby / live config update): exits immediately without
+        // burning the remaining 1.9 s.
+        let mut warm_gpu = Some(7u32);
+        let mut wake_steps = Vec::new();
+        let stopped = wait_for_stop_or_gpu_pause_with_clock(
+            &mut warm_gpu,
+            Duration::from_secs(2),
+            || false,
+            |step| {
+                wake_steps.push(step);
+                Ok((false, Duration::from_millis(1)))
+            },
+        )
+        .unwrap();
+        assert!(!stopped);
+        assert_eq!(wake_steps, vec![Duration::from_millis(100)]);
+        assert!(warm_gpu.is_some());
     }
 }

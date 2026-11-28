@@ -321,10 +321,12 @@ mod tests {
                         VfPoint {
                             voltage_mv: 700,
                             frequency_mhz: 1500,
+                            delta_mhz: None,
                         },
                         VfPoint {
                             voltage_mv: 900,
                             frequency_mhz: 1800,
+                            delta_mhz: None,
                         },
                     ]),
                 },
@@ -344,10 +346,12 @@ mod tests {
             VfPoint {
                 voltage_mv: 700,
                 frequency_mhz: 1515,
+                delta_mhz: None,
             },
             VfPoint {
                 voltage_mv: 900,
                 frequency_mhz: 1815,
+                delta_mhz: None,
             },
         ]);
         let edits = vec![(Feature::GpuMemoryOffsetMhz, Some(Value::Integer(-24)))];

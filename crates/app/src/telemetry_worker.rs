@@ -50,8 +50,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const SAMPLE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// If `Global\GLPH.GpuPause` stays signaled longer than this while no
 /// foreground hardware lease is held, treat the pause as orphaned from a
-/// crashed helper so telemetry does not remain blank forever.
-const STUCK_GPU_PAUSE_CEILING: Duration = Duration::from_secs(20);
+/// crashed helper so telemetry does not remain blank forever. Must exceed a
+/// full `vbios_tgp` Code-43 recovery cycle (~45 s) so telemetry never reopens
+/// NVML/NVAPI handles mid-`CM_Disable_DevNode`.
+const STUCK_GPU_PAUSE_CEILING: Duration = Duration::from_secs(65);
 const GPU_PAUSE_EVENT_NAME: &str = "Global\\GLPH.GpuPause";
 
 /// Live telemetry polling interval in milliseconds (updated without restart).
@@ -423,7 +425,7 @@ pub(crate) fn worker_child(nonce: &str, parent_pid: u32) -> Result<(), String> {
                         let handles = [io_event.0, pe.0];
                         unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) }
                     } else {
-                        unsafe { WaitForSingleObject(io_event.0, 250) }
+                        unsafe { WaitForSingleObject(io_event.0, 100) }
                     }
                 } else {
                     unsafe { WaitForSingleObject(io_event.0, INFINITE) }

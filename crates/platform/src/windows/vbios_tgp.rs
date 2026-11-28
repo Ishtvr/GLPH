@@ -82,6 +82,10 @@ const OFF_LIMIT_MAX: usize = 0x15;
 const OFF_INFLECTION_0: usize = 0x2D;
 const OFF_TGP_RATED: usize = 0x49;
 
+/// Wait after signaling `Global\GLPH.GpuPause` so both `gpu-sensor-worker`
+/// and Session-0 `GLPHService` observe the pause and unload NVML/NVAPI handles
+/// before `CM_Disable_DevNode` tears down the dGPU devnode.
+const GPU_PAUSE_SETTLE: Duration = Duration::from_millis(750);
 const DISABLE_SETTLE: Duration = Duration::from_millis(2500);
 const RECOVERY_DISABLE_SETTLES: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(8)];
 const CODE43_EARLY_DETECT_WAIT: Duration = Duration::from_secs(3);
@@ -820,7 +824,7 @@ fn restart_gpu_and_verify(
     // Signal background telemetry (`gpu-sensor-worker`) and Session-0 cooling to
     // release NVML/NVAPI handles before `CM_Disable_DevNode` to prevent Code-43 races.
     let _gpu_pause = super::ControlLease::signal_gpu_pause();
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(GPU_PAUSE_SETTLE);
     let schedule = [
         DISABLE_SETTLE,
         RECOVERY_DISABLE_SETTLES[0],

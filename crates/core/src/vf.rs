@@ -85,6 +85,7 @@ impl VfState {
                 .map(|p| VfPoint {
                     voltage_mv: p.voltage_uv / 1000,
                     frequency_mhz: p.frequency_khz / 1000,
+                    delta_mhz: None,
                 })
                 .collect(),
         );
@@ -134,8 +135,28 @@ impl VfState {
         if target.len() != self.nodes.len() {
             return Err(crate::message::msg("vf.err.complete_grid", &[]));
         }
+        if target.iter().all(|p| p.delta_mhz.is_some()) {
+            return self
+                .nodes
+                .iter()
+                .zip(target)
+                .map(|(original, wanted)| {
+                    if u64::from(wanted.voltage_mv) * 1000 != u64::from(original.voltage_uv) {
+                        return Err(crate::message::msg("vf.err.anchors", &[]));
+                    }
+                    let delta = i64::from(wanted.delta_mhz.expect("checked above")) * 1000;
+                    let delta = i32::try_from(delta)
+                        .map_err(|_| crate::message::msg("vf.err.delta_representation", &[]))?;
+                    if !(self.minimum_delta_khz..=self.maximum_delta_khz).contains(&delta) {
+                        return Err(crate::message::msg("vf.err.bounds", &[]));
+                    }
+                    Ok((original.index, delta))
+                })
+                .collect();
+        }
         let bases = self.base_frequencies_khz()?;
-        self.nodes
+        let deltas: Vec<(u16, i32)> = self
+            .nodes
             .iter()
             .zip(bases)
             .zip(target)
@@ -151,7 +172,11 @@ impl VfState {
                 }
                 Ok((original.index, delta))
             })
-            .collect()
+            .collect::<Result<_, _>>()?;
+        if legacy_curve_has_pstate_drift(target, &deltas) {
+            return Err(crate::message::msg("vf.err.legacy_drift", &[]));
+        }
+        Ok(deltas)
     }
     /// Derive once from the durable capture, so recovery can reconstruct the
     /// exact controls even if boost observations change before or after SET.
@@ -171,17 +196,70 @@ impl VfState {
         Ok(state)
     }
     pub fn target_state(&self, target: &[VfPoint]) -> Result<Self, String> {
+        let bases = self.base_frequencies_khz()?;
         let deltas = self.target_deltas(target)?;
         let mut state = self.clone();
-        for ((node, (_, delta)), point) in state.nodes.iter_mut().zip(deltas).zip(target) {
+        for (((node, base_khz), (_, delta)), point) in
+            state.nodes.iter_mut().zip(bases).zip(deltas).zip(target)
+        {
             node.delta_khz = delta;
-            node.frequency_khz = point
-                .frequency_mhz
-                .checked_mul(1000)
-                .ok_or(crate::message::msg("vf.err.frequency", &[]))?;
+            node.frequency_khz = if point.delta_mhz.is_some() {
+                let freq = (i64::from(base_khz) + i64::from(delta)).max(1_000);
+                u32::try_from(freq).map_err(|_| crate::message::msg("vf.err.frequency", &[]))?
+            } else {
+                point
+                    .frequency_mhz
+                    .checked_mul(1000)
+                    .ok_or(crate::message::msg("vf.err.frequency", &[]))?
+            };
         }
         Ok(state)
     }
+}
+
+/// Detects dynamic GPU P-state / Vmin-ramp shifts (measured on RTX 50-series
+/// Blackwell: up to +900..+1050 MHz shift at 600–670 mV between P8 idle and
+/// P4/P0 load) on legacy absolute-MHz curves that omit `delta_mhz`.
+///
+/// Refuses to silently write a localized ±350+ MHz crater/spike on non-plateau
+/// anchors while leaving legitimate top-end flat undervolt plateaus and
+/// uniform whole-curve offsets untouched.
+fn legacy_curve_has_pstate_drift(target: &[VfPoint], deltas: &[(u16, i32)]) -> bool {
+    if target.len() < 8 || deltas.len() != target.len() {
+        return false;
+    }
+    let max_freq = target.last().map_or(0, |p| p.frequency_mhz);
+    let mid = target.len() / 2;
+    let mut upper: Vec<i64> = deltas[mid..]
+        .iter()
+        .zip(&target[mid..])
+        .filter(|(_, p)| p.frequency_mhz < max_freq)
+        .map(|((_, d), _)| i64::from(*d))
+        .collect();
+    if upper.len() < 3 {
+        upper = deltas[mid..].iter().map(|(_, d)| i64::from(*d)).collect();
+    }
+    upper.sort_unstable();
+    let ref_delta = upper[upper.len() / 2];
+
+    for i in 0..target.len() {
+        // High-voltage flat plateau ceilings legitimately carry large negative deltas.
+        if target[i].frequency_mhz >= max_freq {
+            continue;
+        }
+        let d = i64::from(deltas[i].1);
+        let spread = (d - ref_delta).abs();
+        if d.abs() > 350_000 && spread > 350_000 {
+            return true;
+        }
+        if i > 0 {
+            let prev = i64::from(deltas[i - 1].1);
+            if (d - prev).abs() > 200_000 && spread > 250_000 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Keep the lower curve and flatten from an existing voltage anchor. This is a
@@ -197,7 +275,10 @@ pub fn plateau(state: &VfState, voltage_mv: u32, frequency_mhz: u32) -> Result<V
     for point in &mut points[first..] {
         point.frequency_mhz = frequency_mhz;
     }
-    state.target_deltas(&points)?;
+    let deltas = state.target_deltas(&points)?;
+    for (point, (_, delta_khz)) in points.iter_mut().zip(deltas) {
+        point.delta_mhz = Some(delta_khz / 1000);
+    }
     Ok(Value::VfCurve(points))
 }
 
@@ -424,5 +505,113 @@ mod tests {
         changed.minimum_delta_khz = -500000;
         changed.nodes[0].frequency_khz = 10000;
         assert!(CurveTrial::FirstPointMinus15.target(&changed).is_err());
+    }
+
+    #[test]
+    fn delta_encoded_curve_survives_blackwell_pstate_vmin_ramp_shift() {
+        // Idle P8 state: 600..670 mV ramp starts at 180..1365 MHz.
+        let p8_freqs = [
+            180, 180, 180, 180, 225, 390, 547, 712, 1425, 2000, 2600, 3127,
+        ];
+        let p8_mv = [450, 500, 550, 620, 625, 635, 640, 645, 675, 800, 960, 1240];
+        let mk_state = |freqs: &[u32]| VfState {
+            nodes: p8_mv
+                .iter()
+                .zip(freqs)
+                .enumerate()
+                .map(|(i, (&mv, &mhz))| VfNode {
+                    index: i as u16,
+                    voltage_uv: mv * 1000,
+                    frequency_khz: mhz * 1000,
+                    delta_khz: 0,
+                })
+                .collect(),
+            minimum_delta_khz: -1_000_000,
+            maximum_delta_khz: 1_000_000,
+            first_index: 0,
+            last_index: (p8_mv.len() - 1) as u16,
+        };
+        let p8 = mk_state(&p8_freqs);
+        // Save a plateau at 960 mV -> 2600 MHz using delta-aware helper.
+        let Value::VfCurve(points) = plateau(&p8, 960, 2600).unwrap() else {
+            panic!()
+        };
+        assert!(points.iter().all(|p| p.delta_mhz.is_some()));
+        assert_eq!(points[5].delta_mhz, Some(0)); // 635 mV untouched
+        assert_eq!(points[11].delta_mhz, Some(-527)); // 1240 mV plateau
+
+        // Load P4/P0 state: Blackwell shifts 620..645 mV up by +700..+1050 MHz.
+        let p0_freqs = [
+            180, 180, 180, 950, 1180, 1420, 1440, 1460, 1500, 2060, 2630, 3090,
+        ];
+        let p0 = mk_state(&p0_freqs);
+        let deltas = p0.target_deltas(&points).unwrap();
+        assert_eq!(deltas[5], (5, 0)); // never becomes -1030 MHz or vf.err.bounds!
+        assert_eq!(deltas[11], (11, -527_000));
+        assert!(p0.target_state(&points).is_ok());
+    }
+
+    #[test]
+    fn legacy_absolute_curve_blocks_blackwell_vmin_drift_but_keeps_plateaus_and_uniform_oc() {
+        let p8_mv = [450, 500, 550, 620, 625, 635, 640, 645, 675, 800, 960, 1240];
+        let p8_freqs = [
+            180, 180, 180, 180, 225, 390, 547, 712, 1425, 2000, 2600, 3127,
+        ];
+        let p4_freqs = [
+            180, 180, 180, 907, 1117, 1290, 1320, 1342, 1485, 2070, 2625, 3082,
+        ];
+        let mk_state = |freqs: &[u32]| VfState {
+            nodes: p8_mv
+                .iter()
+                .zip(freqs)
+                .enumerate()
+                .map(|(i, (&mv, &mhz))| VfNode {
+                    index: i as u16,
+                    voltage_uv: mv * 1000,
+                    frequency_khz: mhz * 1000,
+                    delta_khz: 0,
+                })
+                .collect(),
+            minimum_delta_khz: -1_000_000,
+            maximum_delta_khz: 1_000_000,
+            first_index: 0,
+            last_index: (p8_mv.len() - 1) as u16,
+        };
+        let p8 = mk_state(&p8_freqs);
+        let p4 = mk_state(&p4_freqs);
+
+        // Legacy idle-saved curve applied under load (-900 MHz crater at 635 mV) -> blocked!
+        let Value::VfCurve(legacy_p8) = p8.value().unwrap() else {
+            panic!()
+        };
+        let err = p4.target_deltas(&legacy_p8).unwrap_err();
+        assert!(err.contains("vf.err.legacy_drift"), "unexpected: {err}");
+
+        // Legacy load-saved curve applied at idle (+900 MHz OC spike at 635 mV) -> blocked!
+        let Value::VfCurve(legacy_p4) = p4.value().unwrap() else {
+            panic!()
+        };
+        let err = p8.target_deltas(&legacy_p4).unwrap_err();
+        assert!(err.contains("vf.err.legacy_drift"), "unexpected: {err}");
+
+        // Same-state legacy apply still passes.
+        assert!(p8.target_deltas(&legacy_p8).is_ok());
+
+        // Legitimate legacy top-end undervolt plateau (-527 MHz on flat 2600 MHz ceiling) passes.
+        let mut legacy_plateau = legacy_p8.clone();
+        legacy_plateau[10].frequency_mhz = 2600;
+        legacy_plateau[11].frequency_mhz = 2600;
+        assert!(p8.target_deltas(&legacy_plateau).is_ok());
+
+        // Legitimate legacy uniform +400 MHz whole-curve offset passes.
+        let legacy_uniform_oc: Vec<VfPoint> = legacy_p8
+            .iter()
+            .map(|p| VfPoint {
+                voltage_mv: p.voltage_mv,
+                frequency_mhz: p.frequency_mhz + 400,
+                delta_mhz: None,
+            })
+            .collect();
+        assert!(p8.target_deltas(&legacy_uniform_oc).is_ok());
     }
 }

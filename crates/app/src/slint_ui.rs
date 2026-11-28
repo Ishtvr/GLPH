@@ -1339,6 +1339,9 @@ impl Host {
             self.show();
             return;
         }
+        // Explicit clean user exit (not a crash/BSOD): clear any pending
+        // stability-window marker so the next normal reboot does not misfire.
+        crate::gpu_crash_guard::clear_in_flight();
         let _ = slint::quit_event_loop();
     }
     fn drain(&self, message: u32) {
@@ -3284,6 +3287,9 @@ fn bind(w: &AppWindow, h: &Rc<Host>) {
             }
             3 => {
                 d.set_dirty(false);
+                // Explicit clean user exit (not a crash/BSOD): clear any pending
+                // stability-window marker so the next normal reboot does not misfire.
+                crate::gpu_crash_guard::clear_in_flight();
                 let _ = slint::quit_event_loop();
             }
             7 => h.confirm_replace_plugin(),

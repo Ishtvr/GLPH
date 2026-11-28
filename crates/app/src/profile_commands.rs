@@ -256,7 +256,11 @@ fn save_ui_result(
     store.save_control_result(record)
 }
 
-fn profile_has_gpu_oc_or_vf(profile: &PerformanceProfile) -> bool {
+/// Returns `true` when applying `profile` writes GPU overclocking/V/F/TGP or
+/// CPU/APU Curve Optimizer, Fmax boost, PBO scalar, or voltage/clock tuning
+/// that can trigger a delayed BSOD/freeze (20–30 s after apply) and therefore
+/// must arm the Boot-Crash-Guard anti-boot-loop marker.
+fn profile_has_stability_risk(profile: &PerformanceProfile) -> bool {
     profile.settings.iter().any(|s| {
         matches!(
             s.feature,
@@ -266,6 +270,15 @@ fn profile_has_gpu_oc_or_vf(profile: &PerformanceProfile) -> bool {
                 | Feature::GpuVoltageOffsetMv
                 | Feature::GpuMemoryVoltageOffsetMv
                 | Feature::GpuDynamicBoostLimitMw
+                | Feature::CpuCurveOptimizerAllCore
+                | Feature::CpuCurveOptimizerPerCore
+                | Feature::GfxCurveOptimizer
+                | Feature::CpuBoostLimitMhz
+                | Feature::CpuPboScalar
+                | Feature::CpuAllCoreVoltageOffsetMv
+                | Feature::AmdCpuVoltageMv
+                | Feature::AmdCpuClockMhz
+                | Feature::AmdIgpuClockMhz
         )
     })
 }
@@ -942,7 +955,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 args[0] == "profile-ui-replace",
             )?;
             let inventory = controller.inventory().clone();
-            let armed_crash_guard = profile_has_gpu_oc_or_vf(&profile);
+            let armed_crash_guard = profile_has_stability_risk(&profile);
             if armed_crash_guard {
                 let _ = crate::gpu_crash_guard::mark_in_flight(&profile.id);
             }
@@ -1141,7 +1154,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 }
             } else if armed_crash_guard && nonce.is_none() {
                 // Headless CLI applies have no long-lived UI process to clear
-                // the marker after 15 s; UI applies schedule the 15 s timer in elevation.rs.
+                // the marker after 45 s; UI applies schedule the 45 s timer in elevation.rs.
                 crate::gpu_crash_guard::clear_in_flight();
             }
             // TPP has a SET contract but no exact GET. Do not include it in
@@ -1408,7 +1421,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                 let mut controller = prepare_apply(&direct, &mut store, true, false)?;
                 let inventory = controller.inventory().clone();
                 device_checked = true;
-                let armed_crash_guard = profile_has_gpu_oc_or_vf(&profile);
+                let armed_crash_guard = profile_has_stability_risk(&profile);
                 if armed_crash_guard {
                     let _ = crate::gpu_crash_guard::mark_in_flight(&profile.id);
                 }
@@ -1485,9 +1498,11 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     let _ = store.save_battery_state(&state);
                 }
                 if armed_crash_guard {
-                    // Prove 15 s stability in this background logon task before
-                    // clearing the Boot-Crash-Guard marker.
-                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    // Prove 45 s stability in this background logon task before
+                    // clearing the Boot-Crash-Guard marker; unstable CPU Curve
+                    // Optimizer / Fmax and GPU V/F tuning frequently crashes
+                    // 20–30 s after apply.
+                    std::thread::sleep(std::time::Duration::from_secs(45));
                     crate::gpu_crash_guard::clear_in_flight();
                 }
                 Ok(Some(completion))
@@ -1556,5 +1571,61 @@ mod tests {
             parse_value(Feature::CpuPptLimitMw, "45000").unwrap(),
             Value::Integer(45000)
         );
+    }
+
+    #[test]
+    fn stability_risk_guard_covers_cpu_and_gpu_tuning_but_ignores_benign_profiles() {
+        let profile_with = |settings: Vec<Setting>| PerformanceProfile {
+            schema: PROFILE_SCHEMA,
+            id: "test".into(),
+            name: "Test".into(),
+            binding: glph_core::profiles::DeviceBinding {
+                manufacturer: "HP".into(),
+                board: "8E35".into(),
+                bios: "F.10".into(),
+                cpu_names: vec!["AMD Ryzen 9 9955HX".into()],
+                nvidia_uuid: None,
+                nvidia_driver: None,
+                nvidia_vbios: None,
+            },
+            settings,
+        };
+        assert!(!profile_has_stability_risk(&profile_with(vec![
+            Setting {
+                feature: Feature::CpuPptLimitMw,
+                value: Value::Integer(55_000),
+            },
+            Setting {
+                feature: Feature::DisplayRefreshRateHz,
+                value: Value::Integer(240),
+            },
+        ])));
+        for setting in [
+            Setting {
+                feature: Feature::CpuCurveOptimizerAllCore,
+                value: Value::Integer(-15),
+            },
+            Setting {
+                feature: Feature::CpuBoostLimitMhz,
+                value: Value::Integer(5550),
+            },
+            Setting {
+                feature: Feature::CpuPboScalar,
+                value: Value::Integer(2),
+            },
+            Setting {
+                feature: Feature::GpuCoreOffsetMhz,
+                value: Value::Integer(150),
+            },
+            Setting {
+                feature: Feature::GpuDynamicBoostLimitMw,
+                value: Value::Integer(125_000),
+            },
+        ] {
+            assert!(
+                profile_has_stability_risk(&profile_with(vec![setting])),
+                "stability guard should arm for CPU/GPU voltage, clock, or curve tuning"
+            );
+        }
     }
 }

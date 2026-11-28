@@ -88,11 +88,53 @@ fn factory_points(state: &VfState) -> Result<Vec<Point>, String> {
 impl Curve {
     /// A saved preset curve, or without one the driver's factory curve. The
     /// live curve may carry an applied undervolt and is never the default.
+    /// Delta-encoded curves (`delta_mhz: Some(..)`) are reconstructed on top of
+    /// the current live factory base so Blackwell P-state / thermal base shifts
+    /// preserve the exact intended per-anchor offsets cleanly.
     pub fn gpu(state: VfState, value: Option<&Value>) -> Result<Self, String> {
         let points = match value {
             Some(Value::VfCurve(points)) => {
-                state.target_deltas(points)?;
-                vf_points(points)?
+                let deltas = state.target_deltas(points)?;
+                if points.iter().all(|p| p.delta_mhz.is_some()) {
+                    let bases = state.base_frequencies_khz()?;
+                    let mut bounds: Vec<(i32, i32)> = Vec::with_capacity(bases.len());
+                    let mut rebuilt: Vec<Point> = Vec::with_capacity(bases.len());
+                    for ((node, base_khz), (_, delta_khz)) in
+                        state.nodes.iter().zip(&bases).zip(&deltas)
+                    {
+                        let base = i64::from(*base_khz);
+                        let min_y = (base + i64::from(state.minimum_delta_khz) + 999)
+                            .div_euclid(1000)
+                            .max(1);
+                        let max_y = (base + i64::from(state.maximum_delta_khz)).div_euclid(1000);
+                        let lo =
+                            i32::try_from(min_y).map_err(|_| msg("curve.err.gpu_lower", &[]))?;
+                        let hi =
+                            i32::try_from(max_y).map_err(|_| msg("curve.err.gpu_upper", &[]))?;
+                        let y = ((base + i64::from(*delta_khz)).div_euclid(1000))
+                            .clamp(i64::from(lo), i64::from(hi))
+                            as i32;
+                        bounds.push((lo, hi));
+                        rebuilt.push(Point {
+                            x: i32::try_from(node.voltage_uv / 1000)
+                                .map_err(|_| msg("curve.err.anchor_too_large", &[]))?,
+                            y,
+                        });
+                    }
+                    // Preserve non-decreasing monotonicity inside each anchor's
+                    // driver [lo, hi] envelope across thermal boost bin shifts.
+                    for i in 1..rebuilt.len() {
+                        let (lo, hi) = bounds[i];
+                        rebuilt[i].y = rebuilt[i].y.max(rebuilt[i - 1].y).clamp(lo, hi);
+                    }
+                    for i in (0..rebuilt.len().saturating_sub(1)).rev() {
+                        let (lo, hi) = bounds[i];
+                        rebuilt[i].y = rebuilt[i].y.min(rebuilt[i + 1].y).clamp(lo, hi);
+                    }
+                    rebuilt
+                } else {
+                    vf_points(points)?
+                }
             }
             Some(_) => return Err(msg("curve.err.incomplete_gpu", &[])),
             None => factory_points(&state)?,
@@ -149,15 +191,30 @@ impl Curve {
     }
     pub fn value(&self) -> Result<Value, String> {
         let value = if self.kind == Kind::Gpu {
+            let bases = self
+                .gpu
+                .as_ref()
+                .map(|gpu| gpu.base_frequencies_khz())
+                .transpose()?;
             Value::VfCurve(
                 self.points
                     .iter()
-                    .map(|p| {
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let delta_mhz = bases
+                            .as_ref()
+                            .and_then(|b| b.get(i))
+                            .map(|&base_khz| {
+                                i32::try_from((i64::from(p.y) * 1000 - i64::from(base_khz)) / 1000)
+                                    .map_err(|_| msg("vf.err.delta_representation", &[]))
+                            })
+                            .transpose()?;
                         Ok(VfPoint {
                             voltage_mv: u32::try_from(p.x)
                                 .map_err(|_| msg("curve.err.invalid_anchor", &[]))?,
                             frequency_mhz: u32::try_from(p.y)
                                 .map_err(|_| msg("curve.err.invalid_frequency", &[]))?,
+                            delta_mhz,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?,
@@ -1026,5 +1083,55 @@ mod tests {
         c.drag_gpu(&start, DragMode::Tilt, -5_000).unwrap();
         assert!(c.value().is_ok());
         assert!(c.points.windows(2).all(|w| w[0].y <= w[1].y));
+    }
+
+    #[test]
+    fn delta_curve_round_trips_and_rebuilds_monotonically_across_pstate_shift() {
+        let mv = [450, 625, 635, 675, 900, 1000, 1240];
+        let p8_freqs = [180, 225, 390, 1425, 2422, 2752, 3127];
+        let p0_freqs = [180, 1180, 1420, 1500, 2430, 2745, 3082];
+        let mk_state = |freqs: &[u32]| VfState {
+            nodes: mv
+                .iter()
+                .zip(freqs)
+                .enumerate()
+                .map(|(i, (&v, &f))| crate::vf::VfNode {
+                    index: i as u16,
+                    voltage_uv: v * 1000,
+                    frequency_khz: f * 1000,
+                    delta_khz: 0,
+                })
+                .collect(),
+            minimum_delta_khz: -1_000_000,
+            maximum_delta_khz: 1_000_000,
+            first_index: 0,
+            last_index: (mv.len() - 1) as u16,
+        };
+        let p8 = mk_state(&p8_freqs);
+        let mut curve = Curve::gpu(p8, None).unwrap();
+        // Flatten 900..1240 mV to 2550 MHz (+128, -202, -577 MHz); leave 450..675 mV untouched.
+        curve.select(4, false);
+        curve.plateau(2550).unwrap();
+        let saved = curve.value().unwrap();
+        let Value::VfCurve(ref pts) = saved else {
+            panic!()
+        };
+        assert_eq!(pts[1].delta_mhz, Some(0));
+        assert_eq!(pts[2].delta_mhz, Some(0));
+        assert_eq!(pts[4].delta_mhz, Some(128));
+        assert_eq!(pts[6].delta_mhz, Some(-577));
+
+        // Reopen on P0 where 635 mV shifted +1030 MHz and 1000 mV shifted -7 MHz.
+        let p0 = mk_state(&p0_freqs);
+        let reopened = Curve::gpu(p0.clone(), Some(&saved)).unwrap();
+        assert!(reopened.points.windows(2).all(|w| w[0].y <= w[1].y));
+        assert_eq!(reopened.points[1].y, 1180); // untouched 625 mV stays 0 delta
+        assert_eq!(reopened.points[2].y, 1420); // untouched 635 mV stays 0 delta
+        let Value::VfCurve(re_pts) = reopened.value().unwrap() else {
+            panic!()
+        };
+        assert_eq!(re_pts[1].delta_mhz, Some(0));
+        assert_eq!(re_pts[2].delta_mhz, Some(0));
+        assert!(p0.target_deltas(&re_pts).is_ok());
     }
 }
